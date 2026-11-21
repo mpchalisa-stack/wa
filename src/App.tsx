@@ -1,0 +1,1779 @@
+import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import type { MediaConnection } from 'peerjs';
+import {
+  Camera,
+  Copy,
+  Lock,
+  Moon,
+  MoreVertical,
+  QrCode,
+  RefreshCw,
+  Search,
+  Share2,
+  Sun,
+  Trash2,
+  User,
+  Users,
+  X,
+} from 'lucide-react';
+import {
+  CallRecord,
+  CallType,
+  ChatMessage,
+  Contact,
+  NavTab,
+  PeerConnectionState,
+  PeerPacket,
+  ReplyPreview,
+  StatusItem,
+  ThemeMode,
+  UserProfile,
+} from './types';
+import {
+  dbClearCalls,
+  dbDeleteContact,
+  dbDeleteMessagesForChat,
+  dbDeleteStatus,
+  dbSaveCall,
+  dbSaveContact,
+  dbSaveMessage,
+  dbSaveStatus,
+  getSavedProfile,
+  getSavedTheme,
+  getSavedUnreadCounts,
+  loadAllLocalData,
+  resetAllLocalData,
+  saveTheme,
+  saveUnreadCounts,
+  saveUserProfile,
+} from './lib/db';
+import { WA6PeerManager, fromFullPeerId } from './lib/peerManager';
+import {
+  playMessagePop,
+  startIncomingRingtone,
+  startOutgoingRingback,
+  stopRingtone,
+} from './lib/audio';
+import { formatSixDigitId, generateUid } from './lib/media';
+import { OnboardingScreen } from './components/OnboardingScreen';
+import { ChatList } from './components/ChatList';
+import { ChatRoom } from './components/ChatRoom';
+import { StatusTab } from './components/StatusTab';
+import { CallsTab } from './components/CallsTab';
+import { ProfileDrawer } from './components/ProfileDrawer';
+import { NewChatModal } from './components/NewChatModal';
+import { NewGroupModal } from './components/NewGroupModal';
+import { CameraModal } from './components/CameraModal';
+import { CallOverlay, ActiveCallUIState } from './components/CallOverlay';
+import { MediaLightbox, LightboxMedia } from './components/MediaLightbox';
+import { OfflineIndicator, PWAInstallButton } from './components/PWAInstallButton';
+import { ShareAppModal } from './components/ShareAppModal';
+
+interface ActiveCallRuntime {
+  callId: string;
+  peerId: string;
+  peerName: string;
+  peerAvatar: string;
+  callType: CallType;
+  direction: 'incoming' | 'outgoing';
+  mediaCall: MediaConnection;
+  localStream: MediaStream | null;
+  startedAt: number;
+  connectedAt: number | null;
+  facingMode: 'user' | 'environment';
+}
+
+export default function App() {
+  const [profile, setProfile] = useState<UserProfile | null>(() => getSavedProfile());
+  const [theme, setTheme] = useState<ThemeMode>(() => getSavedTheme());
+  const [dataLoaded, setDataLoaded] = useState(false);
+
+  const [contacts, setContacts] = useState<Contact[]>([]);
+  const [messages, setMessages] = useState<ChatMessage[]>([]);
+  const [statuses, setStatuses] = useState<StatusItem[]>([]);
+  const [calls, setCalls] = useState<CallRecord[]>([]);
+  const [unreadCounts, setUnreadCounts] = useState<Record<string, number>>(() =>
+    getSavedUnreadCounts()
+  );
+
+  // Navigation & UI state
+  const [activeTab, setActiveTab] = useState<NavTab>('chats');
+  const [activeChatId, setActiveChatId] = useState<string | null>(null);
+  const [searchOpen, setSearchOpen] = useState(false);
+  const [searchQuery, setSearchQuery] = useState('');
+  const [showMainMenu, setShowMainMenu] = useState(false);
+  const [showProfileDrawer, setShowProfileDrawer] = useState(false);
+  const [showNewChatModal, setShowNewChatModal] = useState(false);
+  const [showNewGroupModal, setShowNewGroupModal] = useState(false);
+  const [showShareAppModal, setShowShareAppModal] = useState(false);
+  const [showResetConfirm, setShowResetConfirm] = useState(false);
+  const [pendingInvite, setPendingInvite] = useState<{ id: string; name?: string } | null>(() => {
+    if (typeof window === 'undefined') return null;
+    try {
+      const params = new URLSearchParams(window.location.search);
+      const addId = params.get('add')?.replace(/\D/g, '');
+      if (addId && addId.length === 6) {
+        return { id: addId, name: params.get('name')?.trim() || undefined };
+      }
+    } catch {
+      // ignore
+    }
+    return null;
+  });
+  const [cameraPurpose, setCameraPurpose] = useState<'chat' | 'status' | null>(null);
+  const [lightboxMedia, setLightboxMedia] = useState<LightboxMedia | null>(null);
+  const [toast, setToast] = useState<string | null>(null);
+
+  // PeerJS real-time state
+  const [peerState, setPeerState] = useState<PeerConnectionState>('connecting');
+  const [peerError, setPeerError] = useState<string | undefined>();
+  const [onlinePeers, setOnlinePeers] = useState<Record<string, boolean>>({});
+  const [typingMap, setTypingMap] = useState<Record<string, string>>({});
+
+  // Call UI state
+  const [activeCallUI, setActiveCallUI] = useState<ActiveCallUIState | null>(null);
+
+  // Refs for fresh state inside PeerJS callbacks
+  const peerManagerRef = useRef<WA6PeerManager | null>(null);
+  const profileRef = useRef<UserProfile | null>(profile);
+  const contactsRef = useRef<Contact[]>(contacts);
+  const messagesRef = useRef<ChatMessage[]>(messages);
+  const activeChatIdRef = useRef<string | null>(activeChatId);
+  const callRuntimeRef = useRef<ActiveCallRuntime | null>(null);
+  const callTimerRef = useRef<number | null>(null);
+  const typingClearTimersRef = useRef<Record<string, number>>({});
+  const toastTimerRef = useRef<number | null>(null);
+
+  useEffect(() => {
+    profileRef.current = profile;
+  }, [profile]);
+  useEffect(() => {
+    contactsRef.current = contacts;
+  }, [contacts]);
+  useEffect(() => {
+    messagesRef.current = messages;
+  }, [messages]);
+  useEffect(() => {
+    activeChatIdRef.current = activeChatId;
+  }, [activeChatId]);
+
+  // Sync Tailwind dark class & browser theme-color
+  useEffect(() => {
+    document.documentElement.classList.toggle('dark', theme === 'dark');
+    saveTheme(theme);
+    const metaTheme = document.querySelector('meta[name="theme-color"]');
+    if (metaTheme) {
+      metaTheme.setAttribute('content', theme === 'dark' ? '#1F2C34' : '#008069');
+    }
+  }, [theme]);
+
+  // Sync unread counts to localStorage
+  useEffect(() => {
+    saveUnreadCounts(unreadCounts);
+  }, [unreadCounts]);
+
+  const showToast = useCallback((message: string) => {
+    setToast(message);
+    if (toastTimerRef.current !== null) {
+      window.clearTimeout(toastTimerRef.current);
+    }
+    toastTimerRef.current = window.setTimeout(() => {
+      setToast(null);
+    }, 2800);
+  }, []);
+
+  // Load IndexedDB data on startup
+  useEffect(() => {
+    let active = true;
+    loadAllLocalData().then((data) => {
+      if (!active) return;
+      setContacts(data.contacts);
+      setMessages(data.messages);
+      setStatuses(data.statuses);
+      setCalls(data.calls);
+      setDataLoaded(true);
+    });
+    return () => {
+      active = false;
+    };
+  }, []);
+
+  // Helper to upsert contact
+  const upsertContact = useCallback((contact: Contact) => {
+    setContacts((prev) => {
+      const idx = prev.findIndex((c) => c.id === contact.id);
+      if (idx >= 0) {
+        const merged = { ...prev[idx], ...contact };
+        void dbSaveContact(merged);
+        const copy = [...prev];
+        copy[idx] = merged;
+        return copy;
+      }
+      void dbSaveContact(contact);
+      return [contact, ...prev];
+    });
+  }, []);
+
+  // Helper to send READ_ACK for unread messages in a chat
+  const sendReadAcksForChat = useCallback((chatId: string) => {
+    const me = profileRef.current;
+    const manager = peerManagerRef.current;
+    if (!me || !manager) return;
+
+    const unreadFromPeer = messagesRef.current.filter(
+      (m) => m.chatId === chatId && m.senderId !== me.id && m.status !== 'read'
+    );
+    if (unreadFromPeer.length === 0) return;
+
+    // Group message IDs by senderId (works for both 1:1 and group chats)
+    const bySender = new Map<string, string[]>();
+    for (const m of unreadFromPeer) {
+      const arr = bySender.get(m.senderId) || [];
+      arr.push(m.id);
+      bySender.set(m.senderId, arr);
+    }
+
+    bySender.forEach((messageIds, senderId) => {
+      manager.sendPacket(senderId, {
+        kind: 'READ_ACK',
+        chatId,
+        messageIds,
+        fromId: me.id,
+      });
+    });
+
+    // Mark locally as read
+    const idSet = new Set(unreadFromPeer.map((m) => m.id));
+    setMessages((prev) =>
+      prev.map((m) => {
+        if (idSet.has(m.id)) {
+          const updated: ChatMessage = { ...m, status: 'read' };
+          void dbSaveMessage(updated);
+          return updated;
+        }
+        return m;
+      })
+    );
+  }, []);
+
+  // Clean up any active call & record call history
+  const finalizeCall = useCallback(
+    (statusOverride?: 'answered' | 'missed' | 'rejected') => {
+      stopRingtone();
+      if (callTimerRef.current !== null) {
+        window.clearInterval(callTimerRef.current);
+        callTimerRef.current = null;
+      }
+
+      const rt = callRuntimeRef.current;
+      callRuntimeRef.current = null;
+      setActiveCallUI(null);
+
+      if (!rt) return;
+
+      try {
+        rt.mediaCall.close();
+      } catch {
+        // ignore
+      }
+      if (rt.localStream) {
+        rt.localStream.getTracks().forEach((t) => t.stop());
+      }
+
+      const duration = rt.connectedAt
+        ? Math.max(1, Math.floor((Date.now() - rt.connectedAt) / 1000))
+        : 0;
+      const finalStatus: CallRecord['status'] =
+        statusOverride ?? (rt.connectedAt ? 'answered' : 'missed');
+
+      const record: CallRecord = {
+        id: rt.callId,
+        peerId: rt.peerId,
+        peerName: rt.peerName,
+        peerAvatar: rt.peerAvatar,
+        callType: rt.callType,
+        direction: rt.direction,
+        status: finalStatus,
+        timestamp: rt.startedAt,
+        duration,
+      };
+      setCalls((prev) => [record, ...prev]);
+      void dbSaveCall(record);
+    },
+    []
+  );
+
+  // Incoming PeerJS DataChannel packet handler
+  const handleIncomingPacket = useCallback(
+    (fromId: string, packet: PeerPacket) => {
+      const me = profileRef.current;
+      if (!me) return;
+
+      switch (packet.kind) {
+        case 'HELLO': {
+          const existing = contactsRef.current.find((c) => c.id === fromId);
+          if (existing) {
+            upsertContact({
+              ...existing,
+              name: packet.profile.name || existing.name,
+              bio: packet.profile.bio || existing.bio,
+              avatar: packet.profile.avatar || existing.avatar,
+              lastSeen: Date.now(),
+            });
+          }
+          break;
+        }
+
+        case 'MESSAGE': {
+          const incomingMsg = packet.message;
+          // Determine local chatId: for 1:1, chatId is sender's 6-digit ID; for groups, keep groupId
+          const localChatId = incomingMsg.isGroup ? incomingMsg.chatId : fromId;
+
+          // Ensure contact / group exists locally
+          if (incomingMsg.isGroup && packet.groupMeta) {
+            const existingGroup = contactsRef.current.find((c) => c.id === localChatId);
+            if (!existingGroup) {
+              upsertContact({
+                id: packet.groupMeta.id,
+                name: packet.groupMeta.name,
+                bio: 'Grup P2P WA6',
+                avatar: packet.groupMeta.avatar,
+                addedAt: Date.now(),
+                isGroup: true,
+                members: packet.groupMeta.members,
+                memberNames: packet.groupMeta.memberNames,
+                adminId: packet.groupMeta.adminId,
+              });
+            }
+          } else {
+            const existingContact = contactsRef.current.find((c) => c.id === fromId);
+            if (!existingContact) {
+              upsertContact({
+                id: fromId,
+                name: incomingMsg.senderName || `Teman ${fromId}`,
+                bio: 'Ada',
+                avatar: '',
+                addedAt: Date.now(),
+              });
+            }
+          }
+
+          // Idempotent insert (guard duplicates)
+          const alreadyExists = messagesRef.current.some((m) => m.id === incomingMsg.id);
+          if (!alreadyExists) {
+            const isViewingChat = activeChatIdRef.current === localChatId;
+            const savedMsg: ChatMessage = {
+              ...incomingMsg,
+              chatId: localChatId,
+              status: isViewingChat ? 'read' : 'delivered',
+            };
+
+            setMessages((prev) => {
+              if (prev.some((m) => m.id === savedMsg.id)) return prev;
+              return [...prev, savedMsg];
+            });
+            void dbSaveMessage(savedMsg);
+
+            // Always send DELIVERY_ACK
+            peerManagerRef.current?.sendPacket(fromId, {
+              kind: 'DELIVERY_ACK',
+              messageId: incomingMsg.id,
+              chatId: incomingMsg.isGroup ? localChatId : me.id,
+              fromId: me.id,
+            });
+
+            if (isViewingChat) {
+              // Immediately send READ_ACK (turns sender's ticks blue!)
+              peerManagerRef.current?.sendPacket(fromId, {
+                kind: 'READ_ACK',
+                chatId: incomingMsg.isGroup ? localChatId : me.id,
+                messageIds: [incomingMsg.id],
+                fromId: me.id,
+              });
+            } else {
+              setUnreadCounts((prev) => ({
+                ...prev,
+                [localChatId]: (prev[localChatId] || 0) + 1,
+              }));
+              playMessagePop(true);
+            }
+          }
+          break;
+        }
+
+        case 'DELIVERY_ACK': {
+          setMessages((prev) =>
+            prev.map((m) => {
+              if (m.id === packet.messageId && m.status !== 'read') {
+                const updated: ChatMessage = { ...m, status: 'delivered' };
+                void dbSaveMessage(updated);
+                return updated;
+              }
+              return m;
+            })
+          );
+          break;
+        }
+
+        case 'READ_ACK': {
+          const idSet = new Set(packet.messageIds);
+          setMessages((prev) =>
+            prev.map((m) => {
+              if (idSet.has(m.id) && m.status !== 'read') {
+                const updated: ChatMessage = { ...m, status: 'read' };
+                void dbSaveMessage(updated);
+                return updated;
+              }
+              return m;
+            })
+          );
+          break;
+        }
+
+        case 'TYPING': {
+          const targetChat = packet.chatId === me.id ? fromId : packet.chatId;
+          if (typingClearTimersRef.current[targetChat]) {
+            window.clearTimeout(typingClearTimersRef.current[targetChat]);
+          }
+          if (packet.isTyping) {
+            setTypingMap((prev) => ({ ...prev, [targetChat]: packet.fromName }));
+            typingClearTimersRef.current[targetChat] = window.setTimeout(() => {
+              setTypingMap((prev) => {
+                const next = { ...prev };
+                delete next[targetChat];
+                return next;
+              });
+            }, 3500);
+          } else {
+            setTypingMap((prev) => {
+              const next = { ...prev };
+              delete next[targetChat];
+              return next;
+            });
+          }
+          break;
+        }
+
+        case 'DELETE_MSG': {
+          setMessages((prev) =>
+            prev.map((m) => {
+              if (m.id === packet.messageId) {
+                const updated: ChatMessage = {
+                  ...m,
+                  deleted: true,
+                  text: undefined,
+                  mediaData: undefined,
+                };
+                void dbSaveMessage(updated);
+                return updated;
+              }
+              return m;
+            })
+          );
+          break;
+        }
+
+        case 'STATUS_UPDATE': {
+          const s = packet.status;
+          if (s.expiresAt <= Date.now()) return;
+          setStatuses((prev) => {
+            if (prev.some((item) => item.id === s.id)) return prev;
+            const stored: StatusItem = { ...s, viewed: false };
+            void dbSaveStatus(stored);
+            return [stored, ...prev];
+          });
+          break;
+        }
+
+        case 'GROUP_INVITE': {
+          upsertContact({ ...packet.group, isGroup: true });
+          showToast(`Anda ditambahkan ke grup "${packet.group.name}"`);
+          break;
+        }
+
+        case 'CALL_SIGNAL': {
+          const rt = callRuntimeRef.current;
+          if (packet.action === 'reject' && rt && rt.peerId === fromId) {
+            showToast(`${rt.peerName} menolak panggilan`);
+            finalizeCall('rejected');
+          } else if (packet.action === 'end' && rt && rt.peerId === fromId) {
+            showToast('Panggilan berakhir');
+            finalizeCall();
+          } else if (packet.action === 'busy' && rt && rt.peerId === fromId) {
+            showToast(`${rt.peerName} sedang dalam panggilan lain`);
+            finalizeCall('missed');
+          }
+          break;
+        }
+      }
+    },
+    [upsertContact, finalizeCall, showToast]
+  );
+
+  // Incoming WebRTC Media Call handler
+  const handleIncomingMediaCall = useCallback(
+    (mediaCall: MediaConnection) => {
+      const me = profileRef.current;
+      if (!me) return;
+      const callerId = fromFullPeerId(mediaCall.peer);
+
+      // If already in a call, reply busy
+      if (callRuntimeRef.current) {
+        peerManagerRef.current?.sendPacket(callerId, {
+          kind: 'CALL_SIGNAL',
+          action: 'busy',
+          callId: generateUid('call'),
+          callType: 'audio',
+          fromId: me.id,
+          fromName: me.name,
+          fromAvatar: me.avatar,
+        });
+        mediaCall.close();
+        return;
+      }
+
+      const meta = (mediaCall.metadata || {}) as {
+        callId?: string;
+        callType?: CallType;
+        callerName?: string;
+        callerAvatar?: string;
+      };
+
+      const existingContact = contactsRef.current.find((c) => c.id === callerId);
+      const callerName = existingContact?.name || meta.callerName || `ID ${callerId}`;
+      const callerAvatar = existingContact?.avatar || meta.callerAvatar || '';
+      const callType: CallType = meta.callType === 'video' ? 'video' : 'audio';
+      const callId = meta.callId || generateUid('call');
+
+      callRuntimeRef.current = {
+        callId,
+        peerId: callerId,
+        peerName: callerName,
+        peerAvatar: callerAvatar,
+        callType,
+        direction: 'incoming',
+        mediaCall,
+        localStream: null,
+        startedAt: Date.now(),
+        connectedAt: null,
+        facingMode: 'user',
+      };
+
+      setActiveCallUI({
+        callId,
+        peerId: callerId,
+        peerName: callerName,
+        peerAvatar: callerAvatar,
+        callType,
+        phase: 'incoming',
+        duration: 0,
+        isMuted: false,
+        isCameraOff: callType !== 'video',
+        isSpeakerOn: true,
+        localStream: null,
+        remoteStream: null,
+      });
+
+      startIncomingRingtone();
+
+      mediaCall.on('close', () => {
+        if (callRuntimeRef.current?.callId === callId) {
+          finalizeCall();
+        }
+      });
+
+      mediaCall.on('error', () => {
+        if (callRuntimeRef.current?.callId === callId) {
+          finalizeCall();
+        }
+      });
+    },
+    [finalizeCall]
+  );
+
+  // Initialize PeerJS whenever profile is ready
+  useEffect(() => {
+    if (!profile) return;
+
+    const manager = new WA6PeerManager(profile, {
+      onStatusChange: (state, errMsg) => {
+        setPeerState(state);
+        setPeerError(errMsg);
+        if (state === 'online') {
+          // Proactively handshake known 1:1 contacts to establish presence
+          contactsRef.current
+            .filter((c) => !c.isGroup)
+            .forEach((c) => manager.ensureConnection(c.id));
+        }
+      },
+      onPacket: handleIncomingPacket,
+      onPeerPresence: (sixId, isOnline) => {
+        setOnlinePeers((prev) => {
+          if (prev[sixId] === isOnline) return prev;
+          return { ...prev, [sixId]: isOnline };
+        });
+      },
+      onIncomingMediaCall: handleIncomingMediaCall,
+    });
+
+    peerManagerRef.current = manager;
+    manager.connect();
+
+    return () => {
+      manager.destroy();
+      peerManagerRef.current = null;
+    };
+    // Re-init only when user ID changes (login/reset)
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [profile?.id]);
+
+  // Whenever user opens a chat room, clear unread badge & send READ_ACK
+  useEffect(() => {
+    if (!activeChatId) return;
+    setUnreadCounts((prev) => {
+      if (!prev[activeChatId]) return prev;
+      const next = { ...prev };
+      delete next[activeChatId];
+      return next;
+    });
+    sendReadAcksForChat(activeChatId);
+
+    // Ensure P2P connection to this contact (or group members)
+    const target = contactsRef.current.find((c) => c.id === activeChatId);
+    if (target) {
+      if (target.isGroup && target.members) {
+        target.members.forEach((mId) => {
+          if (mId !== profileRef.current?.id) {
+            peerManagerRef.current?.ensureConnection(mId);
+          }
+        });
+      } else {
+        peerManagerRef.current?.ensureConnection(target.id);
+      }
+    }
+  }, [activeChatId, sendReadAcksForChat]);
+
+  // Auto-apply deep-link invite (?add=482910&name=...) once profile & local DB are ready
+  useEffect(() => {
+    if (!profile || !dataLoaded || !pendingInvite) return;
+    const invite = pendingInvite;
+    setPendingInvite(null);
+
+    // Clean query string from URL bar without reloading
+    try {
+      const cleanUrl = `${window.location.origin}${window.location.pathname}`;
+      window.history.replaceState({}, '', cleanUrl);
+    } catch {
+      // ignore
+    }
+
+    if (invite.id === profile.id) return;
+
+    const existing = contactsRef.current.find((c) => c.id === invite.id);
+    if (!existing) {
+      upsertContact({
+        id: invite.id,
+        name: invite.name || `Teman ${invite.id}`,
+        bio: 'Ada',
+        avatar: '',
+        addedAt: Date.now(),
+      });
+    } else if (invite.name && existing.name.startsWith('Teman ')) {
+      upsertContact({ ...existing, name: invite.name });
+    }
+    setActiveTab('chats');
+    setActiveChatId(invite.id);
+    peerManagerRef.current?.ensureConnection(invite.id);
+    showToast(`Terhubung dengan ${invite.name || `ID ${invite.id}`} via tautan undangan`);
+  }, [profile, dataLoaded, pendingInvite, upsertContact, showToast]);
+
+  // Complete Onboarding
+  const handleCompleteOnboarding = (newProfile: UserProfile) => {
+    saveUserProfile(newProfile);
+    setProfile(newProfile);
+    showToast(`Selamat datang, ${newProfile.name}! ID Anda: ${newProfile.id}`);
+  };
+
+  // Update Profile
+  const handleUpdateProfile = (updated: UserProfile) => {
+    saveUserProfile(updated);
+    setProfile(updated);
+    peerManagerRef.current?.updateProfile(updated);
+  };
+
+  // Add Contact / Open Chat
+  const handleAddContact = (sixDigitId: string, nickname?: string) => {
+    const existing = contacts.find((c) => c.id === sixDigitId);
+    if (!existing) {
+      const contact: Contact = {
+        id: sixDigitId,
+        name: nickname || `Teman ${sixDigitId}`,
+        bio: 'Ada',
+        avatar: '',
+        addedAt: Date.now(),
+      };
+      upsertContact(contact);
+    } else if (nickname) {
+      upsertContact({ ...existing, name: nickname });
+    }
+    setShowNewChatModal(false);
+    setActiveTab('chats');
+    setActiveChatId(sixDigitId);
+    peerManagerRef.current?.ensureConnection(sixDigitId);
+  };
+
+  // Create Group Chat P2P
+  const handleCreateGroup = (name: string, memberIds: string[], avatar: string) => {
+    if (!profile) return;
+    const allMembers = Array.from(new Set([profile.id, ...memberIds]));
+    const memberNames: Record<string, string> = { [profile.id]: profile.name };
+    for (const id of memberIds) {
+      const c = contacts.find((ct) => ct.id === id);
+      memberNames[id] = c?.name || `Teman ${id}`;
+    }
+
+    const groupContact: Contact = {
+      id: `GRP-${Math.random().toString(36).slice(2, 8).toUpperCase()}`,
+      name,
+      bio: `Grup P2P · Dibuat oleh ${profile.name}`,
+      avatar,
+      addedAt: Date.now(),
+      isGroup: true,
+      members: allMembers,
+      memberNames,
+      adminId: profile.id,
+    };
+
+    upsertContact(groupContact);
+
+    // Broadcast group invitation to every member
+    for (const memberId of memberIds) {
+      peerManagerRef.current?.sendPacket(memberId, {
+        kind: 'GROUP_INVITE',
+        group: groupContact,
+      });
+    }
+
+    setShowNewGroupModal(false);
+    setActiveTab('chats');
+    setActiveChatId(groupContact.id);
+    showToast(`Grup "${name}" berhasil dibuat`);
+  };
+
+  // Send message (text / image / video / document / voice) to 1:1 or P2P Group
+  const dispatchMessage = useCallback(
+    (
+      chatId: string,
+      payload: Omit<ChatMessage, 'id' | 'chatId' | 'senderId' | 'senderName' | 'timestamp' | 'status' | 'isGroup'>
+    ) => {
+      const me = profileRef.current;
+      const target = contactsRef.current.find((c) => c.id === chatId);
+      if (!me || !target) return;
+
+      const msg: ChatMessage = {
+        id: generateUid('msg'),
+        chatId,
+        senderId: me.id,
+        senderName: me.name,
+        timestamp: Date.now(),
+        status: 'sent',
+        isGroup: Boolean(target.isGroup),
+        ...payload,
+      };
+
+      setMessages((prev) => [...prev, msg]);
+      void dbSaveMessage(msg);
+      playMessagePop(false);
+
+      const manager = peerManagerRef.current;
+      if (!manager) return;
+
+      if (target.isGroup && target.members) {
+        const packet: PeerPacket = {
+          kind: 'MESSAGE',
+          message: msg,
+          groupMeta: {
+            id: target.id,
+            name: target.name,
+            avatar: target.avatar,
+            members: target.members,
+            memberNames: target.memberNames || {},
+            adminId: target.adminId || me.id,
+          },
+        };
+        target.members.forEach((mId) => {
+          if (mId !== me.id) {
+            manager.sendPacket(mId, packet);
+          }
+        });
+      } else {
+        manager.sendPacket(target.id, {
+          kind: 'MESSAGE',
+          message: msg,
+        });
+      }
+    },
+    []
+  );
+
+  // Typing signal
+  const handleTyping = useCallback((isTyping: boolean) => {
+    const me = profileRef.current;
+    const chatId = activeChatIdRef.current;
+    const manager = peerManagerRef.current;
+    if (!me || !chatId || !manager) return;
+
+    const target = contactsRef.current.find((c) => c.id === chatId);
+    if (!target) return;
+
+    const pkt: PeerPacket = {
+      kind: 'TYPING',
+      chatId: target.isGroup ? target.id : me.id,
+      fromId: me.id,
+      fromName: me.name,
+      isTyping,
+    };
+
+    if (target.isGroup && target.members) {
+      target.members.forEach((mId) => {
+        if (mId !== me.id && manager.isPeerOnline(mId)) {
+          manager.sendPacket(mId, pkt);
+        }
+      });
+    } else if (manager.isPeerOnline(target.id)) {
+      manager.sendPacket(target.id, pkt);
+    }
+  }, []);
+
+  // Delete message
+  const handleDeleteMessage = (messageId: string, forEveryone: boolean) => {
+    const me = profileRef.current;
+    const chatId = activeChatIdRef.current;
+    if (!me || !chatId) return;
+
+    setMessages((prev) =>
+      prev.map((m) => {
+        if (m.id === messageId) {
+          const updated: ChatMessage = {
+            ...m,
+            deleted: true,
+            text: undefined,
+            mediaData: undefined,
+          };
+          void dbSaveMessage(updated);
+          return updated;
+        }
+        return m;
+      })
+    );
+
+    if (forEveryone) {
+      const target = contacts.find((c) => c.id === chatId);
+      const pkt: PeerPacket = {
+        kind: 'DELETE_MSG',
+        chatId,
+        messageId,
+        fromId: me.id,
+      };
+      if (target?.isGroup && target.members) {
+        target.members.forEach((mId) => {
+          if (mId !== me.id) peerManagerRef.current?.sendPacket(mId, pkt);
+        });
+      } else if (target) {
+        peerManagerRef.current?.sendPacket(target.id, pkt);
+      }
+    }
+  };
+
+  // Clear chat / Delete contact
+  const handleClearChat = (chatId: string) => {
+    setMessages((prev) => prev.filter((m) => m.chatId !== chatId));
+    void dbDeleteMessagesForChat(chatId);
+    showToast('Riwayat obrolan dibersihkan');
+  };
+
+  const handleDeleteContact = (chatId: string) => {
+    setContacts((prev) => prev.filter((c) => c.id !== chatId));
+    setMessages((prev) => prev.filter((m) => m.chatId !== chatId));
+    void dbDeleteContact(chatId);
+    void dbDeleteMessagesForChat(chatId);
+    if (activeChatId === chatId) setActiveChatId(null);
+    showToast('Kontak dihapus');
+  };
+
+  // Status Posting (24-hour TTL + P2P broadcast to connected contacts)
+  const broadcastStatus = (status: StatusItem) => {
+    setStatuses((prev) => [status, ...prev]);
+    void dbSaveStatus(status);
+    contacts
+      .filter((c) => !c.isGroup)
+      .forEach((c) => {
+        peerManagerRef.current?.sendPacket(c.id, {
+          kind: 'STATUS_UPDATE',
+          status,
+        });
+      });
+    showToast('Pembaruan status dipublikasikan (24 jam)');
+  };
+
+  const handlePostTextStatus = (text: string, bgColor: string, fontClass: string) => {
+    if (!profile) return;
+    const now = Date.now();
+    broadcastStatus({
+      id: generateUid('st'),
+      userId: profile.id,
+      userName: profile.name,
+      userAvatar: profile.avatar,
+      type: 'text',
+      text,
+      bgColor,
+      fontClass,
+      timestamp: now,
+      expiresAt: now + 24 * 60 * 60 * 1000,
+      viewed: true,
+    });
+  };
+
+  const handlePostImageStatus = (mediaData: string, caption: string) => {
+    if (!profile) return;
+    const now = Date.now();
+    broadcastStatus({
+      id: generateUid('st'),
+      userId: profile.id,
+      userName: profile.name,
+      userAvatar: profile.avatar,
+      type: 'image',
+      mediaData,
+      caption,
+      timestamp: now,
+      expiresAt: now + 24 * 60 * 60 * 1000,
+      viewed: true,
+    });
+  };
+
+  const handleMarkStatusViewed = useCallback((statusId: string) => {
+    setStatuses((prev) =>
+      prev.map((s) => {
+        if (s.id === statusId && !s.viewed) {
+          const updated = { ...s, viewed: true };
+          void dbSaveStatus(updated);
+          return updated;
+        }
+        return s;
+      })
+    );
+  }, []);
+
+  const handleDeleteStatus = (statusId: string) => {
+    setStatuses((prev) => prev.filter((s) => s.id !== statusId));
+    void dbDeleteStatus(statusId);
+    showToast('Status dihapus');
+  };
+
+  const handleReplyToStatus = (userId: string, statusText: string, replyText: string) => {
+    const existing = contacts.find((c) => c.id === userId);
+    if (!existing) {
+      upsertContact({
+        id: userId,
+        name: `Teman ${userId}`,
+        bio: 'Ada',
+        avatar: '',
+        addedAt: Date.now(),
+      });
+    }
+    setActiveTab('chats');
+    setActiveChatId(userId);
+    window.setTimeout(() => {
+      dispatchMessage(userId, {
+        type: 'text',
+        text: replyText,
+        replyTo: {
+          id: 'status-reply',
+          senderId: userId,
+          senderName: `Status · ${existing?.name || userId}`,
+          type: 'text',
+          text: statusText,
+        },
+      });
+    }, 50);
+  };
+
+  // Start Outgoing Audio / Video Call
+  const handleStartCall = async (peerId: string, callType: CallType) => {
+    if (!profile) return;
+    if (callRuntimeRef.current) {
+      showToast('Anda sedang dalam panggilan aktif.');
+      return;
+    }
+
+    const manager = peerManagerRef.current;
+    if (!manager || peerState !== 'online') {
+      showToast('Menunggu koneksi PeerJS online sebelum menelepon.');
+      return;
+    }
+
+    try {
+      const localStream = await navigator.mediaDevices.getUserMedia({
+        audio: true,
+        video: callType === 'video' ? { facingMode: 'user' } : false,
+      });
+
+      const callId = generateUid('call');
+      const contact = contacts.find((c) => c.id === peerId);
+      const peerName = contact?.name || `ID ${peerId}`;
+      const peerAvatar = contact?.avatar || '';
+
+      const mediaCall = manager.startMediaCall(peerId, localStream, {
+        callId,
+        callType,
+        callerName: profile.name,
+        callerAvatar: profile.avatar,
+      });
+
+      if (!mediaCall) {
+        localStream.getTracks().forEach((t) => t.stop());
+        showToast('Gagal memulai panggilan. Pastikan teman sedang online.');
+        return;
+      }
+
+      callRuntimeRef.current = {
+        callId,
+        peerId,
+        peerName,
+        peerAvatar,
+        callType,
+        direction: 'outgoing',
+        mediaCall,
+        localStream,
+        startedAt: Date.now(),
+        connectedAt: null,
+        facingMode: 'user',
+      };
+
+      setActiveCallUI({
+        callId,
+        peerId,
+        peerName,
+        peerAvatar,
+        callType,
+        phase: 'outgoing',
+        duration: 0,
+        isMuted: false,
+        isCameraOff: callType !== 'video',
+        isSpeakerOn: true,
+        localStream,
+        remoteStream: null,
+      });
+
+      startOutgoingRingback();
+
+      mediaCall.on('stream', (remoteStream) => {
+        if (callRuntimeRef.current?.callId !== callId) return;
+        stopRingtone();
+        if (!callRuntimeRef.current.connectedAt) {
+          callRuntimeRef.current.connectedAt = Date.now();
+          callTimerRef.current = window.setInterval(() => {
+            if (!callRuntimeRef.current?.connectedAt) return;
+            const secs = Math.floor((Date.now() - callRuntimeRef.current.connectedAt) / 1000);
+            setActiveCallUI((prev) => (prev ? { ...prev, duration: secs } : null));
+          }, 1000);
+        }
+        setActiveCallUI((prev) =>
+          prev ? { ...prev, phase: 'connected', remoteStream } : null
+        );
+      });
+
+      mediaCall.on('close', () => {
+        if (callRuntimeRef.current?.callId === callId) {
+          finalizeCall();
+        }
+      });
+
+      mediaCall.on('error', () => {
+        if (callRuntimeRef.current?.callId === callId) {
+          showToast('Panggilan tidak dapat tersambung.');
+          finalizeCall('missed');
+        }
+      });
+    } catch {
+      showToast(
+        callType === 'video'
+          ? 'Izin kamera dan mikrofon diperlukan untuk panggilan video.'
+          : 'Izin mikrofon diperlukan untuk panggilan suara.'
+      );
+    }
+  };
+
+  // Accept Incoming Call
+  const handleAcceptCall = async () => {
+    const rt = callRuntimeRef.current;
+    if (!rt) return;
+    stopRingtone();
+
+    try {
+      const localStream = await navigator.mediaDevices.getUserMedia({
+        audio: true,
+        video: rt.callType === 'video' ? { facingMode: 'user' } : false,
+      });
+
+      rt.localStream = localStream;
+      rt.connectedAt = Date.now();
+      rt.mediaCall.answer(localStream);
+
+      setActiveCallUI((prev) =>
+        prev ? { ...prev, phase: 'connected', localStream } : null
+      );
+
+      callTimerRef.current = window.setInterval(() => {
+        if (!callRuntimeRef.current?.connectedAt) return;
+        const secs = Math.floor((Date.now() - callRuntimeRef.current.connectedAt) / 1000);
+        setActiveCallUI((prev) => (prev ? { ...prev, duration: secs } : null));
+      }, 1000);
+
+      rt.mediaCall.on('stream', (remoteStream) => {
+        if (callRuntimeRef.current?.callId !== rt.callId) return;
+        setActiveCallUI((prev) => (prev ? { ...prev, remoteStream } : null));
+      });
+    } catch {
+      showToast('Gagal mengakses mikrofon/kamera.');
+      handleRejectCall();
+    }
+  };
+
+  const handleRejectCall = () => {
+    const rt = callRuntimeRef.current;
+    const me = profileRef.current;
+    if (rt && me) {
+      peerManagerRef.current?.sendPacket(rt.peerId, {
+        kind: 'CALL_SIGNAL',
+        action: 'reject',
+        callId: rt.callId,
+        callType: rt.callType,
+        fromId: me.id,
+        fromName: me.name,
+        fromAvatar: me.avatar,
+      });
+    }
+    finalizeCall('rejected');
+  };
+
+  const handleEndCall = () => {
+    const rt = callRuntimeRef.current;
+    const me = profileRef.current;
+    if (rt && me) {
+      peerManagerRef.current?.sendPacket(rt.peerId, {
+        kind: 'CALL_SIGNAL',
+        action: 'end',
+        callId: rt.callId,
+        callType: rt.callType,
+        fromId: me.id,
+        fromName: me.name,
+        fromAvatar: me.avatar,
+      });
+    }
+    finalizeCall();
+  };
+
+  const handleToggleMute = () => {
+    const rt = callRuntimeRef.current;
+    if (!rt?.localStream) return;
+    const nextMuted = !activeCallUI?.isMuted;
+    rt.localStream.getAudioTracks().forEach((t) => {
+      t.enabled = !nextMuted;
+    });
+    setActiveCallUI((prev) => (prev ? { ...prev, isMuted: nextMuted } : null));
+  };
+
+  const handleToggleCamera = () => {
+    const rt = callRuntimeRef.current;
+    if (!rt?.localStream) return;
+    const nextOff = !activeCallUI?.isCameraOff;
+    rt.localStream.getVideoTracks().forEach((t) => {
+      t.enabled = !nextOff;
+    });
+    setActiveCallUI((prev) => (prev ? { ...prev, isCameraOff: nextOff } : null));
+  };
+
+  const handleSwitchCamera = async () => {
+    const rt = callRuntimeRef.current;
+    if (!rt?.localStream || rt.callType !== 'video') return;
+    const nextFacing: 'user' | 'environment' =
+      rt.facingMode === 'user' ? 'environment' : 'user';
+    try {
+      const newVideoStream = await navigator.mediaDevices.getUserMedia({
+        video: { facingMode: nextFacing },
+        audio: false,
+      });
+      const newVideoTrack = newVideoStream.getVideoTracks()[0];
+      if (!newVideoTrack) return;
+
+      // Replace video track in RTCPeerConnection sender so remote sees new camera seamlessly
+      const pc = (rt.mediaCall as unknown as { peerConnection?: RTCPeerConnection })
+        .peerConnection;
+      if (pc) {
+        const sender = pc.getSenders().find((s) => s.track?.kind === 'video');
+        if (sender) {
+          await sender.replaceTrack(newVideoTrack);
+        }
+      }
+
+      // Stop old video track & update local stream
+      rt.localStream.getVideoTracks().forEach((t) => {
+        t.stop();
+        rt.localStream?.removeTrack(t);
+      });
+      rt.localStream.addTrack(newVideoTrack);
+      rt.facingMode = nextFacing;
+      setActiveCallUI((prev) =>
+        prev ? { ...prev, localStream: new MediaStream(rt.localStream!.getTracks()) } : null
+      );
+    } catch {
+      showToast('Kamera lain tidak tersedia pada perangkat ini.');
+    }
+  };
+
+  const handleToggleSpeaker = () => {
+    setActiveCallUI((prev) => (prev ? { ...prev, isSpeakerOn: !prev.isSpeakerOn } : null));
+  };
+
+  // Reset all data
+  const handleConfirmReset = async () => {
+    peerManagerRef.current?.destroy();
+    await resetAllLocalData();
+    setContacts([]);
+    setMessages([]);
+    setStatuses([]);
+    setCalls([]);
+    setUnreadCounts({});
+    setActiveChatId(null);
+    setShowResetConfirm(false);
+    setProfile(null);
+  };
+
+  const activeContact = useMemo(
+    () => contacts.find((c) => c.id === activeChatId) || null,
+    [contacts, activeChatId]
+  );
+
+  const activeChatMessages = useMemo(
+    () => (activeChatId ? messages.filter((m) => m.chatId === activeChatId) : []),
+    [messages, activeChatId]
+  );
+
+  const totalUnreadChats = useMemo(
+    () => Object.values(unreadCounts).reduce((sum, n) => sum + (n > 0 ? 1 : 0), 0),
+    [unreadCounts]
+  );
+
+  const hasUnviewedStatus = useMemo(
+    () => statuses.some((s) => s.userId !== profile?.id && !s.viewed && s.expiresAt > Date.now()),
+    [statuses, profile?.id]
+  );
+
+  // Show Welcome / Onboarding if no profile saved yet
+  if (!profile) {
+    return <OnboardingScreen onComplete={handleCompleteOnboarding} />;
+  }
+
+  return (
+    <div className="h-dvh w-full flex bg-[#F0F2F5] dark:bg-[#0B141A] overflow-hidden relative">
+      {/* LEFT SIDEBAR (Full-width on mobile when no chat active; fixed 390px-420px split-pane on desktop) */}
+      <aside
+        className={`w-full md:w-[380px] lg:w-[420px] h-full flex flex-col bg-white dark:bg-[#111B21] border-r border-black/10 dark:border-white/10 shrink-0 ${
+          activeContact ? 'hidden md:flex' : 'flex'
+        }`}
+      >
+        {/* Top WhatsApp Header (#008069 Light / #1F2C34 Dark) */}
+        <header className="bg-[#008069] dark:bg-[#1F2C34] text-white shrink-0 pt-safe">
+          {searchOpen ? (
+            <div className="h-[58px] px-3 flex items-center gap-2">
+              <button
+                type="button"
+                onClick={() => {
+                  setSearchOpen(false);
+                  setSearchQuery('');
+                }}
+                className="w-10 h-10 rounded-full flex items-center justify-center hover:bg-white/10 cursor-pointer"
+                aria-label="Tutup pencarian"
+              >
+                <X className="w-5 h-5" />
+              </button>
+              <input
+                type="text"
+                value={searchQuery}
+                onChange={(e) => setSearchQuery(e.target.value)}
+                placeholder="Cari chat, ID 6 digit, atau panggilan..."
+                autoFocus
+                className="flex-1 h-10 px-3 rounded-xl bg-white/15 text-white placeholder:text-white/70 text-sm focus:outline-none"
+              />
+            </div>
+          ) : (
+            <div className="h-[58px] px-4 flex items-center justify-between gap-2">
+              {/* Brand & PeerJS Live Status Indicator */}
+              <div className="flex items-center gap-2.5 min-w-0">
+                <button
+                  type="button"
+                  onClick={() => setShowProfileDrawer(true)}
+                  className="text-xl font-bold tracking-tight whitespace-nowrap hover:opacity-90 cursor-pointer"
+                >
+                  WA6
+                </button>
+                <button
+                  type="button"
+                  onClick={() => {
+                    if (peerState !== 'online') {
+                      peerManagerRef.current?.connect();
+                      showToast('Menghubungkan ulang ke server PeerJS...');
+                    } else {
+                      setShowProfileDrawer(true);
+                    }
+                  }}
+                  title={peerError || `ID Anda: ${profile.id}`}
+                  className="inline-flex items-center gap-1.5 text-[11.5px] font-medium text-white/90 hover:text-white transition-colors whitespace-nowrap cursor-pointer"
+                >
+                  <span
+                    className={`w-2 h-2 rounded-full shrink-0 ${
+                      peerState === 'online'
+                        ? 'bg-[#25D366]'
+                        : peerState === 'connecting'
+                        ? 'bg-amber-300 animate-pulse'
+                        : 'bg-rose-400'
+                    }`}
+                  />
+                  <span>
+                    {peerState === 'online'
+                      ? 'Online'
+                      : peerState === 'connecting'
+                      ? 'Menghubungkan...'
+                      : 'Terputus'}
+                  </span>
+                  {peerState === 'disconnected' || peerState === 'error' ? (
+                    <RefreshCw className="w-3 h-3" />
+                  ) : null}
+                </button>
+              </div>
+
+              {/* Right Icons: Camera, Global Search, 3-Dot Menu */}
+              <div className="flex items-center gap-0.5 shrink-0">
+                <button
+                  type="button"
+                  onClick={() => setCameraPurpose(activeContact ? 'chat' : 'status')}
+                  className="w-10 h-10 rounded-full flex items-center justify-center hover:bg-white/10 transition-colors cursor-pointer"
+                  title="Kamera"
+                  aria-label="Buka Kamera"
+                >
+                  <Camera className="w-5 h-5" />
+                </button>
+
+                <button
+                  type="button"
+                  onClick={() => setSearchOpen(true)}
+                  className="w-10 h-10 rounded-full flex items-center justify-center hover:bg-white/10 transition-colors cursor-pointer"
+                  title="Pencarian"
+                  aria-label="Pencarian global"
+                >
+                  <Search className="w-5 h-5" />
+                </button>
+
+                <div className="relative">
+                  <button
+                    type="button"
+                    onClick={() => setShowMainMenu((prev) => !prev)}
+                    className="w-10 h-10 rounded-full flex items-center justify-center hover:bg-white/10 transition-colors cursor-pointer"
+                    title="Menu lainnya"
+                    aria-label="Menu titik tiga"
+                  >
+                    <MoreVertical className="w-5 h-5" />
+                  </button>
+
+                  {showMainMenu && (
+                    <>
+                      <div
+                        className="fixed inset-0 z-30"
+                        onClick={() => setShowMainMenu(false)}
+                      />
+                      <div className="absolute right-0 mt-1 w-56 rounded-xl bg-white dark:bg-[#233138] shadow-2xl border border-black/10 dark:border-white/10 py-1.5 z-40 text-[#111B21] dark:text-[#E9EDEF]">
+                        <button
+                          type="button"
+                          onClick={() => {
+                            setShowMainMenu(false);
+                            setShowNewGroupModal(true);
+                          }}
+                          className="w-full flex items-center gap-3 px-4 py-3 text-left text-sm hover:bg-[#F5F6F6] dark:hover:bg-[#182229] transition-colors cursor-pointer"
+                        >
+                          <Users className="w-4 h-4 text-[#008069] dark:text-[#00A884] shrink-0" />
+                          <span>Grup Baru</span>
+                        </button>
+
+                        <button
+                          type="button"
+                          onClick={() => {
+                            setShowMainMenu(false);
+                            setShowProfileDrawer(true);
+                          }}
+                          className="w-full flex items-center gap-3 px-4 py-3 text-left text-sm hover:bg-[#F5F6F6] dark:hover:bg-[#182229] transition-colors cursor-pointer"
+                        >
+                          <User className="w-4 h-4 text-[#008069] dark:text-[#00A884] shrink-0" />
+                          <span>Profil &amp; ID Saya</span>
+                        </button>
+
+                        <button
+                          type="button"
+                          onClick={() => {
+                            setShowMainMenu(false);
+                            setShowShareAppModal(true);
+                          }}
+                          className="w-full flex items-center gap-3 px-4 py-3 text-left text-sm hover:bg-[#F5F6F6] dark:hover:bg-[#182229] transition-colors cursor-pointer"
+                        >
+                          <Share2 className="w-4 h-4 text-[#008069] dark:text-[#00A884] shrink-0" />
+                          <span>Bagikan Aplikasi</span>
+                        </button>
+
+                        <button
+                          type="button"
+                          onClick={() => {
+                            setTheme((t) => (t === 'dark' ? 'light' : 'dark'));
+                            setShowMainMenu(false);
+                          }}
+                          className="w-full flex items-center gap-3 px-4 py-3 text-left text-sm hover:bg-[#F5F6F6] dark:hover:bg-[#182229] transition-colors cursor-pointer"
+                        >
+                          {theme === 'dark' ? (
+                            <Sun className="w-4 h-4 text-amber-400 shrink-0" />
+                          ) : (
+                            <Moon className="w-4 h-4 text-[#008069] shrink-0" />
+                          )}
+                          <span>{theme === 'dark' ? 'Mode Terang' : 'Mode Gelap'}</span>
+                        </button>
+
+                        <PWAInstallButton
+                          variant="menu-item"
+                          onAfterClick={() => setShowMainMenu(false)}
+                        />
+
+                        <div className="my-1 border-t border-black/5 dark:border-white/10" />
+
+                        <button
+                          type="button"
+                          onClick={() => {
+                            setShowMainMenu(false);
+                            setShowResetConfirm(true);
+                          }}
+                          className="w-full flex items-center gap-3 px-4 py-3 text-left text-sm text-rose-600 dark:text-rose-400 hover:bg-[#F5F6F6] dark:hover:bg-[#182229] transition-colors cursor-pointer"
+                        >
+                          <Trash2 className="w-4 h-4 shrink-0" />
+                          <span>Reset Data</span>
+                        </button>
+                      </div>
+                    </>
+                  )}
+                </div>
+              </div>
+            </div>
+          )}
+
+          {/* 3 Main WhatsApp Navigation Tabs: Chat · Status · Panggilan */}
+          <nav className="grid grid-cols-3 text-sm font-semibold">
+            <button
+              type="button"
+              onClick={() => setActiveTab('chats')}
+              className={`h-11 flex items-center justify-center gap-1.5 border-b-[3px] transition-colors cursor-pointer ${
+                activeTab === 'chats'
+                  ? 'border-white dark:border-[#00A884] text-white dark:text-[#00A884]'
+                  : 'border-transparent text-white/70 dark:text-[#8696A0] hover:text-white'
+              }`}
+            >
+              <span>Chat</span>
+              {totalUnreadChats > 0 && (
+                <span className="min-w-[18px] h-[18px] px-1 rounded-full bg-white dark:bg-[#00A884] text-[#008069] dark:text-[#111B21] text-[10.5px] font-bold flex items-center justify-center tabular-nums">
+                  {totalUnreadChats}
+                </span>
+              )}
+            </button>
+
+            <button
+              type="button"
+              onClick={() => setActiveTab('status')}
+              className={`h-11 flex items-center justify-center gap-1.5 border-b-[3px] transition-colors cursor-pointer ${
+                activeTab === 'status'
+                  ? 'border-white dark:border-[#00A884] text-white dark:text-[#00A884]'
+                  : 'border-transparent text-white/70 dark:text-[#8696A0] hover:text-white'
+              }`}
+            >
+              <span>Status</span>
+              {hasUnviewedStatus && (
+                <span className="w-2 h-2 rounded-full bg-[#25D366]" />
+              )}
+            </button>
+
+            <button
+              type="button"
+              onClick={() => setActiveTab('calls')}
+              className={`h-11 flex items-center justify-center gap-1.5 border-b-[3px] transition-colors cursor-pointer ${
+                activeTab === 'calls'
+                  ? 'border-white dark:border-[#00A884] text-white dark:text-[#00A884]'
+                  : 'border-transparent text-white/70 dark:text-[#8696A0] hover:text-white'
+              }`}
+            >
+              <span>Panggilan</span>
+            </button>
+          </nav>
+        </header>
+
+        {/* Active Sidebar Tab Content */}
+        {!dataLoaded ? (
+          <div className="flex-1 flex items-center justify-center text-sm text-[#667781] dark:text-[#8696A0]">
+            Memuat data lokal...
+          </div>
+        ) : activeTab === 'chats' ? (
+          <ChatList
+            contacts={contacts}
+            messages={messages}
+            myId={profile.id}
+            activeChatId={activeChatId}
+            unreadCounts={unreadCounts}
+            onlinePeers={onlinePeers}
+            typingMap={typingMap}
+            searchQuery={searchQuery}
+            onSelectChat={(id) => setActiveChatId(id)}
+            onNewChat={() => setShowNewChatModal(true)}
+          />
+        ) : activeTab === 'status' ? (
+          <StatusTab
+            profile={profile}
+            statuses={statuses}
+            onPostTextStatus={handlePostTextStatus}
+            onPostImageStatus={handlePostImageStatus}
+            onMarkStatusViewed={handleMarkStatusViewed}
+            onDeleteStatus={handleDeleteStatus}
+            onReplyToStatus={handleReplyToStatus}
+            onOpenCameraForStatus={() => setCameraPurpose('status')}
+          />
+        ) : (
+          <CallsTab
+            calls={calls}
+            searchQuery={searchQuery}
+            onStartCall={handleStartCall}
+            onClearCalls={() => {
+              setCalls([]);
+              void dbClearCalls();
+              showToast('Riwayat panggilan dihapus');
+            }}
+          />
+        )}
+      </aside>
+
+      {/* RIGHT MAIN PANE (Active Chat Room or Desktop WhatsApp Web Welcome View) */}
+      <main
+        className={`flex-1 h-full flex flex-col min-w-0 ${
+          activeContact ? 'flex' : 'hidden md:flex'
+        }`}
+      >
+        {activeContact ? (
+          <ChatRoom
+            profile={profile}
+            contact={activeContact}
+            messages={activeChatMessages}
+            isPeerOnline={Boolean(onlinePeers[activeContact.id])}
+            typingUserName={typingMap[activeContact.id]}
+            onBack={() => setActiveChatId(null)}
+            onSendText={(txt, replyTo) =>
+              dispatchMessage(activeContact.id, { type: 'text', text: txt, replyTo })
+            }
+            onSendMedia={(media) => dispatchMessage(activeContact.id, media)}
+            onDeleteMessage={handleDeleteMessage}
+            onClearChat={handleClearChat}
+            onDeleteContact={handleDeleteContact}
+            onTyping={handleTyping}
+            onStartCall={handleStartCall}
+            onOpenCamera={() => setCameraPurpose('chat')}
+            onOpenLightbox={setLightboxMedia}
+            onToast={showToast}
+          />
+        ) : (
+          <div className="flex-1 flex flex-col items-center justify-center bg-[#F0F2F5] dark:bg-[#222E35] border-b-[6px] border-[#25D366] dark:border-[#00A884] px-8 text-center">
+            <div className="w-20 h-20 rounded-full bg-[#008069]/12 dark:bg-[#00A884]/15 flex items-center justify-center mb-6">
+              <span className="font-mono-id text-3xl font-bold text-[#008069] dark:text-[#00A884]">
+                6
+              </span>
+            </div>
+            <h1 className="text-2xl font-light text-[#41525D] dark:text-[#E9EDEF]">
+              WA6 Web &amp; PWA
+            </h1>
+            <p className="mt-2.5 text-sm text-[#667781] dark:text-[#8696A0] max-w-md leading-relaxed">
+              Kirim pesan, Voice Note, dokumen, Status 24 jam, dan panggilan suara atau video secara langsung Peer-to-Peer tanpa nomor telepon maupun database eksternal.
+            </p>
+
+            {/* Quick 6-Digit ID Copy Card */}
+            <div className="mt-7 rounded-2xl bg-white dark:bg-[#111B21] border border-black/5 dark:border-white/10 px-6 py-4 shadow-xs flex items-center gap-5">
+              <div className="text-left">
+                <div className="text-xs text-[#667781] dark:text-[#8696A0]">ID 6 Digit Anda</div>
+                <div className="font-mono-id text-2xl font-bold tracking-wider text-[#008069] dark:text-[#00A884]">
+                  {formatSixDigitId(profile.id)}
+                </div>
+              </div>
+              <div className="flex items-center gap-2">
+                <button
+                  type="button"
+                  onClick={async () => {
+                    try {
+                      await navigator.clipboard.writeText(profile.id);
+                      showToast(`ID ${profile.id} disalin`);
+                    } catch {
+                      showToast(`ID Anda: ${profile.id}`);
+                    }
+                  }}
+                  className="h-10 px-3.5 rounded-xl bg-[#008069] hover:bg-[#017561] dark:bg-[#00A884] dark:hover:bg-[#06CF9C] text-white dark:text-[#111B21] text-xs font-semibold flex items-center gap-1.5 cursor-pointer"
+                >
+                  <Copy className="w-3.5 h-3.5" />
+                  <span>Salin ID</span>
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setShowShareAppModal(true)}
+                  className="h-10 px-3.5 rounded-xl bg-[#F0F2F5] dark:bg-[#202C33] text-[#111B21] dark:text-[#E9EDEF] text-xs font-semibold flex items-center gap-1.5 hover:bg-[#E4E7EB] dark:hover:bg-[#2A3942] cursor-pointer whitespace-nowrap"
+                  title="Bagikan Aplikasi via Barcode & Link"
+                >
+                  <Share2 className="w-3.5 h-3.5 text-[#008069] dark:text-[#00A884]" />
+                  <span>Bagikan Aplikasi</span>
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setShowProfileDrawer(true)}
+                  className="h-10 w-10 rounded-xl bg-[#F0F2F5] dark:bg-[#202C33] text-[#111B21] dark:text-[#E9EDEF] flex items-center justify-center hover:bg-[#E4E7EB] dark:hover:bg-[#2A3942] cursor-pointer"
+                  title="Lihat QR Code Saya"
+                >
+                  <QrCode className="w-4 h-4" />
+                </button>
+              </div>
+            </div>
+
+            <div className="mt-10 flex items-center gap-1.5 text-xs text-[#8696A0]">
+              <Lock className="w-3.5 h-3.5" />
+              <span>Terenkripsi Peer-to-Peer (WebRTC DTLS/SRTP) · 100% Penyimpanan Lokal</span>
+            </div>
+          </div>
+        )}
+      </main>
+
+      {/* Modals & Overlays */}
+      {showProfileDrawer && (
+        <ProfileDrawer
+          profile={profile}
+          onUpdateProfile={handleUpdateProfile}
+          onOpenShareApp={() => {
+            setShowProfileDrawer(false);
+            setShowShareAppModal(true);
+          }}
+          onClose={() => setShowProfileDrawer(false)}
+          onToast={showToast}
+        />
+      )}
+
+      {showShareAppModal && (
+        <ShareAppModal
+          profile={profile}
+          onClose={() => setShowShareAppModal(false)}
+          onToast={showToast}
+        />
+      )}
+
+      {showNewChatModal && (
+        <NewChatModal
+          myId={profile.id}
+          onAddContact={handleAddContact}
+          onClose={() => setShowNewChatModal(false)}
+        />
+      )}
+
+      {showNewGroupModal && (
+        <NewGroupModal
+          contacts={contacts}
+          onCreateGroup={handleCreateGroup}
+          onClose={() => setShowNewGroupModal(false)}
+        />
+      )}
+
+      {cameraPurpose && (
+        <CameraModal
+          title={cameraPurpose === 'status' ? 'Foto untuk Status 24 Jam' : 'Kirim Foto ke Obrolan'}
+          onCapture={(dataUrl, caption) => {
+            if (cameraPurpose === 'chat' && activeContact) {
+              dispatchMessage(activeContact.id, {
+                type: 'image',
+                mediaData: dataUrl,
+                text: caption || undefined,
+                fileName: `kamera-${Date.now()}.jpg`,
+                mimeType: 'image/jpeg',
+              });
+            } else {
+              handlePostImageStatus(dataUrl, caption);
+              setActiveTab('status');
+            }
+            setCameraPurpose(null);
+          }}
+          onClose={() => setCameraPurpose(null)}
+        />
+      )}
+
+      {activeCallUI && (
+        <CallOverlay
+          call={activeCallUI}
+          onAccept={handleAcceptCall}
+          onReject={handleRejectCall}
+          onEnd={handleEndCall}
+          onToggleMute={handleToggleMute}
+          onToggleCamera={handleToggleCamera}
+          onSwitchCamera={handleSwitchCamera}
+          onToggleSpeaker={handleToggleSpeaker}
+        />
+      )}
+
+      <MediaLightbox media={lightboxMedia} onClose={() => setLightboxMedia(null)} />
+
+      {/* Reset Data Confirmation Dialog */}
+      {showResetConfirm && (
+        <div
+          className="fixed inset-0 z-[100] flex items-center justify-center bg-black/55 backdrop-blur-xs p-4"
+          onClick={() => setShowResetConfirm(false)}
+        >
+          <div
+            className="w-full max-w-sm rounded-2xl bg-white dark:bg-[#233138] p-6 shadow-2xl border border-black/5 dark:border-white/10"
+            onClick={(e) => e.stopPropagation()}
+          >
+            <h3 className="text-base font-bold text-[#111B21] dark:text-[#E9EDEF]">
+              Reset Semua Data Lokal?
+            </h3>
+            <p className="mt-2 text-sm text-[#54656F] dark:text-[#AEBAC1] leading-relaxed">
+              Seluruh profil, ID 6 digit, daftar kontak, riwayat chat, status, dan panggilan di perangkat ini akan dihapus permanen.
+            </p>
+            <div className="mt-6 flex items-center justify-end gap-2.5">
+              <button
+                type="button"
+                onClick={() => setShowResetConfirm(false)}
+                className="h-10 px-4 rounded-xl bg-[#F0F2F5] dark:bg-[#111B21] text-sm font-semibold text-[#111B21] dark:text-[#E9EDEF] hover:bg-[#E4E7EB] cursor-pointer"
+              >
+                Batal
+              </button>
+              <button
+                type="button"
+                onClick={handleConfirmReset}
+                className="h-10 px-4 rounded-xl bg-rose-600 hover:bg-rose-700 text-white text-sm font-semibold cursor-pointer"
+              >
+                Ya, Reset Data
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Subtle Toast Notification */}
+      {toast && (
+        <div className="fixed bottom-6 left-1/2 -translate-x-1/2 z-[140] px-4 py-2.5 rounded-xl bg-[#111B21]/95 dark:bg-[#233138] text-white text-xs font-medium shadow-xl border border-white/10 whitespace-nowrap">
+          {toast}
+        </div>
+      )}
+
+      <OfflineIndicator />
+    </div>
+  );
+}

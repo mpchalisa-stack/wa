@@ -1,0 +1,76 @@
+@import "tailwindcss";
+@custom-variant dark (&:where(.dark, .dark *));
+
+@layer base {
+  :root {
+    --font-sans: 'Plus Jakarta Sans', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+    --font-mono: 'JetBrains Mono', ui-monospace, SFMono-Regular, monospace;
+  }
+
+  html,
+  body,
+  #root {
+    height: 100%;
+    height: 100dvh;
+    width: 100%;
+    margin: 0;
+    padding: 0;
+    overflow: hidden;
+    font-family: var(--font-sans);
+    -webkit-tap-highlight-color: transparent;
+  }
+}
+
+.font-mono-id {
+  font-family: var(--font-mono);
+  font-variant-numeric: tabular-nums;
+}
+
+/* Authentic WhatsApp Chat Doodle Wallpaper */
+.wa-chat-bg {
+  background-color: #EFEAE2;
+  background-image: url("data:image/svg+xml,%3Csvg width='120' height='120' viewBox='0 0 120 120' xmlns='http://www.w3.org/2000/svg'%3E%3Cg fill='none' stroke='%23C9C0B3' stroke-width='1.35' stroke-opacity='0.34'%3E%3Ccircle cx='22' cy='22' r='8'/%3E%3Cpath d='M78 18h20a6 6 0 0 1 6 6v10a6 6 0 0 1-6 6H86l-8 6v-6a6 6 0 0 1-6-6V24a6 6 0 0 1 6-6z'/%3E%3Cpath d='M18 78c0-6 4-10 10-10s10 4 10 10-4 10-10 10-10-4-10-10zm6-2h8m-4-4v8'/%3E%3Cpath d='M74 86l10-18 10 18H74z'/%3E%3Cpath d='M52 48l4 8 8 4-8 4-4 8-4-8-8-4 8-4 4-8z'/%3E%3Ccircle cx='104' cy='62' r='4'/%3E%3Ccircle cx='48' cy='102' r='5'/%3E%3C/g%3E%3C/svg%3E");
+  background-size: 160px 160px;
+}
+
+.dark .wa-chat-bg {
+  background-color: #0B141A;
+  background-image: url("data:image/svg+xml,%3Csvg width='120' height='120' viewBox='0 0 120 120' xmlns='http://www.w3.org/2000/svg'%3E%3Cg fill='none' stroke='%23233138' stroke-width='1.35' stroke-opacity='0.52'%3E%3Ccircle cx='22' cy='22' r='8'/%3E%3Cpath d='M78 18h20a6 6 0 0 1 6 6v10a6 6 0 0 1-6 6H86l-8 6v-6a6 6 0 0 1-6-6V24a6 6 0 0 1 6-6z'/%3E%3Cpath d='M18 78c0-6 4-10 10-10s10 4 10 10-4 10-10 10-10-4-10-10zm6-2h8m-4-4v8'/%3E%3Cpath d='M74 86l10-18 10 18H74z'/%3E%3Cpath d='M52 48l4 8 8 4-8 4-4 8-4-8-8-4 8-4 4-8z'/%3E%3Ccircle cx='104' cy='62' r='4'/%3E%3Ccircle cx='48' cy='102' r='5'/%3E%3C/g%3E%3C/svg%3E");
+  background-size: 160px 160px;
+}
+
+/* Custom sleek scrollbars */
+.wa-scroll::-webkit-scrollbar {
+  width: 6px;
+  height: 6px;
+}
+
+.wa-scroll::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+.wa-scroll::-webkit-scrollbar-thumb {
+  background: rgba(134, 150, 160, 0.32);
+  border-radius: 9999px;
+}
+
+.wa-scroll::-webkit-scrollbar-thumb:hover {
+  background: rgba(134, 150, 160, 0.52);
+}
+
+/* Safe area padding helpers for mobile PWA standalone mode */
+.pb-safe {
+  padding-bottom: env(safe-area-inset-bottom, 0px);
+}
+
+.pt-safe {
+  padding-top: env(safe-area-inset-top, 0px);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+  }
+}

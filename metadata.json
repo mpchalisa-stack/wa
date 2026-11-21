@@ -1,0 +1,6 @@
+{
+  "name": "WA6 — Pesan & Panggilan P2P",
+  "description": "Aplikasi web komunikasi real-time PWA bergaya WhatsApp berbasis Peer-to-Peer dengan ID 6 digit tanpa nomor telepon, email, atau database eksternal.",
+  "requestFramePermissions": ["camera", "microphone"],
+  "majorCapabilities": []
+}
