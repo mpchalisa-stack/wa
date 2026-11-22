@@ -1,6 +1,7 @@
 import React, { useEffect, useRef, useState } from 'react';
 import {
   ChevronDown,
+  Lock,
   Mic,
   MicOff,
   Phone,
@@ -43,6 +44,8 @@ interface CallOverlayProps {
   onToggleSpeaker: () => void;
 }
 
+const WHATSAPP_DARK_PATTERN_SVG = `url("data:image/svg+xml,%3Csvg width='120' height='120' viewBox='0 0 120 120' xmlns='http://www.w3.org/2000/svg'%3E%3Cg fill='none' stroke='%23ffffff' stroke-opacity='0.045' stroke-width='1.1'%3E%3Ccircle cx='24' cy='24' r='9'/%3E%3Cpath d='M78 16l10 6v12l-10 6-10-6V22z'/%3E%3Cpath d='M18 76h18v12H24l-6 5z'/%3E%3Cpath d='M76 78c4-5 12-5 16 0M80 84c2-2.5 6-2.5 8 0'/%3E%3Ccircle cx='84' cy='90' r='1.5' fill='%23ffffff' fill-opacity='0.06'/%3E%3Cpath d='M52 48l6 6-6 6-6-6z'/%3E%3C/g%3E%3C/svg%3E")`;
+
 export const CallOverlay: React.FC<CallOverlayProps> = ({
   call,
   forceFullscreenTick = 0,
@@ -60,12 +63,14 @@ export const CallOverlay: React.FC<CallOverlayProps> = ({
   const [shakeStopped, setShakeStopped] = useState(false);
   const [minimizedBanner, setMinimizedBanner] = useState(false);
   const [logoImgFailed, setLogoImgFailed] = useState(false);
+  const [avatarImgFailed, setAvatarImgFailed] = useState(false);
 
   // Reset animasi getar & paksa layar penuh setiap kali panggilan masuk baru / dipicu notifikasi
   useEffect(() => {
     setShakeStopped(false);
     setMinimizedBanner(false);
-  }, [call.callId, call.phase, forceFullscreenTick]);
+    setAvatarImgFailed(false);
+  }, [call.callId, call.phase, call.peerAvatar, forceFullscreenTick]);
 
   useEffect(() => {
     if (remoteVideoRef.current && call.remoteStream) {
@@ -90,8 +95,9 @@ export const CallOverlay: React.FC<CallOverlayProps> = ({
   const isVideo = call.callType === 'video';
   const isIncomingRinging = call.phase === 'incoming' && !shakeStopped;
   const showRemoteVideo = isVideo && call.phase === 'connected' && Boolean(call.remoteStream);
+  const hasContactPhoto = Boolean(call.peerAvatar && !avatarImgFailed);
 
-  // Hentikan animasi getar & radar seketika saat tombol Angkat atau Tolak ditekan
+  // Hentikan animasi getar & radar seketika saat tombol Jawab atau Tolak ditekan
   const handleAcceptClick = () => {
     setShakeStopped(true);
     setMinimizedBanner(false);
@@ -104,24 +110,23 @@ export const CallOverlay: React.FC<CallOverlayProps> = ({
     onReject();
   };
 
-  // Banner Notifikasi Mengambang di dalam aplikasi (saat panggilan masuk diperkecil)
+  // Banner Notifikasi Mengambang ala WhatsApp (saat panggilan masuk diperkecil)
   if (call.phase === 'incoming' && minimizedBanner) {
     return (
       <div className="fixed top-3 left-3 right-3 sm:left-1/2 sm:-translate-x-1/2 sm:max-w-md z-[130] select-none">
         <div
           onClick={() => setMinimizedBanner(false)}
-          className="rounded-2xl bg-[#111B21]/95 backdrop-blur-md border border-[#38bdf8]/40 shadow-2xl px-3.5 py-3 flex items-center gap-3 text-white cursor-pointer"
+          className="rounded-2xl bg-[#111b21]/95 backdrop-blur-md border border-emerald-500/35 shadow-2xl px-3.5 py-3 flex items-center gap-3 text-white cursor-pointer"
         >
-          {/* Logo WattappsAU bergetar + 2 gelombang radar cyan/hijau di banner mengambang */}
           <div className="relative w-12 h-12 flex items-center justify-center shrink-0">
             {isIncomingRinging && (
               <>
                 <span
-                  className="pointer-events-none absolute inset-0 rounded-full border-2 border-[#38bdf8] bg-[#38bdf8]/20"
+                  className="pointer-events-none absolute inset-0 rounded-full border-2 border-[#10b981] bg-[#10b981]/20"
                   style={{ animation: 'wa-radar-pulse 1.5s infinite ease-out' }}
                 />
                 <span
-                  className="pointer-events-none absolute inset-0 rounded-full border-2 border-[#25D366] bg-[#25D366]/15"
+                  className="pointer-events-none absolute inset-0 rounded-full border-2 border-[#10b981] bg-[#10b981]/15"
                   style={{
                     animation: 'wa-radar-pulse 1.5s infinite ease-out',
                     animationDelay: '0.75s',
@@ -130,14 +135,21 @@ export const CallOverlay: React.FC<CallOverlayProps> = ({
               </>
             )}
             <div
-              className="relative z-10 w-10 h-10 rounded-full overflow-hidden shadow-md ring-2 ring-[#38bdf8]/70"
+              className="relative z-10 w-10 h-10 rounded-full overflow-hidden shadow-md ring-2 ring-emerald-400/70"
               style={
                 isIncomingRinging
                   ? { animation: 'wa-ring-shake 0.9s infinite ease-in-out' }
                   : undefined
               }
             >
-              {logoImgFailed ? (
+              {hasContactPhoto ? (
+                <img
+                  src={call.peerAvatar}
+                  alt={call.peerName}
+                  onError={() => setAvatarImgFailed(true)}
+                  className="w-10 h-10 rounded-full object-cover"
+                />
+              ) : logoImgFailed ? (
                 <AppLogo size={40} />
               ) : (
                 <img
@@ -151,27 +163,20 @@ export const CallOverlay: React.FC<CallOverlayProps> = ({
           </div>
 
           <div className="min-w-0 flex-1">
-            <div
-              className="text-[11px] font-semibold text-cyan-400 truncate"
-              style={
-                isIncomingRinging
-                  ? { animation: 'wa-text-pulse 1.2s infinite ease-in-out' }
-                  : undefined
-              }
-            >
-              {isVideo ? 'Panggilan Video Masuk...' : 'Panggilan Suara Masuk...'}
-            </div>
-            <div
-              className="text-sm font-bold text-white truncate"
-              style={
-                isIncomingRinging
-                  ? { animation: 'wa-text-pulse 1.2s infinite ease-in-out' }
-                  : undefined
-              }
-            >
+            <div className="text-sm font-semibold text-white truncate">
               {call.peerName}
             </div>
-            <div className="text-[11px] font-mono text-cyan-400 truncate">
+            <div
+              className="text-[11px] font-medium text-emerald-400 truncate"
+              style={
+                isIncomingRinging
+                  ? { animation: 'wa-text-pulse 1.4s infinite ease-in-out' }
+                  : undefined
+              }
+            >
+              {isVideo ? 'Panggilan video WattappsAU...' : 'Panggilan suara WattappsAU...'}
+            </div>
+            <div className="text-[11px] font-mono text-slate-400 truncate">
               ID: {formatSixDigitId(call.peerId)}
             </div>
           </div>
@@ -183,7 +188,7 @@ export const CallOverlay: React.FC<CallOverlayProps> = ({
             <button
               type="button"
               onClick={handleRejectClick}
-              className="w-10 h-10 rounded-full bg-rose-600 hover:bg-rose-500 text-white shadow-lg flex items-center justify-center active:scale-95 transition-transform cursor-pointer"
+              className="w-10 h-10 rounded-full bg-red-600 hover:bg-red-500 text-white shadow-lg flex items-center justify-center active:scale-95 transition-transform cursor-pointer"
               aria-label="Tolak panggilan"
               title="Tolak"
             >
@@ -192,11 +197,11 @@ export const CallOverlay: React.FC<CallOverlayProps> = ({
             <button
               type="button"
               onClick={handleAcceptClick}
-              className={`w-10 h-10 rounded-full bg-[#25D366] hover:bg-[#1FD060] text-white shadow-lg flex items-center justify-center active:scale-95 transition-transform cursor-pointer ${
+              className={`w-10 h-10 rounded-full bg-[#00a884] hover:bg-[#00c298] text-white shadow-lg flex items-center justify-center active:scale-95 transition-transform cursor-pointer ${
                 isIncomingRinging ? 'animate-bounce' : ''
               }`}
-              aria-label="Angkat panggilan"
-              title="Angkat"
+              aria-label="Jawab panggilan"
+              title="Jawab"
             >
               {isVideo ? <Video className="w-4 h-4" /> : <Phone className="w-4 h-4" />}
             </button>
@@ -207,7 +212,7 @@ export const CallOverlay: React.FC<CallOverlayProps> = ({
   }
 
   return (
-    <div className="fixed inset-0 z-[150] bg-[#0B141A] text-white flex flex-col justify-between overflow-hidden select-none">
+    <div className="fixed inset-0 z-[150] bg-[#0b141a] text-white flex flex-col justify-between overflow-hidden select-none">
       {/* Remote Audio Element (always active for voice/video audio playback) */}
       <audio ref={remoteAudioRef} autoPlay playsInline className="hidden" />
 
@@ -220,24 +225,36 @@ export const CallOverlay: React.FC<CallOverlayProps> = ({
           className="absolute inset-0 w-full h-full object-cover bg-black"
         />
       ) : (
-        <div
-          className="absolute inset-0"
-          style={{
-            background:
-              'radial-gradient(circle at 50% 28%, #0F2B3D 0%, #0B141A 64%, #070E12 100%)',
-          }}
-        />
+        <>
+          {/* WhatsApp Dark Mode solid #0b141a base with subtle tactical chat pattern */}
+          <div
+            className="absolute inset-0 bg-[#0b141a]"
+            style={{
+              backgroundImage: WHATSAPP_DARK_PATTERN_SVG,
+              backgroundRepeat: 'repeat',
+            }}
+          />
+          <div
+            className="pointer-events-none absolute inset-0"
+            style={{
+              background:
+                'radial-gradient(circle at 50% 42%, rgba(0, 168, 132, 0.14) 0%, rgba(11, 20, 26, 0.55) 55%, rgba(11, 20, 26, 0.92) 100%)',
+            }}
+          />
+        </>
       )}
 
       {/* Subtle scrim for readability over video */}
-      <div className="pointer-events-none absolute inset-0 bg-gradient-to-b from-black/60 via-transparent to-black/75" />
+      {showRemoteVideo && (
+        <div className="pointer-events-none absolute inset-0 bg-gradient-to-b from-black/60 via-transparent to-black/75" />
+      )}
 
       {/* Minimize to Floating Banner button during incoming call */}
       {call.phase === 'incoming' && (
         <button
           type="button"
           onClick={() => setMinimizedBanner(true)}
-          className="absolute top-4 right-4 pt-safe z-30 w-10 h-10 rounded-full bg-white/10 hover:bg-white/20 text-white/90 flex items-center justify-center transition-colors cursor-pointer"
+          className="absolute top-4 right-4 pt-safe z-30 w-10 h-10 rounded-full bg-white/10 hover:bg-white/20 text-slate-200 flex items-center justify-center transition-colors cursor-pointer"
           title="Perkecil ke banner mengambang"
           aria-label="Perkecil ke banner mengambang"
         >
@@ -246,18 +263,48 @@ export const CallOverlay: React.FC<CallOverlayProps> = ({
       )}
 
       {call.phase === 'incoming' ? (
-        /* Modal Panggilan Masuk: Logo WattappsAU Bergetar + Radar Cyan di Tengah Atas, diikuti Nama & ID 6 Digit */
-        <div className="relative z-10 flex-1 flex flex-col items-center justify-center px-6 pt-12 pt-safe text-center">
-          <div className="relative w-36 h-36 flex items-center justify-center mb-7">
-            {/* Lingkaran Gelombang Radar Cyan (wa-radar-pulse) di Belakang Logo */}
+        /* Layar Panggilan Masuk Full-Screen Ala WhatsApp Dark Mode */
+        <div className="relative z-10 flex-1 flex flex-col items-center justify-between px-6 pt-8 pt-safe pb-4 text-center">
+          {/* Header Atas: Enkripsi End-to-End */}
+          <div className="inline-flex items-center gap-1.5 text-xs text-slate-400 mt-1">
+            <Lock className="w-3.5 h-3.5 text-slate-400 shrink-0" />
+            <span>Terenkripsi secara end-to-end (AES-256)</span>
+          </div>
+
+          {/* Identitas Penelepon di Tengah Atas */}
+          <div className="mt-6 flex flex-col items-center max-w-full">
+            <h2 className="text-3xl font-semibold text-white tracking-tight max-w-full truncate px-2">
+              {call.peerName}
+            </h2>
+            <p
+              className="mt-2 text-sm sm:text-base text-slate-300 font-normal"
+              style={
+                isIncomingRinging
+                  ? { animation: 'wa-text-pulse 1.4s infinite ease-in-out' }
+                  : undefined
+              }
+            >
+              {isIncomingRinging
+                ? isVideo
+                  ? 'Panggilan video WattappsAU...'
+                  : 'Panggilan suara WattappsAU...'
+                : 'Menghubungkan...'}
+            </p>
+            <div className="mt-1.5 font-mono text-emerald-400 text-sm tracking-wider">
+              ID: {formatSixDigitId(call.peerId)}
+            </div>
+          </div>
+
+          {/* Avatar Kontak / Logo WattappsAU di Tengah Layar dengan 2 Radar Hijau Zamrud & Efek Getar */}
+          <div className="relative w-48 h-48 flex items-center justify-center my-auto">
             {isIncomingRinging && (
               <>
                 <span
-                  className="pointer-events-none absolute inset-2 rounded-full border-2 border-cyan-400 bg-cyan-400/20 shadow-[0_0_28px_rgba(34,211,238,0.4)]"
+                  className="pointer-events-none absolute w-32 h-32 rounded-full border-2 border-[#10b981] bg-[#10b981]/20 shadow-[0_0_28px_rgba(16,185,129,0.4)]"
                   style={{ animation: 'wa-radar-pulse 1.5s infinite ease-out' }}
                 />
                 <span
-                  className="pointer-events-none absolute inset-2 rounded-full border-2 border-[#25D366] bg-[#25D366]/15 shadow-[0_0_24px_rgba(37,211,102,0.3)]"
+                  className="pointer-events-none absolute w-32 h-32 rounded-full border-2 border-[#10b981] bg-[#10b981]/15 shadow-[0_0_24px_rgba(16,185,129,0.3)]"
                   style={{
                     animation: 'wa-radar-pulse 1.5s infinite ease-out',
                     animationDelay: '0.75s',
@@ -266,118 +313,69 @@ export const CallOverlay: React.FC<CallOverlayProps> = ({
               </>
             )}
 
-            {/* Logo WattappsAU (/icon-512.png) Bergetar Kencang Kiri-Kanan (0.9s) */}
-            {logoImgFailed ? (
-              <div
-                className="relative z-10 rounded-full ring-2 ring-cyan-400/80 shadow-[0_0_36px_rgba(34,211,238,0.45)]"
-                style={
-                  isIncomingRinging
-                    ? { animation: 'wa-ring-shake 0.9s infinite ease-in-out' }
-                    : undefined
-                }
-              >
-                <AppLogo size={96} />
-              </div>
-            ) : (
-              <img
-                src="/icon-512.png"
-                alt="WattappsAU"
-                onError={() => setLogoImgFailed(true)}
-                className="relative z-10 w-24 h-24 rounded-full object-cover ring-2 ring-cyan-400/80 shadow-[0_0_36px_rgba(34,211,238,0.45)]"
-                style={
-                  isIncomingRinging
-                    ? { animation: 'wa-ring-shake 0.9s infinite ease-in-out' }
-                    : undefined
-                }
-              />
-            )}
-          </div>
-
-          <div
-            className="text-xs font-semibold uppercase tracking-widest text-cyan-300/90 mb-2"
-            style={
-              isIncomingRinging
-                ? { animation: 'wa-text-pulse 1.2s infinite ease-in-out' }
-                : undefined
-            }
-          >
-            {isVideo ? 'Panggilan Video Masuk...' : 'Panggilan Suara Masuk...'}
-          </div>
-
-          <h2
-            className="text-2xl sm:text-3xl font-bold text-white tracking-tight max-w-full truncate px-2"
-            style={
-              isIncomingRinging
-                ? { animation: 'wa-text-pulse 1.2s infinite ease-in-out' }
-                : undefined
-            }
-          >
-            {call.peerName}
-          </h2>
-
-          <div
-            className="mt-2 text-cyan-400 font-mono text-base font-semibold tracking-wider"
-            style={
-              isIncomingRinging
-                ? { animation: 'wa-text-pulse 1.2s infinite ease-in-out' }
-                : undefined
-            }
-          >
-            ID: {formatSixDigitId(call.peerId)}
-          </div>
-
-          {/* Chip Status Penelepon + Avatar Bergetar */}
-          <div
-            className="mt-6 inline-flex items-center gap-2.5 px-4 py-1.5 rounded-full bg-white/10 border border-white/15 backdrop-blur-xs"
-            style={
-              isIncomingRinging
-                ? { animation: 'wa-text-pulse 1.2s infinite ease-in-out' }
-                : undefined
-            }
-          >
             <div
+              className="relative z-10 w-32 h-32 rounded-full overflow-hidden ring-2 ring-[#10b981]/80 bg-[#111b21] shadow-[0_0_36px_rgba(16,185,129,0.35)] flex items-center justify-center"
               style={
                 isIncomingRinging
                   ? { animation: 'wa-ring-shake 0.9s infinite ease-in-out' }
                   : undefined
               }
             >
-              <Avatar src={call.peerAvatar} name={call.peerName} size="sm" />
+              {hasContactPhoto ? (
+                <img
+                  src={call.peerAvatar}
+                  alt={call.peerName}
+                  onError={() => setAvatarImgFailed(true)}
+                  className="w-32 h-32 rounded-full object-cover"
+                />
+              ) : logoImgFailed ? (
+                <AppLogo size={128} />
+              ) : (
+                <img
+                  src="/icon-512.png"
+                  alt="WattappsAU"
+                  onError={() => setLogoImgFailed(true)}
+                  className="w-32 h-32 rounded-full object-cover"
+                />
+              )}
             </div>
-            <span className="text-xs font-medium text-white/90">
-              {isIncomingRinging ? 'Saluran P2P Terenkripsi · Berdering...' : 'Menghubungkan...'}
-            </span>
           </div>
+
+          <div className="h-4" />
         </div>
       ) : (
         <>
           {/* Top Caller Info (Outgoing / Connected) */}
-          <div className="relative z-10 pt-10 pt-safe px-6 flex flex-col items-center text-center">
-            <div className="text-xs font-semibold text-cyan-400 tracking-wide mb-1">
-              {call.phase === 'outgoing'
-                ? 'Memanggil...'
-                : isVideo
-                ? 'Panggilan Video Terenkripsi P2P'
-                : 'Panggilan Suara Terenkripsi P2P'}
+          <div className="relative z-10 pt-8 pt-safe px-6 flex flex-col items-center text-center">
+            <div className="inline-flex items-center gap-1.5 text-xs text-slate-400 mb-3">
+              <Lock className="w-3.5 h-3.5 text-slate-400 shrink-0" />
+              <span>Terenkripsi secara end-to-end (AES-256)</span>
             </div>
 
-            <h2 className="text-2xl sm:text-3xl font-bold text-white tracking-tight">
+            <h2 className="text-3xl font-semibold text-white tracking-tight">
               {call.peerName}
             </h2>
-            <div className="mt-1 font-mono text-sm text-cyan-400/90">
-              {call.phase === 'connected'
-                ? formatDuration(call.duration)
-                : `ID: ${formatSixDigitId(call.peerId)}`}
+            <div className="mt-1.5 text-sm text-slate-300">
+              {call.phase === 'outgoing'
+                ? isVideo
+                  ? 'Memanggil video...'
+                  : 'Memanggil...'
+                : formatDuration(call.duration)}
             </div>
+            {call.phase !== 'connected' && (
+              <div className="mt-1 font-mono text-sm text-emerald-400">
+                ID: {formatSixDigitId(call.peerId)}
+              </div>
+            )}
           </div>
 
           {!showRemoteVideo && (
             <div className="relative z-10 flex flex-col items-center justify-center my-auto px-6">
               <div className="relative">
                 {call.phase !== 'connected' && (
-                  <span className="absolute -inset-4 rounded-full border-2 border-[#25D366]/40 animate-ping" />
+                  <span className="absolute -inset-4 rounded-full border-2 border-[#10b981]/40 animate-ping" />
                 )}
-                <div className="ring-4 ring-[#00A884]/40 rounded-full">
+                <div className="ring-4 ring-[#00a884]/40 rounded-full">
                   <Avatar src={call.peerAvatar} name={call.peerName} size="2xl" />
                 </div>
               </div>
@@ -400,33 +398,33 @@ export const CallOverlay: React.FC<CallOverlayProps> = ({
       )}
 
       {/* Bottom Controls */}
-      <div className="relative z-20 px-6 pb-10 pb-safe">
+      <div className="relative z-20 px-8 pb-12 pb-safe">
         {call.phase === 'incoming' ? (
           <div className="max-w-xs mx-auto flex items-center justify-between">
-            <div className="flex flex-col items-center gap-2">
+            <div className="flex flex-col items-center gap-2.5">
               <button
                 type="button"
                 onClick={handleRejectClick}
-                className="w-16 h-16 rounded-full bg-rose-600 hover:bg-rose-500 text-white shadow-xl flex items-center justify-center active:scale-95 transition-transform cursor-pointer"
+                className="w-16 h-16 rounded-full bg-red-600 hover:bg-red-500 text-white shadow-lg flex items-center justify-center active:scale-95 transition-transform cursor-pointer"
                 aria-label="Tolak panggilan"
               >
                 <PhoneOff className="w-7 h-7" />
               </button>
-              <span className="text-xs font-medium text-white/80">Tolak</span>
+              <span className="text-sm font-medium text-slate-200">Tolak</span>
             </div>
 
-            <div className="flex flex-col items-center gap-2">
+            <div className="flex flex-col items-center gap-2.5">
               <button
                 type="button"
                 onClick={handleAcceptClick}
-                className={`w-16 h-16 rounded-full bg-[#25D366] hover:bg-[#1FD060] text-white shadow-[0_0_24px_rgba(37,211,102,0.5)] flex items-center justify-center active:scale-95 transition-transform cursor-pointer ${
+                className={`w-16 h-16 rounded-full bg-[#00a884] hover:bg-[#00c298] text-white shadow-lg shadow-[#00a884]/40 flex items-center justify-center active:scale-95 transition-transform cursor-pointer ${
                   isIncomingRinging ? 'animate-bounce' : ''
                 }`}
-                aria-label="Angkat panggilan"
+                aria-label="Jawab panggilan"
               >
                 {isVideo ? <Video className="w-7 h-7" /> : <Phone className="w-7 h-7" />}
               </button>
-              <span className="text-xs font-semibold text-[#D9FDD3]">Angkat</span>
+              <span className="text-sm font-semibold text-emerald-300">Jawab</span>
             </div>
           </div>
         ) : (

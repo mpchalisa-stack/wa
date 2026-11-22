@@ -487,6 +487,7 @@ export interface NotificationClickData {
   fromName?: string;
   callerId?: string;
   callerName?: string;
+  callerAvatar?: string;
   callId?: string;
   callType?: 'audio' | 'video';
   isVideo?: boolean;
@@ -520,44 +521,61 @@ export function buildNotificationUrl(options: {
   return url;
 }
 
-type ExtendedNotificationOptions = NotificationOptions & {
+interface NotificationActionOption {
+  action: string;
+  title: string;
+  icon?: string;
+}
+
+type ExtendedSWNotificationOptions = NotificationOptions & {
   renotify?: boolean;
+  vibrate?: number[];
+  actions?: NotificationActionOption[];
 };
 
 export function showIncomingWebNotification(options: {
   title: string;
   body: string;
   tag: string;
+  icon?: string;
   isCall?: boolean;
   data?: NotificationClickData;
   onClick?: () => void;
 }): void {
-  triggerAlertVibration(options.isCall ? [1000, 300, 1000] : [500, 200, 500]);
+  const isCall = Boolean(options.isCall || options.data?.kind === 'call');
+  triggerAlertVibration(isCall ? [1000, 500, 1000, 500, 1000] : [250, 120, 250]);
 
   if (typeof window === 'undefined' || !('Notification' in window)) return;
   if (Notification.permission !== 'granted') return;
 
   const shouldNotify =
-    options.isCall ||
+    isCall ||
     isStandbyActive ||
     document.visibilityState !== 'visible' ||
     !document.hasFocus();
 
   if (!shouldNotify) return;
 
-  const isCall = Boolean(options.isCall || options.data?.kind === 'call');
   const senderId =
     options.data?.callerId || options.data?.chatId || options.data?.fromId || '';
   const callerName =
     options.data?.callerName ||
     options.data?.fromName ||
     (senderId ? `ID: ${senderId}` : 'Penelepon');
+  const isVideo = Boolean(options.data?.isVideo || options.data?.callType === 'video');
 
-  const notifTitle = isCall ? `Panggilan Masuk — ${callerName}` : options.title;
+  // Format notifikasi khas WhatsApp:
+  // Panggilan: Title = Nama Penelepon (atau "ID: ..."), Body = "Panggilan suara/video WattappsAU"
+  // Pesan: Title = Nama Pengirim, Body = Isi teks / "📷 Foto"
+  const notifTitle = isCall ? callerName : options.title;
   const notifBody = isCall
-    ? options.body || `ID: ${senderId} • Ketuk untuk menjawab`
+    ? isVideo
+      ? 'Panggilan video WattappsAU'
+      : 'Panggilan suara WattappsAU'
     : options.body;
-  const notifTag = isCall ? 'wattappsau-call' : options.tag;
+  const notifIcon =
+    options.icon?.trim() || options.data?.callerAvatar?.trim() || '/icon-512.png';
+  const notifTag = isCall ? `wattapps-call-${senderId || 'active'}` : options.tag;
 
   const eventType: 'call' | 'chat' = isCall ? 'call' : 'chat';
   const targetUrl =
@@ -565,25 +583,47 @@ export function showIncomingWebNotification(options: {
     buildNotificationUrl({
       senderId,
       eventType,
-      callType: options.data?.callType,
+      callType: isVideo ? 'video' : 'audio',
       callId: options.data?.callId,
       fromName: callerName,
     });
 
   const enrichedData: NotificationClickData = {
     ...(options.data || { kind: isCall ? 'call' : 'message' }),
+    kind: isCall ? 'call' : 'message',
     action: isCall ? 'ANSWER_CALL' : 'OPEN_CHAT',
     callerId: senderId,
     callerName,
+    callType: isVideo ? 'video' : 'audio',
+    isVideo,
     url: targetUrl,
   };
 
-  const notifOptions: ExtendedNotificationOptions = {
+  // Opsi lengkap khusus ServiceWorkerRegistration.showNotification (mendukung actions, vibrate, renotify)
+  const swNotifOptions: ExtendedSWNotificationOptions = {
     body: notifBody,
-    icon: '/icon-512.png',
+    icon: notifIcon,
     badge: '/icon-512.png',
     tag: notifTag,
     renotify: isCall,
+    requireInteraction: isCall,
+    vibrate: isCall ? [1000, 500, 1000, 500, 1000] : [200, 100, 200],
+    silent: false,
+    actions: isCall
+      ? [
+          { action: 'reject_call', title: 'Tolak' },
+          { action: 'accept_call', title: 'Jawab' },
+        ]
+      : [{ action: 'open_chat', title: 'Balas / Buka Chat' }],
+    data: enrichedData,
+  };
+
+  // Fallback window.Notification tanpa properti `actions` agar tidak memicu TypeError
+  const windowNotifOptions: NotificationOptions = {
+    body: notifBody,
+    icon: notifIcon,
+    badge: '/icon-512.png',
+    tag: notifTag,
     requireInteraction: isCall,
     silent: false,
     data: enrichedData,
@@ -591,7 +631,7 @@ export function showIncomingWebNotification(options: {
 
   const showWindowNotificationFallback = () => {
     try {
-      const notif = new Notification(notifTitle, notifOptions);
+      const notif = new Notification(notifTitle, windowNotifOptions);
 
       notif.onclick = () => {
         try {
@@ -607,17 +647,16 @@ export function showIncomingWebNotification(options: {
     }
   };
 
-  // Utamakan Service Worker reg.showNotification agar event notificationclick di sw.js
-  // selalu memfokuskan jendela dan mengirim TRIGGER_INCOMING_CALL_UI
+  // Utamakan Service Worker reg.showNotification agar tombol aksi Tolak/Jawab/Balas tampil di layar kunci Android
   if ('serviceWorker' in navigator) {
     navigator.serviceWorker
       .getRegistration()
       .then((reg) => {
         if (reg && reg.active) {
-          return reg.showNotification(notifTitle, notifOptions);
+          return reg.showNotification(notifTitle, swNotifOptions);
         }
         return navigator.serviceWorker.ready.then((readyReg) =>
-          readyReg.showNotification(notifTitle, notifOptions)
+          readyReg.showNotification(notifTitle, swNotifOptions)
         );
       })
       .catch(() => {
@@ -627,4 +666,24 @@ export function showIncomingWebNotification(options: {
   }
 
   showWindowNotificationFallback();
+}
+
+export function dismissIncomingCallNotification(peerId?: string): void {
+  if (typeof navigator === 'undefined' || !('serviceWorker' in navigator)) return;
+  navigator.serviceWorker
+    .getRegistration()
+    .then((reg) => {
+      if (!reg || !reg.getNotifications) return;
+      return reg.getNotifications().then((list) => {
+        for (const notif of list) {
+          const matchesPeer = peerId && notif.tag === `wattapps-call-${peerId}`;
+          const isAnyCall =
+            notif.tag?.startsWith('wattapps-call-') || notif.tag === 'wattappsau-call';
+          if (matchesPeer || (!peerId && isAnyCall) || isAnyCall) {
+            notif.close();
+          }
+        }
+      });
+    })
+    .catch(() => {});
 }
