@@ -26,7 +26,7 @@ export interface Contact {
 }
 
 export type MessageType = 'text' | 'image' | 'video' | 'document' | 'voice';
-export type MessageStatus = 'sending' | 'sent' | 'delivered' | 'read';
+export type MessageStatus = 'pending' | 'sending' | 'sent' | 'delivered' | 'read';
 
 export interface ReplyPreview {
   id: string;
@@ -97,6 +97,15 @@ export interface GroupMeta {
   members: string[];
   memberNames: Record<string, string>;
   adminId: string;
+}
+
+export interface PendingOutboxMessage {
+  id: string; // `${messageId}:${recipientId}`
+  messageId: string;
+  recipientId: string; // Target 6-digit peer ID
+  chatId: string;
+  createdAt: number;
+  groupMeta?: GroupMeta;
 }
 
 export interface ChunkMessageMeta {
@@ -174,6 +183,12 @@ export type PeerPacket =
       groupMeta?: GroupMeta;
     }
   | {
+      kind: 'MSG_ACK';
+      messageId: string;
+      chatId: string;
+      fromId: string;
+    }
+  | {
       kind: 'DELIVERY_ACK';
       messageId: string;
       chatId: string;
@@ -184,6 +199,16 @@ export type PeerPacket =
       chatId: string;
       messageIds: string[];
       fromId: string;
+    }
+  | {
+      kind: 'PING';
+      fromId: string;
+      ts: number;
+    }
+  | {
+      kind: 'PONG';
+      fromId: string;
+      ts: number;
     }
   | {
       kind: 'TYPING';

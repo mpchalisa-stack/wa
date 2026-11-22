@@ -123,6 +123,7 @@ export interface PeerManagerCallbacks {
   ) => void | Promise<void>;
   onFileAck?: (fromSixDigitId: string, fileId: string, messageId?: string) => void;
   onPeerPresence: (sixDigitId: string, isOnline: boolean) => void;
+  onPeerReady?: (sixDigitId: string) => void;
   onIncomingMediaCall: (call: MediaConnection) => void;
 }
 
@@ -1011,9 +1012,12 @@ export class WA6PeerManager {
       if (queuedFiles && queuedFiles.length > 0) {
         this.pendingFileTransfers.delete(peerSixId);
         for (const transfer of queuedFiles) {
-          this.enqueueChunkedSend(peerSixId, transfer);
+          this.enqueueChunkedSend(peerSixId, transfer, true);
         }
       }
+
+      // Beri tahu aplikasi agar segera menguras antrean pendingMessages untuk peer ini
+      this.callbacks.onPeerReady?.(peerSixId);
     };
 
     if (isConnectionLive(conn)) {
@@ -1038,10 +1042,31 @@ export class WA6PeerManager {
         return;
       }
 
-      // Handle paket signaling & pesan teks reguler
+      // Handle paket signaling, PING/PONG keep-alive & pesan teks reguler
       if ('kind' in data) {
+        const pkt = data as PeerPacket;
         this.callbacks.onPeerPresence(peerSixId, true);
-        this.callbacks.onPacket(peerSixId, data as PeerPacket);
+
+        if (pkt.kind === 'PING') {
+          try {
+            conn.send({
+              kind: 'PONG',
+              fromId: this.profile.id,
+              ts: Date.now(),
+            } satisfies PeerPacket);
+          } catch {
+            // ignore
+          }
+          this.callbacks.onPeerReady?.(peerSixId);
+          return;
+        }
+
+        if (pkt.kind === 'PONG') {
+          this.callbacks.onPeerReady?.(peerSixId);
+          return;
+        }
+
+        this.callbacks.onPacket(peerSixId, pkt);
       }
     });
 
@@ -1118,6 +1143,47 @@ export class WA6PeerManager {
   }
 
   /**
+   * Mengirim sinyal PING ke peer bila koneksi terbuka, atau mencoba menghubungkan ulang bila belum terbuka.
+   * Mengembalikan true jika koneksi sedang aktif terbuka.
+   */
+  public pingPeer(targetSixDigitId: string): boolean {
+    if (this.destroyed || targetSixDigitId === this.profile.id) return false;
+    const existing = this.connections.get(targetSixDigitId);
+    if (existing && isConnectionLive(existing)) {
+      try {
+        existing.send({
+          kind: 'PING',
+          fromId: this.profile.id,
+          ts: Date.now(),
+        } satisfies PeerPacket);
+        return true;
+      } catch {
+        // Koneksi rusak — bersihkan dan coba sambung ulang
+        try {
+          existing.close();
+        } catch {
+          // ignore
+        }
+        this.connections.delete(targetSixDigitId);
+        this.callbacks.onPeerPresence(targetSixDigitId, false);
+      }
+    }
+
+    if (this.peer && !this.peer.destroyed && this.peer.disconnected) {
+      try {
+        this.peer.reconnect();
+      } catch {
+        this.connect();
+      }
+    } else if (!this.peer || this.peer.destroyed) {
+      this.connect();
+    }
+
+    this.ensureConnection(targetSixDigitId);
+    return false;
+  }
+
+  /**
    * Mengirim gambar, foto kamera, video, dokumen, atau voice note dengan:
    * 1. Memastikan DataChannel aktif/terbuka (reconnect + await conn.on('open') maks 8 detik)
    * 2. Memecah Base64/DataURL menjadi potongan 8 KB (8192 karakter) dalam JSON.stringify(...)
@@ -1127,30 +1193,56 @@ export class WA6PeerManager {
   public sendFileChunked(targetSixDigitId: string, options: SendFileChunkedOptions): boolean {
     if (targetSixDigitId === this.profile.id) return false;
     // Langsung masuk antrean eksekusi async agar ensureOpenConnection (timeout 8 detik) berjalan dulu
-    this.enqueueChunkedSend(targetSixDigitId, options);
+    void this.enqueueChunkedSend(targetSixDigitId, options, true);
     return this.isPeerOnline(targetSixDigitId);
   }
 
-  private enqueueChunkedSend(targetSixDigitId: string, options: SendFileChunkedOptions): void {
+  /**
+   * Versi Promise/async untuk menguras antrean outbox secara berurutan (1 file selesai baru lanjut berikutnya).
+   */
+  public sendFileChunkedAsync(
+    targetSixDigitId: string,
+    options: SendFileChunkedOptions,
+    requeueOnFail = false
+  ): Promise<boolean> {
+    if (targetSixDigitId === this.profile.id) return Promise.resolve(false);
+    return this.enqueueChunkedSend(targetSixDigitId, options, requeueOnFail);
+  }
+
+  private enqueueChunkedSend(
+    targetSixDigitId: string,
+    options: SendFileChunkedOptions,
+    requeueOnFail: boolean
+  ): Promise<boolean> {
     const prevChain = this.activeFileSendChain.get(targetSixDigitId) ?? Promise.resolve();
-    const nextChain = prevChain
+    let resultPromise!: Promise<boolean>;
+    resultPromise = prevChain
       .catch(() => {})
-      .then(() => this.streamChunksOverConnection(targetSixDigitId, options));
-    this.activeFileSendChain.set(targetSixDigitId, nextChain);
+      .then(() => this.streamChunksOverConnection(targetSixDigitId, options, requeueOnFail));
+    this.activeFileSendChain.set(
+      targetSixDigitId,
+      resultPromise.then(() => undefined, () => undefined)
+    );
+    return resultPromise;
   }
 
   private async streamChunksOverConnection(
     targetSixDigitId: string,
-    options: SendFileChunkedOptions
-  ): Promise<void> {
+    options: SendFileChunkedOptions,
+    requeueOnFail: boolean
+  ): Promise<boolean> {
     // 1. Wajib pastikan koneksi aktif sebelum mulai chunking (anti-stuck 0% setelah kembali dari file picker Android)
     const conn = await this.ensureOpenConnection(
       targetSixDigitId,
       CONNECTION_OPEN_TIMEOUT_MS
     );
     if (!conn || !isConnectionLive(conn)) {
-      this.requeuePendingTransfer(targetSixDigitId, options);
-      return;
+      if (requeueOnFail) {
+        this.requeuePendingTransfer(targetSixDigitId, options);
+      } else {
+        options.onQueued?.();
+      }
+      return false;
     }
 
     const payload = options.dataUrl;
@@ -1208,13 +1300,19 @@ export class WA6PeerManager {
         retrying: false,
       });
       this.scheduleFileAckRetry(options.fileId);
+      return true;
     } catch (err) {
       console.error('Chunked transfer interrupted:', err);
       options.onError?.();
       if (!this.destroyed) {
-        this.requeuePendingTransfer(targetSixDigitId, options);
+        if (requeueOnFail) {
+          this.requeuePendingTransfer(targetSixDigitId, options);
+        } else {
+          options.onQueued?.();
+        }
         this.ensureConnection(targetSixDigitId);
       }
+      return false;
     }
   }
 

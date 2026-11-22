@@ -1,13 +1,22 @@
-import { CallRecord, ChatMessage, Contact, StatusItem, ThemeMode, UserProfile } from '../types';
+import {
+  CallRecord,
+  ChatMessage,
+  Contact,
+  PendingOutboxMessage,
+  StatusItem,
+  ThemeMode,
+  UserProfile,
+} from '../types';
 import { dataUrlToBlob, fileToDataUrl } from './media';
 
 const DB_NAME = 'WA6LocalDatabase';
-const DB_VERSION = 2;
+const DB_VERSION = 3;
 
 const STORES = {
   contacts: 'contacts',
   messages: 'messages',
   media: 'media', // Dedicated IndexedDB store for binary Blobs (images, videos, documents, voice notes)
+  pendingMessages: 'pendingMessages', // Persistent Outbox Queue untuk pesan tertunda saat peer offline
   statuses: 'statuses',
   calls: 'calls',
 } as const;
@@ -104,6 +113,12 @@ function openDB(): Promise<IDBDatabase> {
       if (!db.objectStoreNames.contains(STORES.media)) {
         const mediaStore = db.createObjectStore(STORES.media, { keyPath: 'id' });
         mediaStore.createIndex('chatId', 'chatId', { unique: false });
+      }
+      if (!db.objectStoreNames.contains(STORES.pendingMessages)) {
+        const pendingStore = db.createObjectStore(STORES.pendingMessages, { keyPath: 'id' });
+        pendingStore.createIndex('recipientId', 'recipientId', { unique: false });
+        pendingStore.createIndex('messageId', 'messageId', { unique: false });
+        pendingStore.createIndex('createdAt', 'createdAt', { unique: false });
       }
       if (!db.objectStoreNames.contains(STORES.statuses)) {
         db.createObjectStore(STORES.statuses, { keyPath: 'id' });
@@ -222,14 +237,16 @@ export async function dbSaveMessage(msg: ChatMessage): Promise<void> {
 export async function loadAllLocalData(): Promise<{
   contacts: Contact[];
   messages: ChatMessage[];
+  pendingMessages: PendingOutboxMessage[];
   statuses: StatusItem[];
   calls: CallRecord[];
 }> {
   const now = Date.now();
-  const [contacts, rawMessages, mediaRecords, rawStatuses, calls] = await Promise.all([
+  const [contacts, rawMessages, mediaRecords, pendingMessages, rawStatuses, calls] = await Promise.all([
     getAllFromStore<Contact>(STORES.contacts),
     getAllFromStore<ChatMessage>(STORES.messages),
     getAllFromStore<StoredMediaRecord>(STORES.media),
+    getAllFromStore<PendingOutboxMessage>(STORES.pendingMessages),
     getAllFromStore<StatusItem>(STORES.statuses),
     getAllFromStore<CallRecord>(STORES.calls),
   ]);
@@ -268,17 +285,44 @@ export async function loadAllLocalData(): Promise<{
   }
 
   messages.sort((a, b) => a.timestamp - b.timestamp);
+  pendingMessages.sort((a, b) => a.createdAt - b.createdAt);
   validStatuses.sort((a, b) => b.timestamp - a.timestamp);
   calls.sort((a, b) => b.timestamp - a.timestamp);
 
-  return { contacts, messages, statuses: validStatuses, calls };
+  return { contacts, messages, pendingMessages, statuses: validStatuses, calls };
 }
 
 export const dbSaveContact = (contact: Contact) => putInStore(STORES.contacts, contact);
 export const dbDeleteContact = (id: string) => deleteFromStore(STORES.contacts, id);
+export const dbSavePendingMessage = (item: PendingOutboxMessage) =>
+  putInStore(STORES.pendingMessages, item);
+export const dbDeletePendingMessage = (id: string) =>
+  deleteFromStore(STORES.pendingMessages, id);
 export const dbSaveStatus = (status: StatusItem) => putInStore(STORES.statuses, status);
 export const dbDeleteStatus = (id: string) => deleteFromStore(STORES.statuses, id);
 export const dbSaveCall = (call: CallRecord) => putInStore(STORES.calls, call);
+
+export async function dbDeletePendingByMessageId(messageId: string): Promise<void> {
+  try {
+    const db = await openDB();
+    await new Promise<void>((resolve, reject) => {
+      const tx = db.transaction(STORES.pendingMessages, 'readwrite');
+      const idx = tx.objectStore(STORES.pendingMessages).index('messageId');
+      const req = idx.openCursor(IDBKeyRange.only(messageId));
+      req.onsuccess = () => {
+        const cursor = req.result;
+        if (cursor) {
+          cursor.delete();
+          cursor.continue();
+        }
+      };
+      tx.oncomplete = () => resolve();
+      tx.onerror = () => reject(tx.error);
+    });
+  } catch (err) {
+    console.error('Failed to delete pending messages by messageId:', err);
+  }
+}
 
 export async function dbDeleteMessagesForChat(chatId: string): Promise<void> {
   try {
@@ -334,12 +378,20 @@ export async function resetAllLocalData(): Promise<void> {
     const db = await openDB();
     await new Promise<void>((resolve, reject) => {
       const tx = db.transaction(
-        [STORES.contacts, STORES.messages, STORES.media, STORES.statuses, STORES.calls],
+        [
+          STORES.contacts,
+          STORES.messages,
+          STORES.media,
+          STORES.pendingMessages,
+          STORES.statuses,
+          STORES.calls,
+        ],
         'readwrite'
       );
       tx.objectStore(STORES.contacts).clear();
       tx.objectStore(STORES.messages).clear();
       tx.objectStore(STORES.media).clear();
+      tx.objectStore(STORES.pendingMessages).clear();
       tx.objectStore(STORES.statuses).clear();
       tx.objectStore(STORES.calls).clear();
       tx.oncomplete = () => resolve();

@@ -10,6 +10,7 @@ import {
   Copy,
   Download,
   FileText,
+  Hourglass,
   Image as ImageIcon,
   Loader2,
   Mic,
@@ -800,15 +801,20 @@ export const ChatRoom: React.FC<ChatRoomProps> = ({
                   msg.type !== 'text' &&
                   msg.status !== 'delivered' &&
                   msg.status !== 'read' &&
-                  (msg.status === 'sending' ||
+                  (msg.status === 'pending' ||
+                    msg.status === 'sending' ||
                     msg.transferWaitingPeer ||
                     typeof msg.transferProgress === 'number') && (
                     <div className="mt-1.5 rounded-md bg-black/[0.06] dark:bg-black/30 px-2.5 py-1.5 space-y-1">
                       <div className="flex items-center justify-between gap-2 text-[11px] font-medium text-[#008069] dark:text-[#06CF9C] tabular-nums">
                         <span className="inline-flex items-center gap-1.5 truncate">
-                          <Loader2 className="w-3 h-3 animate-spin shrink-0" />
+                          {msg.status === 'pending' || msg.transferWaitingPeer ? (
+                            <Hourglass className="w-3 h-3 text-amber-500 dark:text-amber-400 shrink-0" />
+                          ) : (
+                            <Loader2 className="w-3 h-3 animate-spin shrink-0" />
+                          )}
                           <span>
-                            {msg.transferWaitingPeer
+                            {msg.status === 'pending' || msg.transferWaitingPeer
                               ? 'Menunggu teman online...'
                               : (msg.transferProgress ?? 0) >= 100
                               ? 'Menunggu konfirmasi diterima...'
@@ -825,7 +831,7 @@ export const ChatRoom: React.FC<ChatRoomProps> = ({
                                 } ${msg.transferProgress ?? 0}%...`}
                           </span>
                         </span>
-                        {!msg.transferWaitingPeer && (
+                        {msg.status !== 'pending' && !msg.transferWaitingPeer && (
                           <span className="shrink-0 font-mono-id">
                             {msg.transferProgress ?? 0}%
                           </span>
@@ -833,11 +839,15 @@ export const ChatRoom: React.FC<ChatRoomProps> = ({
                       </div>
                       <div className="h-1.5 w-full rounded-full bg-black/10 dark:bg-white/15 overflow-hidden">
                         <div
-                          className="h-full rounded-full bg-[#00A884] transition-[width] duration-150"
+                          className={`h-full rounded-full transition-[width] duration-150 ${
+                            msg.status === 'pending' || msg.transferWaitingPeer
+                              ? 'bg-amber-400'
+                              : 'bg-[#00A884]'
+                          }`}
                           style={{
                             width: `${
-                              msg.transferWaitingPeer
-                                ? 12
+                              msg.status === 'pending' || msg.transferWaitingPeer
+                                ? 16
                                 : Math.max(4, msg.transferProgress ?? 0)
                             }%`,
                           }}
@@ -850,11 +860,26 @@ export const ChatRoom: React.FC<ChatRoomProps> = ({
                 <div className="mt-0.5 flex items-center justify-end gap-1 text-[10.5px] text-[#667781] dark:text-[#AEBAC1] tabular-nums select-none">
                   <span>{formatTime(msg.timestamp)}</span>
                   {isMine && !msg.deleted && (
-                    <span className="inline-flex items-center">
+                    <span
+                      className="inline-flex items-center"
+                      title={
+                        msg.status === 'pending'
+                          ? 'Menunggu kontak online (antrean tertunda)'
+                          : msg.status === 'read'
+                          ? 'Diterima & dibaca'
+                          : msg.status === 'delivered'
+                          ? 'Terkirim ke perangkat penerima'
+                          : msg.status === 'sending'
+                          ? 'Sedang mengirim...'
+                          : 'Terkirim'
+                      }
+                    >
                       {msg.status === 'read' ? (
                         <CheckCheck className="w-4 h-4 text-[#53BDEB]" />
                       ) : msg.status === 'delivered' ? (
                         <CheckCheck className="w-4 h-4 text-[#8696A0]" />
+                      ) : msg.status === 'pending' ? (
+                        <Hourglass className="w-3 h-3 text-amber-600 dark:text-amber-400" />
                       ) : msg.status === 'sending' ? (
                         <Clock className="w-3 h-3 text-[#8696A0]" />
                       ) : (

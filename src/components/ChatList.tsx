@@ -6,6 +6,7 @@ import {
   Clock,
   FileText,
   Film,
+  Hourglass,
   MessageSquarePlus,
   Mic,
   Ban,
@@ -96,6 +97,8 @@ export const ChatList: React.FC<ChatListProps> = ({
               <CheckCheck className="w-4 h-4 text-[#53BDEB]" />
             ) : last.status === 'delivered' ? (
               <CheckCheck className="w-4 h-4 text-[#8696A0]" />
+            ) : last.status === 'pending' ? (
+              <Hourglass className="w-3.5 h-3.5 text-amber-600 dark:text-amber-400" />
             ) : last.status === 'sending' ? (
               <Clock className="w-3.5 h-3.5 text-[#8696A0]" />
             ) : (

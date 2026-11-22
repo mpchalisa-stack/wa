@@ -1,9 +1,9 @@
-// Synthesized Web Audio API ringtones and message sound effects (zero external mp3 files)
+// Synthesized Web Audio API loud ringtones, message chimes, and vibration (zero external mp3 files)
 
 let ringtoneTimer: number | null = null;
 let audioCtx: AudioContext | null = null;
 
-function getAudioContext(): AudioContext | null {
+export function getSharedAudioContext(): AudioContext | null {
   try {
     if (!audioCtx) {
       const Ctx =
@@ -22,50 +22,94 @@ function getAudioContext(): AudioContext | null {
   }
 }
 
-function playMarimbaNote(ctx: AudioContext, freq: number, startTime: number, duration: number, gainPeak = 0.14) {
+export function triggerAlertVibration(pattern: number | number[] = [500, 200, 500]): void {
+  try {
+    if (typeof navigator !== 'undefined' && typeof navigator.vibrate === 'function') {
+      navigator.vibrate(pattern);
+    }
+  } catch {
+    // ignore on unsupported browsers
+  }
+}
+
+export function stopVibration(): void {
+  try {
+    if (typeof navigator !== 'undefined' && typeof navigator.vibrate === 'function') {
+      navigator.vibrate(0);
+    }
+  } catch {
+    // ignore
+  }
+}
+
+function playMarimbaNote(
+  ctx: AudioContext,
+  freq: number,
+  startTime: number,
+  duration: number,
+  gainPeak = 0.24,
+  waveform: OscillatorType = 'triangle'
+) {
   const osc = ctx.createOscillator();
+  const harmonic = ctx.createOscillator();
   const gain = ctx.createGain();
-  osc.type = 'sine';
+
+  osc.type = waveform;
   osc.frequency.setValueAtTime(freq, startTime);
 
+  // Harmonisa halus agar dering lebih nyaring dan jelas terdengar di speaker HP
+  harmonic.type = 'sine';
+  harmonic.frequency.setValueAtTime(freq * 2, startTime);
+
+  const harmonicGain = ctx.createGain();
+  harmonicGain.gain.setValueAtTime(0.28, startTime);
+
   gain.gain.setValueAtTime(0.0001, startTime);
-  gain.gain.exponentialRampToValueAtTime(gainPeak, startTime + 0.015);
+  gain.gain.exponentialRampToValueAtTime(gainPeak, startTime + 0.014);
   gain.gain.exponentialRampToValueAtTime(0.0001, startTime + duration);
 
   osc.connect(gain);
+  harmonic.connect(harmonicGain);
+  harmonicGain.connect(gain);
   gain.connect(ctx.destination);
+
   osc.start(startTime);
+  harmonic.start(startTime);
   osc.stop(startTime + duration + 0.02);
+  harmonic.stop(startTime + duration + 0.02);
 }
 
+/**
+ * Nada dering panggilan masuk nyaring via Web Audio API + getar [500, 200, 500] ms berulang
+ */
 export function startIncomingRingtone(): void {
   stopRingtone();
   const playPattern = () => {
-    const ctx = getAudioContext();
+    triggerAlertVibration([500, 200, 500]);
+    const ctx = getSharedAudioContext();
     if (!ctx) return;
     const now = ctx.currentTime;
-    // Pleasant rhythmic marimba-inspired WhatsApp ring melody
     const notes = [
-      { f: 523.25, t: 0.0, d: 0.18 }, // C5
-      { f: 659.25, t: 0.16, d: 0.18 }, // E5
-      { f: 783.99, t: 0.32, d: 0.22 }, // G5
-      { f: 659.25, t: 0.56, d: 0.18 }, // E5
-      { f: 783.99, t: 0.72, d: 0.24 }, // G5
-      { f: 1046.5, t: 0.94, d: 0.32 }, // C6
+      { f: 587.33, t: 0.0, d: 0.2 }, // D5
+      { f: 739.99, t: 0.16, d: 0.2 }, // F#5
+      { f: 880.0, t: 0.32, d: 0.24 }, // A5
+      { f: 739.99, t: 0.56, d: 0.2 }, // F#5
+      { f: 880.0, t: 0.72, d: 0.26 }, // A5
+      { f: 1174.66, t: 0.94, d: 0.36 }, // D6
     ];
     for (const n of notes) {
-      playMarimbaNote(ctx, n.f, now + n.t, n.d, 0.16);
+      playMarimbaNote(ctx, n.f, now + n.t, n.d, 0.34, 'triangle');
     }
   };
 
   playPattern();
-  ringtoneTimer = window.setInterval(playPattern, 2600);
+  ringtoneTimer = window.setInterval(playPattern, 2400);
 }
 
 export function startOutgoingRingback(): void {
   stopRingtone();
   const playPulse = () => {
-    const ctx = getAudioContext();
+    const ctx = getSharedAudioContext();
     if (!ctx) return;
     const now = ctx.currentTime;
     const osc1 = ctx.createOscillator();
@@ -78,8 +122,8 @@ export function startOutgoingRingback(): void {
     osc2.frequency.setValueAtTime(480, now);
 
     gain.gain.setValueAtTime(0.0001, now);
-    gain.gain.linearRampToValueAtTime(0.06, now + 0.05);
-    gain.gain.setValueAtTime(0.06, now + 0.95);
+    gain.gain.linearRampToValueAtTime(0.07, now + 0.05);
+    gain.gain.setValueAtTime(0.07, now + 0.95);
     gain.gain.linearRampToValueAtTime(0.0001, now + 1.05);
 
     osc1.connect(gain);
@@ -101,16 +145,21 @@ export function stopRingtone(): void {
     window.clearInterval(ringtoneTimer);
     ringtoneTimer = null;
   }
+  stopVibration();
 }
 
 export function playMessagePop(incoming = false): void {
-  const ctx = getAudioContext();
+  const ctx = getSharedAudioContext();
+  if (incoming) {
+    triggerAlertVibration([500, 200, 500]);
+  }
   if (!ctx) return;
   const now = ctx.currentTime;
   if (incoming) {
-    playMarimbaNote(ctx, 587.33, now, 0.1, 0.08);
-    playMarimbaNote(ctx, 880, now + 0.07, 0.14, 0.09);
+    // Nada notifikasi pesan masuk lebih nyaring & tegas
+    playMarimbaNote(ctx, 659.25, now, 0.13, 0.24, 'triangle');
+    playMarimbaNote(ctx, 987.77, now + 0.09, 0.2, 0.26, 'triangle');
   } else {
-    playMarimbaNote(ctx, 660, now, 0.09, 0.06);
+    playMarimbaNote(ctx, 660, now, 0.09, 0.06, 'sine');
   }
 }

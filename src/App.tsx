@@ -7,6 +7,7 @@ import {
   Moon,
   MoreVertical,
   QrCode,
+  Radio,
   RefreshCw,
   Search,
   Share2,
@@ -24,6 +25,7 @@ import {
   NavTab,
   PeerConnectionState,
   PeerPacket,
+  PendingOutboxMessage,
   ReplyPreview,
   StatusItem,
   ThemeMode,
@@ -33,10 +35,13 @@ import {
   dbClearCalls,
   dbDeleteContact,
   dbDeleteMessagesForChat,
+  dbDeletePendingByMessageId,
+  dbDeletePendingMessage,
   dbDeleteStatus,
   dbSaveCall,
   dbSaveContact,
   dbSaveMessage,
+  dbSavePendingMessage,
   dbSaveStatus,
   getSavedProfile,
   getSavedTheme,
@@ -58,6 +63,11 @@ import {
   startOutgoingRingback,
   stopRingtone,
 } from './lib/audio';
+import {
+  disableStandbyMode,
+  enableStandbyMode,
+  showIncomingWebNotification,
+} from './lib/standby';
 import { estimateDataUrlBytes, formatSixDigitId, generateUid } from './lib/media';
 import { OnboardingScreen } from './components/OnboardingScreen';
 import { ChatList } from './components/ChatList';
@@ -97,6 +107,8 @@ export default function App() {
   const [messages, setMessages] = useState<ChatMessage[]>([]);
   const [statuses, setStatuses] = useState<StatusItem[]>([]);
   const [calls, setCalls] = useState<CallRecord[]>([]);
+  const [pendingMessages, setPendingMessages] = useState<PendingOutboxMessage[]>([]);
+  const [standbyMode, setStandbyMode] = useState(false);
   const [unreadCounts, setUnreadCounts] = useState<Record<string, number>>(() =>
     getSavedUnreadCounts()
   );
@@ -143,6 +155,10 @@ export default function App() {
   const profileRef = useRef<UserProfile | null>(profile);
   const contactsRef = useRef<Contact[]>(contacts);
   const messagesRef = useRef<ChatMessage[]>(messages);
+  const pendingMessagesRef = useRef<PendingOutboxMessage[]>(pendingMessages);
+  const standbyModeRef = useRef<boolean>(standbyMode);
+  const flushingPeersRef = useRef<Set<string>>(new Set());
+  const pendingLastAttemptRef = useRef<Map<string, number>>(new Map());
   const activeChatIdRef = useRef<string | null>(activeChatId);
   const callRuntimeRef = useRef<ActiveCallRuntime | null>(null);
   const callTimerRef = useRef<number | null>(null);
@@ -158,6 +174,12 @@ export default function App() {
   useEffect(() => {
     messagesRef.current = messages;
   }, [messages]);
+  useEffect(() => {
+    pendingMessagesRef.current = pendingMessages;
+  }, [pendingMessages]);
+  useEffect(() => {
+    standbyModeRef.current = standbyMode;
+  }, [standbyMode]);
   useEffect(() => {
     activeChatIdRef.current = activeChatId;
   }, [activeChatId]);
@@ -196,10 +218,18 @@ export default function App() {
       setMessages(data.messages);
       setStatuses(data.statuses);
       setCalls(data.calls);
+      setPendingMessages(data.pendingMessages);
       setDataLoaded(true);
     });
     return () => {
       active = false;
+    };
+  }, []);
+
+  // Release Wake Lock & silent audio on unmount
+  useEffect(() => {
+    return () => {
+      void disableStandbyMode();
     };
   }, []);
 
@@ -218,6 +248,40 @@ export default function App() {
       return [contact, ...prev];
     });
   }, []);
+
+  // Hapus satu entri dari antrean outbox tertunda
+  const removePendingEntry = useCallback((messageId: string, recipientId: string) => {
+    const entryId = `${messageId}:${recipientId}`;
+    pendingLastAttemptRef.current.delete(entryId);
+    setPendingMessages((prev) => {
+      if (!prev.some((p) => p.id === entryId)) return prev;
+      return prev.filter((p) => p.id !== entryId);
+    });
+    void dbDeletePendingMessage(entryId);
+  }, []);
+
+  // Konfirmasi MSG_ACK / FILE_ACK dari penerima -> hapus dari outbox & ubah jadi Centang 2 biru
+  const markMessageConfirmedBlueTick = useCallback(
+    (messageId: string, fromId: string) => {
+      removePendingEntry(messageId, fromId);
+      setMessages((prev) =>
+        prev.map((m) => {
+          if (m.id === messageId) {
+            const updated: ChatMessage = {
+              ...m,
+              status: 'read',
+              transferProgress: undefined,
+              transferWaitingPeer: undefined,
+            };
+            void dbSaveMessage(updated);
+            return updated;
+          }
+          return m;
+        })
+      );
+    },
+    [removePendingEntry]
+  );
 
   // Helper to send READ_ACK for unread messages in a chat
   const sendReadAcksForChat = useCallback((chatId: string) => {
@@ -379,16 +443,7 @@ export default function App() {
             });
             void dbSaveMessage(savedMsg);
 
-            // Always send DELIVERY_ACK
-            peerManagerRef.current?.sendPacket(fromId, {
-              kind: 'DELIVERY_ACK',
-              messageId: incomingMsg.id,
-              chatId: incomingMsg.isGroup ? localChatId : me.id,
-              fromId: me.id,
-            });
-
             if (isViewingChat) {
-              // Immediately send READ_ACK (turns sender's ticks blue!)
               peerManagerRef.current?.sendPacket(fromId, {
                 kind: 'READ_ACK',
                 chatId: incomingMsg.isGroup ? localChatId : me.id,
@@ -400,13 +455,52 @@ export default function App() {
                 ...prev,
                 [localChatId]: (prev[localChatId] || 0) + 1,
               }));
-              playMessagePop(true);
+            }
+
+            // Putar nada notifikasi + getaran keras pada setiap pesan masuk
+            playMessagePop(true);
+
+            // Tampilkan Web Notification (penting saat tab/layar di latar belakang atau Mode Siaga)
+            if (!isViewingChat || document.hidden || standbyModeRef.current) {
+              const senderTitle =
+                incomingMsg.isGroup && packet.groupMeta
+                  ? `${packet.groupMeta.name} · ${incomingMsg.senderName}`
+                  : incomingMsg.senderName || `ID ${fromId}`;
+              void showIncomingWebNotification({
+                title: senderTitle,
+                body: incomingMsg.text || 'Pesan baru masuk',
+                tag: `msg-${incomingMsg.id}`,
+                onClick: () => {
+                  setActiveTab('chats');
+                  setActiveChatId(localChatId);
+                },
+              });
             }
           }
+
+          // Selalu kirim balik MSG_ACK & DELIVERY_ACK (termasuk jika retry duplikat) agar outbox pengirim bersih & Centang 2 biru
+          peerManagerRef.current?.sendPacket(fromId, {
+            kind: 'MSG_ACK',
+            messageId: incomingMsg.id,
+            chatId: incomingMsg.isGroup ? localChatId : me.id,
+            fromId: me.id,
+          });
+          peerManagerRef.current?.sendPacket(fromId, {
+            kind: 'DELIVERY_ACK',
+            messageId: incomingMsg.id,
+            chatId: incomingMsg.isGroup ? localChatId : me.id,
+            fromId: me.id,
+          });
+          break;
+        }
+
+        case 'MSG_ACK': {
+          markMessageConfirmedBlueTick(packet.messageId, fromId);
           break;
         }
 
         case 'DELIVERY_ACK': {
+          removePendingEntry(packet.messageId, fromId);
           setMessages((prev) =>
             prev.map((m) => {
               if (m.id === packet.messageId && m.status !== 'read') {
@@ -427,6 +521,7 @@ export default function App() {
 
         case 'READ_ACK': {
           const idSet = new Set(packet.messageIds);
+          packet.messageIds.forEach((mId) => removePendingEntry(mId, fromId));
           setMessages((prev) =>
             prev.map((m) => {
               if (idSet.has(m.id) && m.status !== 'read') {
@@ -522,7 +617,7 @@ export default function App() {
         }
       }
     },
-    [upsertContact, finalizeCall, showToast]
+    [upsertContact, finalizeCall, showToast, markMessageConfirmedBlueTick, removePendingEntry]
   );
 
   // Incoming WebRTC Media Call handler
@@ -590,6 +685,15 @@ export default function App() {
       });
 
       startIncomingRingtone();
+      void showIncomingWebNotification({
+        title: callerName,
+        body:
+          callType === 'video'
+            ? 'Panggilan Video WattappsAU Masuk'
+            : 'Panggilan Suara WattappsAU Masuk',
+        tag: `call-${callId}`,
+        isCall: true,
+      });
 
       mediaCall.on('close', () => {
         if (callRuntimeRef.current?.callId === callId) {
@@ -671,6 +775,13 @@ export default function App() {
       }
 
       if (messagesRef.current.some((m) => m.id === meta.id)) {
+        // Tetap balas MSG_ACK jika retry agar antrean pengirim bersih
+        peerManagerRef.current?.sendPacket(fromId, {
+          kind: 'MSG_ACK',
+          messageId: meta.id,
+          chatId: meta.isGroup ? localChatId : me.id,
+          fromId: me.id,
+        });
         return;
       }
 
@@ -701,7 +812,13 @@ export default function App() {
       // Simpan ke IndexedDB (media Blob tersimpan di object store `media`) sebelum FILE_ACK dikirim balik
       await dbSaveMessage(savedMsg);
 
-      // Kirim DELIVERY_ACK & notifikasi audio
+      // Kirim MSG_ACK & DELIVERY_ACK agar pengirim segera mendapat Centang 2 biru & membersihkan outbox
+      peerManagerRef.current?.sendPacket(fromId, {
+        kind: 'MSG_ACK',
+        messageId: savedMsg.id,
+        chatId: savedMsg.isGroup ? localChatId : me.id,
+        fromId: me.id,
+      });
       peerManagerRef.current?.sendPacket(fromId, {
         kind: 'DELIVERY_ACK',
         messageId: savedMsg.id,
@@ -716,37 +833,200 @@ export default function App() {
           messageIds: [savedMsg.id],
           fromId: me.id,
         });
-        playMessagePop(true);
       } else {
         setUnreadCounts((prev) => ({
           ...prev,
           [localChatId]: (prev[localChatId] || 0) + 1,
         }));
-        playMessagePop(true);
+      }
+
+      playMessagePop(true);
+
+      if (!isViewingChat || document.hidden || standbyModeRef.current) {
+        const mediaLabel =
+          savedMsg.type === 'image'
+            ? 'Foto'
+            : savedMsg.type === 'video'
+            ? 'Video'
+            : savedMsg.type === 'voice'
+            ? 'Pesan suara'
+            : savedMsg.fileName || 'Dokumen';
+        void showIncomingWebNotification({
+          title:
+            meta.isGroup && meta.groupMeta
+              ? `${meta.groupMeta.name} · ${meta.senderName}`
+              : meta.senderName || `ID ${fromId}`,
+          body: savedMsg.text ? `${mediaLabel}: ${savedMsg.text}` : `Mengirim ${mediaLabel}`,
+          tag: `msg-${savedMsg.id}`,
+          onClick: () => {
+            setActiveTab('chats');
+            setActiveChatId(localChatId);
+          },
+        });
       }
     },
     [upsertContact]
   );
 
-  // Konfirmasi FILE_ACK dari penerima: hilangkan bar tunggu, ubah ke Centang 2 biru, simpan ke IndexedDB
-  const handleFileAck = useCallback((_fromId: string, _fileId: string, messageId?: string) => {
-    if (!messageId) return;
-    setMessages((prev) =>
-      prev.map((m) => {
-        if (m.id === messageId) {
-          const updated: ChatMessage = {
-            ...m,
-            status: 'read',
-            transferProgress: undefined,
-            transferWaitingPeer: undefined,
-          };
-          void dbSaveMessage(updated);
-          return updated;
+  // Konfirmasi FILE_ACK dari penerima: hilangkan bar tunggu, bersihkan antrean, ubah ke Centang 2 biru
+  const handleFileAck = useCallback(
+    (fromId: string, _fileId: string, messageId?: string) => {
+      if (!messageId) return;
+      markMessageConfirmedBlueTick(messageId, fromId);
+    },
+    [markMessageConfirmedBlueTick]
+  );
+
+  // Helper pengiriman satu pesan media via chunked WebRTC (dipakai saat kirim langsung & kuras antrean)
+  const sendMediaMessageToPeer = useCallback(
+    async (
+      msg: ChatMessage,
+      recipientId: string,
+      groupMeta?: PendingOutboxMessage['groupMeta']
+    ): Promise<boolean> => {
+      const manager = peerManagerRef.current;
+      if (!manager || !msg.mediaData || msg.type === 'text') return false;
+
+      return manager.sendFileChunkedAsync(
+        recipientId,
+        {
+          fileId: `${msg.id}-${recipientId}`,
+          messageId: msg.id,
+          fileName: msg.fileName || `${msg.type}-${msg.timestamp}`,
+          fileType: msg.mimeType || 'application/octet-stream',
+          fileSize: msg.fileSize || estimateDataUrlBytes(msg.mediaData),
+          dataUrl: msg.mediaData,
+          messageMeta: {
+            id: msg.id,
+            chatId: msg.chatId,
+            senderId: msg.senderId,
+            senderName: msg.senderName,
+            msgType: msg.type as 'image' | 'video' | 'document' | 'voice',
+            text: msg.text,
+            duration: msg.duration,
+            timestamp: msg.timestamp,
+            replyTo: msg.replyTo,
+            isGroup: msg.isGroup,
+            groupMeta,
+          },
+          onQueued: () => {
+            setMessages((prev) =>
+              prev.map((m) =>
+                m.id === msg.id && m.status !== 'delivered' && m.status !== 'read'
+                  ? { ...m, status: 'pending', transferWaitingPeer: true }
+                  : m
+              )
+            );
+          },
+          onProgress: (pct) => {
+            setMessages((prev) =>
+              prev.map((m) =>
+                m.id === msg.id && m.status !== 'delivered' && m.status !== 'read'
+                  ? {
+                      ...m,
+                      transferProgress: pct,
+                      transferWaitingPeer: false,
+                      status: pct >= 100 ? 'sent' : 'sending',
+                    }
+                  : m
+              )
+            );
+          },
+          onComplete: () => {
+            setMessages((prev) =>
+              prev.map((m) => {
+                if (m.id === msg.id && m.status !== 'delivered' && m.status !== 'read') {
+                  const updated: ChatMessage = {
+                    ...m,
+                    status: 'sent',
+                    transferProgress: 100,
+                    transferWaitingPeer: false,
+                  };
+                  void dbSaveMessage(updated);
+                  return updated;
+                }
+                return m;
+              })
+            );
+          },
+          onAck: () => {
+            markMessageConfirmedBlueTick(msg.id, recipientId);
+          },
+        },
+        false
+      );
+    },
+    [markMessageConfirmedBlueTick]
+  );
+
+  // Kuras seluruh antrean pendingMessages secara berurutan begitu peer target terdeteksi Online
+  const flushPendingForPeer = useCallback(
+    async (recipientId: string) => {
+      const manager = peerManagerRef.current;
+      if (!manager || !manager.isPeerOnline(recipientId)) return;
+      if (flushingPeersRef.current.has(recipientId)) return;
+
+      const queueForPeer = pendingMessagesRef.current
+        .filter((item) => item.recipientId === recipientId)
+        .sort((a, b) => a.createdAt - b.createdAt);
+
+      if (queueForPeer.length === 0) return;
+
+      flushingPeersRef.current.add(recipientId);
+      try {
+        for (const item of queueForPeer) {
+          if (!peerManagerRef.current?.isPeerOnline(recipientId)) break;
+
+          // Pastikan entri masih ada di antrean (belum terkonfirmasi MSG_ACK di tengah jalan)
+          if (!pendingMessagesRef.current.some((p) => p.id === item.id)) {
+            continue;
+          }
+
+          const msg = messagesRef.current.find((m) => m.id === item.messageId);
+          if (!msg || msg.deleted) {
+            removePendingEntry(item.messageId, recipientId);
+            continue;
+          }
+
+          // Hindari spam pengiriman ulang dalam 5 detik terakhir selagi menunggu MSG_ACK
+          const lastTry = pendingLastAttemptRef.current.get(item.id) ?? 0;
+          if (Date.now() - lastTry < 5000) {
+            continue;
+          }
+          pendingLastAttemptRef.current.set(item.id, Date.now());
+
+          if (msg.type !== 'text' && msg.mediaData) {
+            const ok = await sendMediaMessageToPeer(msg, recipientId, item.groupMeta);
+            if (!ok) {
+              // Hentikan sementara untuk peer ini jika koneksi terputus; loop 4 detik akan mencoba lagi
+              pendingLastAttemptRef.current.delete(item.id);
+              break;
+            }
+          } else {
+            const sentNow = peerManagerRef.current.sendPacket(recipientId, {
+              kind: 'MESSAGE',
+              message: msg,
+              groupMeta: item.groupMeta,
+            });
+            if (!sentNow) {
+              pendingLastAttemptRef.current.delete(item.id);
+              break;
+            }
+            setMessages((prev) =>
+              prev.map((m) =>
+                m.id === msg.id && m.status === 'pending' ? { ...m, status: 'sent' } : m
+              )
+            );
+            // Jeda singkat 60 ms agar urutan pesan teks masuk rapi di penerima
+            await new Promise<void>((resolve) => window.setTimeout(resolve, 60));
+          }
         }
-        return m;
-      })
-    );
-  }, []);
+      } finally {
+        flushingPeersRef.current.delete(recipientId);
+      }
+    },
+    [removePendingEntry, sendMediaMessageToPeer]
+  );
 
   // Initialize PeerJS whenever profile is ready
   useEffect(() => {
@@ -772,6 +1052,9 @@ export default function App() {
           return { ...prev, [sixId]: isOnline };
         });
       },
+      onPeerReady: (sixId) => {
+        void flushPendingForPeer(sixId);
+      },
       onIncomingMediaCall: handleIncomingMediaCall,
     });
 
@@ -785,6 +1068,42 @@ export default function App() {
     // Re-init only when user ID changes (login/reset)
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [profile?.id]);
+
+  // Loop pemantau otomatis setiap 4 detik untuk antrean pendingMessages & keep-alive PING
+  useEffect(() => {
+    if (!profile || !dataLoaded) return;
+    let tickCount = 0;
+
+    const intervalId = window.setInterval(() => {
+      tickCount += 1;
+      const manager = peerManagerRef.current;
+      if (!manager) return;
+
+      const pendingList = pendingMessagesRef.current;
+      if (pendingList.length > 0) {
+        const uniqueRecipients = Array.from(new Set(pendingList.map((p) => p.recipientId)));
+        for (const recipientId of uniqueRecipients) {
+          const isLive = manager.pingPeer(recipientId);
+          if (isLive || manager.isPeerOnline(recipientId)) {
+            void flushPendingForPeer(recipientId);
+          }
+        }
+      }
+
+      // Saat Mode Siaga aktif, kirim PING berkala tiap 16 detik ke kontak 1:1 agar WebRTC tetap hidup
+      if (standbyModeRef.current && tickCount % 4 === 0) {
+        contactsRef.current
+          .filter((c) => !c.isGroup)
+          .forEach((c) => {
+            manager.pingPeer(c.id);
+          });
+      }
+    }, 4000);
+
+    return () => {
+      window.clearInterval(intervalId);
+    };
+  }, [profile?.id, dataLoaded, flushPendingForPeer]);
 
   // Whenever user opens a chat room, clear unread badge & send READ_ACK
   useEffect(() => {
@@ -929,10 +1248,20 @@ export default function App() {
       const target = contactsRef.current.find((c) => c.id === chatId);
       if (!me || !target) return;
 
+      const manager = peerManagerRef.current;
+      const recipients =
+        target.isGroup && target.members
+          ? target.members.filter((mId) => mId !== me.id)
+          : [target.id];
+
       const isMediaMessage = payload.type !== 'text' && Boolean(payload.mediaData);
       const computedSize =
         payload.fileSize ||
         (payload.mediaData ? estimateDataUrlBytes(payload.mediaData) : undefined);
+
+      const allRecipientsOnline =
+        recipients.length > 0 &&
+        recipients.every((rId) => Boolean(manager?.isPeerOnline(rId)));
 
       const msg: ChatMessage = {
         id: generateUid('msg'),
@@ -940,8 +1269,9 @@ export default function App() {
         senderId: me.id,
         senderName: me.name,
         timestamp: Date.now(),
-        status: isMediaMessage ? 'sending' : 'sent',
+        status: allRecipientsOnline ? (isMediaMessage ? 'sending' : 'sent') : 'pending',
         transferProgress: isMediaMessage ? 0 : undefined,
+        transferWaitingPeer: isMediaMessage && !allRecipientsOnline ? true : undefined,
         isGroup: Boolean(target.isGroup),
         ...payload,
         fileSize: computedSize,
@@ -951,8 +1281,7 @@ export default function App() {
       void dbSaveMessage(msg);
       playMessagePop(false);
 
-      const manager = peerManagerRef.current;
-      if (!manager) return;
+      if (recipients.length === 0) return;
 
       const groupMeta =
         target.isGroup && target.members
@@ -966,130 +1295,44 @@ export default function App() {
             }
           : undefined;
 
-      // Untuk semua gambar, kamera, video, dokumen, & voice note: WAJIB pecah menjadi chunks 8 KB (JSON string)
-      if (isMediaMessage && msg.mediaData && msg.type !== 'text') {
-        const recipients =
-          target.isGroup && target.members
-            ? target.members.filter((mId) => mId !== me.id)
-            : [target.id];
+      // Daftarkan ke antrean persisten pendingMessages di IndexedDB hingga mendapat konfirmasi MSG_ACK / FILE_ACK
+      const newPendingEntries: PendingOutboxMessage[] = recipients.map((recipientId) => ({
+        id: `${msg.id}:${recipientId}`,
+        messageId: msg.id,
+        recipientId,
+        chatId,
+        createdAt: msg.timestamp,
+        groupMeta,
+      }));
 
-        if (recipients.length === 0) return;
+      setPendingMessages((prev) => [...prev, ...newPendingEntries]);
+      newPendingEntries.forEach((entry) => {
+        void dbSavePendingMessage(entry);
+      });
 
-        const peerProgress = new Map<string, number>();
-        recipients.forEach((r) => peerProgress.set(r, 0));
+      if (!manager) return;
 
-        const updateAggregateProgress = (peerId: string, pct: number) => {
-          peerProgress.set(peerId, pct);
-          let total = 0;
-          peerProgress.forEach((v) => {
-            total += v;
-          });
-          const avg = Math.round(total / recipients.length);
-          setMessages((prev) =>
-            prev.map((m) =>
-              m.id === msg.id && m.status !== 'delivered' && m.status !== 'read'
-                ? {
-                    ...m,
-                    transferProgress: avg,
-                    transferWaitingPeer: false,
-                    status: avg >= 100 ? 'sent' : 'sending',
-                  }
-                : m
-            )
-          );
-        };
-
-        recipients.forEach((recipientId) => {
-          manager.sendFileChunked(recipientId, {
-            fileId: `${msg.id}-${recipientId}`,
-            messageId: msg.id,
-            fileName: msg.fileName || `${msg.type}-${msg.timestamp}`,
-            fileType: msg.mimeType || 'application/octet-stream',
-            fileSize: msg.fileSize || estimateDataUrlBytes(msg.mediaData!),
-            dataUrl: msg.mediaData!,
-            messageMeta: {
-              id: msg.id,
-              chatId: msg.chatId,
-              senderId: msg.senderId,
-              senderName: msg.senderName,
-              msgType: msg.type as 'image' | 'video' | 'document' | 'voice',
-              text: msg.text,
-              duration: msg.duration,
-              timestamp: msg.timestamp,
-              replyTo: msg.replyTo,
-              isGroup: msg.isGroup,
+      // Untuk setiap penerima: kirim langsung jika Online, atau biarkan di antrean pendingMessages jika Offline
+      recipients.forEach((recipientId) => {
+        const entryId = `${msg.id}:${recipientId}`;
+        if (manager.isPeerOnline(recipientId)) {
+          pendingLastAttemptRef.current.set(entryId, Date.now());
+          if (isMediaMessage && msg.mediaData && msg.type !== 'text') {
+            void sendMediaMessageToPeer(msg, recipientId, groupMeta);
+          } else {
+            manager.sendPacket(recipientId, {
+              kind: 'MESSAGE',
+              message: msg,
               groupMeta,
-            },
-            onQueued: () => {
-              setMessages((prev) =>
-                prev.map((m) =>
-                  m.id === msg.id && m.status !== 'delivered' && m.status !== 'read'
-                    ? { ...m, transferWaitingPeer: true }
-                    : m
-                )
-              );
-            },
-            onProgress: (pct) => updateAggregateProgress(recipientId, pct),
-            onComplete: () => {
-              updateAggregateProgress(recipientId, 100);
-              setMessages((prev) =>
-                prev.map((m) => {
-                  if (m.id === msg.id && m.status === 'sending') {
-                    const updated: ChatMessage = {
-                      ...m,
-                      status: 'sent',
-                      transferProgress: 100,
-                      transferWaitingPeer: false,
-                    };
-                    void dbSaveMessage(updated);
-                    return updated;
-                  }
-                  return m;
-                })
-              );
-            },
-            onAck: () => {
-              setMessages((prev) =>
-                prev.map((m) => {
-                  if (m.id === msg.id) {
-                    const updated: ChatMessage = {
-                      ...m,
-                      status: 'read',
-                      transferProgress: undefined,
-                      transferWaitingPeer: undefined,
-                    };
-                    void dbSaveMessage(updated);
-                    return updated;
-                  }
-                  return m;
-                })
-              );
-            },
-          });
-        });
-        return;
-      }
-
-      // Pesan teks ringan langsung lewat DataChannel JSON
-      if (target.isGroup && target.members && groupMeta) {
-        const packet: PeerPacket = {
-          kind: 'MESSAGE',
-          message: msg,
-          groupMeta,
-        };
-        target.members.forEach((mId) => {
-          if (mId !== me.id) {
-            manager.sendPacket(mId, packet);
+            });
           }
-        });
-      } else {
-        manager.sendPacket(target.id, {
-          kind: 'MESSAGE',
-          message: msg,
-        });
-      }
+        } else {
+          // Penerima Offline: coba buka koneksi di latar belakang; loop 4 detik & onPeerReady akan menguras otomatis
+          manager.ensureConnection(recipientId);
+        }
+      });
     },
-    []
+    [sendMediaMessageToPeer]
   );
 
   // Typing signal
@@ -1143,6 +1386,9 @@ export default function App() {
       })
     );
 
+    setPendingMessages((prev) => prev.filter((p) => p.messageId !== messageId));
+    void dbDeletePendingByMessageId(messageId);
+
     if (forEveryone) {
       const target = contacts.find((c) => c.id === chatId);
       const pkt: PeerPacket = {
@@ -1163,12 +1409,22 @@ export default function App() {
 
   // Clear chat / Delete contact
   const handleClearChat = (chatId: string) => {
+    const toRemove = pendingMessagesRef.current.filter((p) => p.chatId === chatId);
+    toRemove.forEach((p) => void dbDeletePendingMessage(p.id));
+    setPendingMessages((prev) => prev.filter((p) => p.chatId !== chatId));
     setMessages((prev) => prev.filter((m) => m.chatId !== chatId));
     void dbDeleteMessagesForChat(chatId);
     showToast('Riwayat obrolan dibersihkan');
   };
 
   const handleDeleteContact = (chatId: string) => {
+    const toRemove = pendingMessagesRef.current.filter(
+      (p) => p.chatId === chatId || p.recipientId === chatId
+    );
+    toRemove.forEach((p) => void dbDeletePendingMessage(p.id));
+    setPendingMessages((prev) =>
+      prev.filter((p) => p.chatId !== chatId && p.recipientId !== chatId)
+    );
     setContacts((prev) => prev.filter((c) => c.id !== chatId));
     setMessages((prev) => prev.filter((m) => m.chatId !== chatId));
     void dbDeleteContact(chatId);
@@ -1531,14 +1787,38 @@ export default function App() {
     setActiveCallUI((prev) => (prev ? { ...prev, isSpeakerOn: !prev.isSpeakerOn } : null));
   };
 
+  // Toggle Mode Siaga / Anti-Sleep (Screen Wake Lock + Silent Audio Keep-Alive + Web Notifications)
+  const handleToggleStandby = useCallback(async () => {
+    if (standbyModeRef.current) {
+      await disableStandbyMode();
+      setStandbyMode(false);
+      showToast('Mode Siaga dinonaktifkan');
+      return;
+    }
+
+    const res = await enableStandbyMode();
+    setStandbyMode(true);
+
+    if (res.wakeLockActive) {
+      showToast('Mode Siaga Aktif · Layar & koneksi P2P tetap terjaga');
+    } else if (res.audioKeepAliveActive) {
+      showToast('Mode Siaga Aktif · Audio latar & notifikasi siaga aktif');
+    } else {
+      showToast('Mode Siaga Aktif · Koneksi P2P dipantau berkala');
+    }
+  }, [showToast]);
+
   // Reset all data
   const handleConfirmReset = async () => {
+    await disableStandbyMode();
+    setStandbyMode(false);
     peerManagerRef.current?.destroy();
     await resetAllLocalData();
     setContacts([]);
     setMessages([]);
     setStatuses([]);
     setCalls([]);
+    setPendingMessages([]);
     setUnreadCounts({});
     setActiveChatId(null);
     setShowResetConfirm(false);
@@ -1649,12 +1929,32 @@ export default function App() {
                 </button>
               </div>
 
-              {/* Right Icons: Camera, Global Search, 3-Dot Menu */}
+              {/* Right Icons: Mode Siaga / Anti-Sleep, Camera, Global Search, 3-Dot Menu */}
               <div className="flex items-center gap-0.5 shrink-0">
                 <button
                   type="button"
+                  onClick={() => void handleToggleStandby()}
+                  className={`h-8 px-2.5 mr-0.5 rounded-full inline-flex items-center gap-1.5 text-[11.5px] font-semibold transition-all cursor-pointer border ${
+                    standbyMode
+                      ? 'bg-[#25D366]/20 border-[#25D366]/70 text-[#D9FDD3] shadow-[0_0_12px_rgba(37,211,102,0.35)]'
+                      : 'bg-white/10 border-white/15 text-white/90 hover:bg-white/20'
+                  }`}
+                  title={
+                    standbyMode
+                      ? 'Mode Siaga / Anti-Sleep AKTIF (ketuk untuk matikan)'
+                      : 'Aktifkan Mode Siaga / Anti-Sleep agar koneksi P2P tetap hidup'
+                  }
+                  aria-label="Mode Siaga Anti-Sleep"
+                  aria-pressed={standbyMode}
+                >
+                  <Radio className={`w-3.5 h-3.5 shrink-0 ${standbyMode ? 'text-[#25D366] animate-pulse' : ''}`} />
+                  <span>Siaga</span>
+                </button>
+
+                <button
+                  type="button"
                   onClick={() => setCameraPurpose(activeContact ? 'chat' : 'status')}
-                  className="w-10 h-10 rounded-full flex items-center justify-center hover:bg-white/10 transition-colors cursor-pointer"
+                  className="w-9 h-9 rounded-full flex items-center justify-center hover:bg-white/10 transition-colors cursor-pointer"
                   title="Kamera"
                   aria-label="Buka Kamera"
                 >
@@ -1664,7 +1964,7 @@ export default function App() {
                 <button
                   type="button"
                   onClick={() => setSearchOpen(true)}
-                  className="w-10 h-10 rounded-full flex items-center justify-center hover:bg-white/10 transition-colors cursor-pointer"
+                  className="w-9 h-9 rounded-full flex items-center justify-center hover:bg-white/10 transition-colors cursor-pointer"
                   title="Pencarian"
                   aria-label="Pencarian global"
                 >
@@ -1675,7 +1975,7 @@ export default function App() {
                   <button
                     type="button"
                     onClick={() => setShowMainMenu((prev) => !prev)}
-                    className="w-10 h-10 rounded-full flex items-center justify-center hover:bg-white/10 transition-colors cursor-pointer"
+                    className="w-9 h-9 rounded-full flex items-center justify-center hover:bg-white/10 transition-colors cursor-pointer"
                     title="Menu lainnya"
                     aria-label="Menu titik tiga"
                   >
@@ -1688,7 +1988,36 @@ export default function App() {
                         className="fixed inset-0 z-30"
                         onClick={() => setShowMainMenu(false)}
                       />
-                      <div className="absolute right-0 mt-1 w-56 rounded-xl bg-white dark:bg-[#233138] shadow-2xl border border-black/10 dark:border-white/10 py-1.5 z-40 text-[#111B21] dark:text-[#E9EDEF]">
+                      <div className="absolute right-0 mt-1 w-60 rounded-xl bg-white dark:bg-[#233138] shadow-2xl border border-black/10 dark:border-white/10 py-1.5 z-40 text-[#111B21] dark:text-[#E9EDEF]">
+                        <button
+                          type="button"
+                          onClick={() => {
+                            setShowMainMenu(false);
+                            void handleToggleStandby();
+                          }}
+                          className="w-full flex items-center justify-between gap-2 px-4 py-3 text-left text-sm hover:bg-[#F5F6F6] dark:hover:bg-[#182229] transition-colors cursor-pointer"
+                        >
+                          <span className="flex items-center gap-3 min-w-0">
+                            <Radio
+                              className={`w-4 h-4 shrink-0 ${
+                                standbyMode
+                                  ? 'text-[#00A884] animate-pulse'
+                                  : 'text-[#008069] dark:text-[#00A884]'
+                              }`}
+                            />
+                            <span className="truncate">Mode Siaga / Anti-Sleep</span>
+                          </span>
+                          <span
+                            className={`text-[10.5px] font-bold px-1.5 py-0.5 rounded-md shrink-0 ${
+                              standbyMode
+                                ? 'bg-[#00A884]/20 text-[#008069] dark:text-[#06CF9C]'
+                                : 'bg-black/5 dark:bg-white/10 text-[#667781] dark:text-[#8696A0]'
+                            }`}
+                          >
+                            {standbyMode ? 'ON' : 'OFF'}
+                          </span>
+                        </button>
+
                         <button
                           type="button"
                           onClick={() => {
