@@ -520,9 +520,9 @@ export const ChatRoom: React.FC<ChatRoomProps> = ({
         </div>
       </header>
 
-      {/* Message Feed with Authentic WhatsApp Doodle Background */}
+      {/* Message Feed with Tactical Military (Komlek / Diskomlekau) Background */}
       <div
-        className="flex-1 overflow-y-auto wa-scroll wa-chat-bg px-3 sm:px-8 lg:px-14 py-4 space-y-1.5"
+        className="flex-1 overflow-y-auto wa-scroll chat-bg-tactical px-3 sm:px-8 lg:px-14 py-4 space-y-1.5"
         onClick={() => {
           setActiveMsgMenuId(null);
           setShowAttach(false);
@@ -530,7 +530,7 @@ export const ChatRoom: React.FC<ChatRoomProps> = ({
       >
         {/* P2P Encryption Notice */}
         <div className="flex justify-center mb-3">
-          <div className="max-w-md text-center px-3.5 py-1.5 rounded-lg bg-[#FFF5C4]/90 dark:bg-[#182229]/95 text-[#54656F] dark:text-[#FFD279] text-[11.5px] shadow-xs">
+          <div className="max-w-md text-center px-3.5 py-1.5 rounded-lg bg-[#182229]/95 border border-[#38bdf8]/15 text-[#E9EDEF]/90 dark:text-[#FFD279] text-[11.5px] shadow-xs">
             Pesan dan panggilan dikirim langsung antar perangkat (WebRTC Peer-to-Peer) dan hanya disimpan secara lokal di perangkat Anda.
           </div>
         </div>
@@ -539,7 +539,7 @@ export const ChatRoom: React.FC<ChatRoomProps> = ({
           if (entry.kind === 'date') {
             return (
               <div key={entry.key} className="flex justify-center my-3">
-                <span className="px-3 py-1 rounded-lg bg-white/90 dark:bg-[#182229]/95 text-[#54656F] dark:text-[#8696A0] text-[11.5px] font-medium shadow-xs">
+                <span className="px-3 py-1 rounded-lg bg-[#182229]/95 border border-[#38bdf8]/12 text-[#CBD5E1] dark:text-[#8696A0] text-[11.5px] font-medium shadow-xs">
                   {entry.label}
                 </span>
               </div>
