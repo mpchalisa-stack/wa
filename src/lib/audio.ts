@@ -160,13 +160,13 @@ function playTelephoneBurst(ctx: AudioContext, startTime: number, duration: numb
 
 /**
  * Nada dering panggilan masuk nyaring:
- * Osilator ganda 440Hz + 480Hz pola dering telepon berulang + getaran [800, 400, 800] ms
+ * Osilator ganda 440Hz + 480Hz pola dering telepon berulang + getaran [1000, 300, 1000] ms
  * hingga panggilan diangkat atau ditolak.
  */
 export function startIncomingRingtone(): void {
   stopRingtone();
   const playPattern = () => {
-    triggerAlertVibration([800, 400, 800]);
+    triggerAlertVibration([1000, 300, 1000]);
     const ctx = getSharedAudioContext();
     if (!ctx) return;
     if (ctx.state === 'suspended') {

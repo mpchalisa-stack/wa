@@ -69,9 +69,11 @@ import {
 import {
   disableStandbyMode,
   enableStandbyMode,
+  isKeepAliveActuallyPlaying,
   pauseKeepAliveForCall,
   requestNotificationPermission,
   resumeKeepAliveAfterCall,
+  setStandbyExternalListener,
   showIncomingWebNotification,
 } from './lib/standby';
 import { sendNtfyWakeSignal, subscribeNtfySignal } from './lib/ntfy';
@@ -247,10 +249,15 @@ export default function App() {
 
   // Aktifkan Mode Siaga secara default saat aplikasi pertama kali aktif dengan profil
   useEffect(() => {
-    if (!profile) return;
-    if (standbyModeRef.current) {
+    setStandbyExternalListener((active) => {
+      setStandbyMode(active);
+    });
+    if (profile && standbyModeRef.current) {
       void enableStandbyMode();
     }
+    return () => {
+      setStandbyExternalListener(null);
+    };
   }, [profile?.id]);
 
   // Release Wake Lock & silent audio on unmount
@@ -1922,24 +1929,26 @@ export default function App() {
     setActiveCallUI((prev) => (prev ? { ...prev, isSpeakerOn: !prev.isSpeakerOn } : null));
   };
 
-  // Toggle Mode Siaga / Anti-Sleep (Screen Wake Lock + Silent Audio Keep-Alive + Web Notifications)
+  // Toggle Mode Siaga (Background Media Keep-Alive + Media Session Lock Screen + Screen Wake Lock)
   const handleToggleStandby = useCallback(async () => {
-    if (standbyModeRef.current) {
+    // Jika Mode Siaga sudah aktif DAN aliran audio penjaga sudah benar-benar berjalan, matikan
+    if (standbyModeRef.current && isKeepAliveActuallyPlaying()) {
       await disableStandbyMode();
       setStandbyMode(false);
       showToast('Mode Siaga dinonaktifkan');
       return;
     }
 
+    // Jalankan await audio.play() langsung di dalam event klik user agar kartu Media Session layar kunci muncul
     const res = await enableStandbyMode();
     setStandbyMode(true);
 
-    if (res.wakeLockActive) {
+    if (res.audioKeepAliveActive) {
+      showToast('Mode Siaga Aktif · Saluran latar & kartu layar kunci aktif');
+    } else if (res.wakeLockActive) {
       showToast('Mode Siaga Aktif · Layar & koneksi P2P tetap terjaga');
-    } else if (res.audioKeepAliveActive) {
-      showToast('Mode Siaga Aktif · Audio latar & notifikasi siaga aktif');
     } else {
-      showToast('Mode Siaga Aktif · Koneksi P2P dipantau berkala');
+      showToast('Mode Siaga Aktif · Koneksi P2P tetap siaga');
     }
   }, [showToast]);
 

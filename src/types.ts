@@ -232,6 +232,14 @@ export type PeerPacket =
       group: Contact;
     }
   | {
+      kind: 'CALL_INVITE';
+      callId: string;
+      callType: CallType;
+      fromId: string;
+      fromName: string;
+      fromAvatar: string;
+    }
+  | {
       kind: 'CALL_REQUEST';
       callId: string;
       callType: CallType;
