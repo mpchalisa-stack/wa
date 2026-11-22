@@ -206,7 +206,7 @@ export const ChatRoom: React.FC<ChatRoomProps> = ({
 
     if (file.type.startsWith('image/')) {
       try {
-        const compressed = await compressImageFile(file, 1024, 0.7);
+        const compressed = await compressImageFile(file, 800, 0.65, 150 * 1024);
         const compressedBytes = estimateDataUrlBytes(compressed);
         onSendMedia({
           type: 'image',
@@ -812,6 +812,8 @@ export const ChatRoom: React.FC<ChatRoomProps> = ({
                               ? 'Menunggu teman online...'
                               : (msg.transferProgress ?? 0) >= 100
                               ? 'Menunggu konfirmasi diterima...'
+                              : (msg.transferProgress ?? 0) === 0
+                              ? 'Menghubungkan & mengirim...'
                               : `Mengirim ${
                                   msg.type === 'image'
                                     ? 'gambar'

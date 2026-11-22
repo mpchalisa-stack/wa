@@ -71,8 +71,8 @@ export const CameraModal: React.FC<CameraModalProps> = ({
     const video = videoRef.current;
     if (!video || !video.videoWidth) return;
     const canvas = document.createElement('canvas');
-    // Resolusi maksimal lebar/tinggi 1024px (proporsional)
-    const maxDim = 1024;
+    // Resolusi maksimal lebar/tinggi 800px (proporsional)
+    const maxDim = 800;
     let w = video.videoWidth;
     let h = video.videoHeight;
     if (w > maxDim || h > maxDim) {
@@ -93,8 +93,8 @@ export const CameraModal: React.FC<CameraModalProps> = ({
       ctx.scale(-1, 1);
     }
     ctx.drawImage(video, 0, 0, w, h);
-    // Kompresi otomatis image/jpeg kualitas 0.7 (dijamin < 250 KB)
-    const { dataUrl, byteSize } = compressCanvasToJpeg(canvas, 0.7, 245 * 1024);
+    // Kompresi otomatis image/jpeg kualitas 0.65 (target ~80–150 KB)
+    const { dataUrl, byteSize } = compressCanvasToJpeg(canvas, 0.65, 150 * 1024);
     setCapturedUrl(dataUrl);
     setCapturedSize(byteSize);
   };

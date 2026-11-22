@@ -607,7 +607,7 @@ export default function App() {
 
   // Reassembled chunked file/image/video/voice/status handler on receiver side
   const handleFileReceived = useCallback(
-    (fromId: string, transfer: ReassembledFileTransfer) => {
+    async (fromId: string, transfer: ReassembledFileTransfer) => {
       const me = profileRef.current;
       if (!me) return;
 
@@ -629,9 +629,9 @@ export default function App() {
         };
         setStatuses((prev) => {
           if (prev.some((item) => item.id === incomingStatus.id)) return prev;
-          void dbSaveStatus(incomingStatus);
           return [incomingStatus, ...prev];
         });
+        await dbSaveStatus(incomingStatus);
         return;
       }
 
@@ -696,10 +696,11 @@ export default function App() {
         if (prev.some((m) => m.id === savedMsg.id)) return prev;
         return [...prev, savedMsg];
       });
-      // Simpan ke IndexedDB (media Blob tersimpan di object store `media`)
-      void dbSaveMessage(savedMsg);
 
-      // Kirim DELIVERY_ACK (mengaktifkan Centang 2 di pengirim)
+      // Simpan ke IndexedDB (media Blob tersimpan di object store `media`) sebelum FILE_ACK dikirim balik
+      await dbSaveMessage(savedMsg);
+
+      // Kirim DELIVERY_ACK & notifikasi audio
       peerManagerRef.current?.sendPacket(fromId, {
         kind: 'DELIVERY_ACK',
         messageId: savedMsg.id,
@@ -708,7 +709,6 @@ export default function App() {
       });
 
       if (isViewingChat) {
-        // Kirim READ_ACK (Centang 2 biru) & putar nada notifikasi lembut
         peerManagerRef.current?.sendPacket(fromId, {
           kind: 'READ_ACK',
           chatId: savedMsg.isGroup ? localChatId : me.id,
@@ -727,6 +727,26 @@ export default function App() {
     [upsertContact]
   );
 
+  // Konfirmasi FILE_ACK dari penerima: hilangkan bar tunggu, ubah ke Centang 2 biru, simpan ke IndexedDB
+  const handleFileAck = useCallback((_fromId: string, _fileId: string, messageId?: string) => {
+    if (!messageId) return;
+    setMessages((prev) =>
+      prev.map((m) => {
+        if (m.id === messageId) {
+          const updated: ChatMessage = {
+            ...m,
+            status: 'read',
+            transferProgress: undefined,
+            transferWaitingPeer: undefined,
+          };
+          void dbSaveMessage(updated);
+          return updated;
+        }
+        return m;
+      })
+    );
+  }, []);
+
   // Initialize PeerJS whenever profile is ready
   useEffect(() => {
     if (!profile) return;
@@ -744,6 +764,7 @@ export default function App() {
       },
       onPacket: handleIncomingPacket,
       onFileReceived: handleFileReceived,
+      onFileAck: handleFileAck,
       onPeerPresence: (sixId, isOnline) => {
         setOnlinePeers((prev) => {
           if (prev[sixId] === isOnline) return prev;
@@ -944,7 +965,7 @@ export default function App() {
             }
           : undefined;
 
-      // Untuk semua gambar, kamera, video, dokumen, & voice note: WAJIB pecah menjadi chunks <= 16 KB
+      // Untuk semua gambar, kamera, video, dokumen, & voice note: WAJIB pecah menjadi chunks 8 KB (JSON string)
       if (isMediaMessage && msg.mediaData && msg.type !== 'text') {
         const recipients =
           target.isGroup && target.members
@@ -980,6 +1001,7 @@ export default function App() {
         recipients.forEach((recipientId) => {
           manager.sendFileChunked(recipientId, {
             fileId: `${msg.id}-${recipientId}`,
+            messageId: msg.id,
             fileName: msg.fileName || `${msg.type}-${msg.timestamp}`,
             fileType: msg.mimeType || 'application/octet-stream',
             fileSize: msg.fileSize || estimateDataUrlBytes(msg.mediaData!),
@@ -1017,6 +1039,23 @@ export default function App() {
                       status: 'sent',
                       transferProgress: 100,
                       transferWaitingPeer: false,
+                    };
+                    void dbSaveMessage(updated);
+                    return updated;
+                  }
+                  return m;
+                })
+              );
+            },
+            onAck: () => {
+              setMessages((prev) =>
+                prev.map((m) => {
+                  if (m.id === msg.id) {
+                    const updated: ChatMessage = {
+                      ...m,
+                      status: 'read',
+                      transferProgress: undefined,
+                      transferWaitingPeer: undefined,
                     };
                     void dbSaveMessage(updated);
                     return updated;

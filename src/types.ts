@@ -124,13 +124,14 @@ export interface ChunkStatusMeta {
 }
 
 /**
- * Paket JSON Chunking WebRTC (<= 16 KB / 16384 bytes per FILE_CHUNK)
+ * Paket JSON Chunking WebRTC (8 KB / 8192 karakter per FILE_CHUNK, dikirim sebagai JSON string)
  * untuk seluruh pengiriman gambar, foto kamera, video, dokumen, voice note, dan foto status.
  */
 export type FileChunkPacket =
   | {
       type: 'FILE_START';
       fileId: string;
+      messageId?: string;
       fileName: string;
       fileType: string;
       fileSize: number;
@@ -147,6 +148,19 @@ export type FileChunkPacket =
   | {
       type: 'FILE_END';
       fileId: string;
+      messageId?: string;
+      missingChunks?: number[];
+    }
+  | {
+      type: 'FILE_ACK';
+      fileId: string;
+      messageId?: string;
+    }
+  | {
+      type: 'FILE_MISSING_CHUNKS';
+      fileId: string;
+      messageId?: string;
+      missingChunks: number[];
     };
 
 export type PeerPacket =

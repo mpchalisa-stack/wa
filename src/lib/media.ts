@@ -170,28 +170,28 @@ export function fileToDataUrl(file: Blob): Promise<string> {
 }
 
 /**
- * Kompresi canvas ke format image/jpeg kualitas awal 0.7 dengan jaminan ukuran akhir di bawah maxBytes (default 250 KB).
+ * Kompresi canvas ke format image/jpeg kualitas awal 0.65 dengan target ukuran akhir sekitar 80–150 KB (maksimal 150 KB).
  */
 export function compressCanvasToJpeg(
   sourceCanvas: HTMLCanvasElement,
-  initialQuality = 0.7,
-  maxBytes = 245 * 1024
+  initialQuality = 0.65,
+  maxBytes = 150 * 1024
 ): { dataUrl: string; byteSize: number } {
   let quality = initialQuality;
   let canvas = sourceCanvas;
   let dataUrl = canvas.toDataURL('image/jpeg', quality);
   let byteSize = estimateDataUrlBytes(dataUrl);
 
-  // Turunkan kualitas secara bertahap bila ukuran masih >= 250 KB
+  // Turunkan kualitas secara bertahap bila ukuran masih > maxBytes (150 KB)
   while (byteSize > maxBytes && quality > 0.35) {
-    quality = Math.max(0.35, Number((quality - 0.1).toFixed(2)));
+    quality = Math.max(0.35, Number((quality - 0.08).toFixed(2)));
     dataUrl = canvas.toDataURL('image/jpeg', quality);
     byteSize = estimateDataUrlBytes(dataUrl);
   }
 
-  // Jika gambar sangat kompleks dan masih > maxBytes, perkecil dimensi proporsional
+  // Jika gambar sangat detail dan masih > maxBytes, perkecil dimensi proporsional
   let attempts = 0;
-  while (byteSize > maxBytes && attempts < 3 && canvas.width > 480 && canvas.height > 480) {
+  while (byteSize > maxBytes && attempts < 3 && canvas.width > 420 && canvas.height > 420) {
     attempts++;
     const nextCanvas = document.createElement('canvas');
     nextCanvas.width = Math.round(canvas.width * 0.8);
@@ -209,15 +209,15 @@ export function compressCanvasToJpeg(
 
 /**
  * Kompresi otomatis gambar dari Galeri menggunakan HTML5 <canvas>:
- * - Maksimal lebar/tinggi 1024px (proporsional)
- * - Format image/jpeg kualitas 0.7
- * - Ukuran akhir dijamin di bawah 250 KB agar pengiriman WebRTC kilat
+ * - Maksimal lebar/tinggi 800px (proporsional)
+ * - Format image/jpeg kualitas 0.65
+ * - Target ukuran akhir sekitar 80–150 KB agar pengiriman chunk 8 KB WebRTC sangat stabil & cepat
  */
 export function compressImageFile(
   file: Blob,
-  maxDimension = 1024,
-  quality = 0.7,
-  maxBytes = 245 * 1024
+  maxDimension = 800,
+  quality = 0.65,
+  maxBytes = 150 * 1024
 ): Promise<string> {
   return new Promise((resolve, reject) => {
     const reader = new FileReader();
