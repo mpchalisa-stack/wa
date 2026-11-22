@@ -34,6 +34,7 @@ interface StoredMediaRecord {
 const PROFILE_KEY = 'wa6_user_profile_v1';
 const THEME_KEY = 'wa6_theme_mode_v1';
 const UNREAD_KEY = 'wa6_unread_counts_v1';
+const OUTBOX_KEY = 'outboxMessages';
 
 // Lightweight preferences only in localStorage (NEVER store chat messages or media in localStorage)
 export function getSavedProfile(): UserProfile | null {
@@ -91,6 +92,25 @@ export function getSavedUnreadCounts(): Record<string, number> {
 export function saveUnreadCounts(counts: Record<string, number>): void {
   try {
     localStorage.setItem(UNREAD_KEY, JSON.stringify(counts));
+  } catch {
+    // ignore
+  }
+}
+
+export function getSavedOutboxMessages(): PendingOutboxMessage[] {
+  try {
+    const raw = localStorage.getItem(OUTBOX_KEY);
+    if (!raw) return [];
+    const parsed = JSON.parse(raw);
+    return Array.isArray(parsed) ? (parsed as PendingOutboxMessage[]) : [];
+  } catch {
+    return [];
+  }
+}
+
+export function saveOutboxMessages(items: PendingOutboxMessage[]): void {
+  try {
+    localStorage.setItem(OUTBOX_KEY, JSON.stringify(items));
   } catch {
     // ignore
   }
@@ -284,12 +304,23 @@ export async function loadAllLocalData(): Promise<{
     }
   }
 
+  // Gabungkan outboxMessages dari localStorage & IndexedDB tanpa duplikasi
+  const mergedOutboxMap = new Map<string, PendingOutboxMessage>();
+  for (const item of getSavedOutboxMessages()) {
+    mergedOutboxMap.set(item.id, item);
+  }
+  for (const item of pendingMessages) {
+    mergedOutboxMap.set(item.id, item);
+  }
+  const mergedPending = Array.from(mergedOutboxMap.values()).sort(
+    (a, b) => a.createdAt - b.createdAt
+  );
+
   messages.sort((a, b) => a.timestamp - b.timestamp);
-  pendingMessages.sort((a, b) => a.createdAt - b.createdAt);
   validStatuses.sort((a, b) => b.timestamp - a.timestamp);
   calls.sort((a, b) => b.timestamp - a.timestamp);
 
-  return { contacts, messages, pendingMessages, statuses: validStatuses, calls };
+  return { contacts, messages, pendingMessages: mergedPending, statuses: validStatuses, calls };
 }
 
 export const dbSaveContact = (contact: Contact) => putInStore(STORES.contacts, contact);
@@ -375,6 +406,7 @@ export async function resetAllLocalData(): Promise<void> {
   try {
     localStorage.removeItem(PROFILE_KEY);
     localStorage.removeItem(UNREAD_KEY);
+    localStorage.removeItem(OUTBOX_KEY);
     const db = await openDB();
     await new Promise<void>((resolve, reject) => {
       const tx = db.transaction(

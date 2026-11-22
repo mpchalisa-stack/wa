@@ -1,8 +1,10 @@
 import React, { useRef, useState } from 'react';
-import { ArrowLeft, Camera, Check, Copy, Pencil, QrCode, Share2 } from 'lucide-react';
+import { ArrowLeft, Bell, Camera, Check, Copy, Pencil, QrCode, Share2 } from 'lucide-react';
 import { QRCodeSVG } from 'qrcode.react';
 import { UserProfile } from '../types';
 import { PRESET_AVATARS, compressImageFile, formatSixDigitId } from '../lib/media';
+import { getNtfyTopic } from '../lib/ntfy';
+import { getNotificationPermissionState, requestNotificationPermission } from '../lib/standby';
 import { Avatar } from './Avatar';
 import { PWAInstallButton } from './PWAInstallButton';
 
@@ -26,8 +28,11 @@ export const ProfileDrawer: React.FC<ProfileDrawerProps> = ({
   const [nameInput, setNameInput] = useState(profile.name);
   const [bioInput, setBioInput] = useState(profile.bio);
   const [copied, setCopied] = useState(false);
+  const [copiedTopic, setCopiedTopic] = useState(false);
+  const [notifPerm, setNotifPerm] = useState(() => getNotificationPermissionState());
   const [showLargeQR, setShowLargeQR] = useState(false);
   const fileInputRef = useRef<HTMLInputElement>(null);
+  const ntfyTopic = getNtfyTopic(profile.id);
 
   const handlePhotoUpload = async (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
@@ -64,6 +69,27 @@ export const ProfileDrawer: React.FC<ProfileDrawerProps> = ({
       window.setTimeout(() => setCopied(false), 2000);
     } catch {
       onToast(`ID Anda: ${profile.id}`);
+    }
+  };
+
+  const handleCopyNtfyTopic = async () => {
+    try {
+      await navigator.clipboard.writeText(ntfyTopic);
+      setCopiedTopic(true);
+      onToast(`Topik ntfy disalin: ${ntfyTopic}`);
+      window.setTimeout(() => setCopiedTopic(false), 2000);
+    } catch {
+      onToast(`Topik ntfy Anda: ${ntfyTopic}`);
+    }
+  };
+
+  const handleEnableBrowserNotifications = async () => {
+    const res = await requestNotificationPermission();
+    setNotifPerm(res);
+    if (res === 'granted') {
+      onToast('Notifikasi browser aktif');
+    } else if (res === 'denied') {
+      onToast('Izin notifikasi diblokir di pengaturan browser');
     }
   };
 
@@ -269,6 +295,55 @@ export const ProfileDrawer: React.FC<ProfileDrawerProps> = ({
                 </button>
               </div>
             )}
+          </div>
+
+          {/* Background Notification & ntfy Companion Section */}
+          <div className="mt-3 bg-white dark:bg-[#111B21] px-6 py-5 border-y border-black/5 dark:border-white/5 space-y-3">
+            <div className="flex items-center justify-between gap-2">
+              <div className="flex items-center gap-2">
+                <Bell className="w-4 h-4 text-[#008069] dark:text-[#00A884] shrink-0" />
+                <span className="text-xs font-semibold text-[#008069] dark:text-[#00A884]">
+                  Notifikasi Latar Belakang &amp; Dering (ntfy)
+                </span>
+              </div>
+              {notifPerm === 'granted' ? (
+                <span className="text-[11px] font-semibold text-[#008069] dark:text-[#06CF9C]">
+                  Izin Aktif
+                </span>
+              ) : notifPerm !== 'unsupported' ? (
+                <button
+                  type="button"
+                  onClick={() => void handleEnableBrowserNotifications()}
+                  className="text-[11px] font-semibold text-[#008069] dark:text-[#00A884] underline cursor-pointer"
+                >
+                  Izinkan Notifikasi
+                </button>
+              ) : null}
+            </div>
+
+            <p className="text-xs text-[#54656F] dark:text-[#8696A0] leading-relaxed">
+              Agar HP tetap berdering keras saat ada panggilan/pesan masuk meski browser Chrome ditutup rapat 100%, pasang aplikasi gratis <strong className="text-[#111B21] dark:text-[#E9EDEF]">ntfy</strong> di Play Store lalu subscribe ke topik terenkripsi Anda:
+            </p>
+
+            <div className="flex items-center gap-2 rounded-xl bg-[#F0F2F5] dark:bg-[#202C33] px-3 py-2.5 border border-black/5 dark:border-white/10">
+              <code className="flex-1 font-mono-id text-xs font-semibold text-[#111B21] dark:text-[#E9EDEF] truncate">
+                {ntfyTopic}
+              </code>
+              <button
+                type="button"
+                onClick={handleCopyNtfyTopic}
+                className="h-8 px-3 rounded-lg bg-[#008069] hover:bg-[#017561] dark:bg-[#00A884] dark:hover:bg-[#06CF9C] text-white dark:text-[#111B21] text-xs font-semibold inline-flex items-center gap-1.5 shrink-0 cursor-pointer"
+              >
+                {copiedTopic ? <Check className="w-3.5 h-3.5" /> : <Copy className="w-3.5 h-3.5" />}
+                <span>{copiedTopic ? 'Disalin' : 'Salin Topik'}</span>
+              </button>
+            </div>
+
+            <ol className="text-[11.5px] text-[#54656F] dark:text-[#8696A0] space-y-1 list-decimal list-inside">
+              <li>Pasang aplikasi <strong className="text-[#111B21] dark:text-[#E9EDEF]">ntfy</strong> (gratis, tanpa login) dari Google Play Store.</li>
+              <li>Tekan ikon <strong className="text-[#111B21] dark:text-[#E9EDEF]">+</strong> lalu tempel nama topik di atas dan aktifkan notifikasi prioritas tinggi.</li>
+              <li>Sinyal dikirim terenkripsi AES-256-GCM saat perangkat Anda offline.</li>
+            </ol>
           </div>
 
           {/* Share App & PWA Install Section */}

@@ -32,6 +32,12 @@ const FILE_ACK_RETRY_MS = 3000;
 /** Batas maksimal auto-retry FILE_END / missingChunks */
 const MAX_ACK_RETRIES = 3;
 
+/** Jeda minimal 15 detik sebelum mencoba reconnect peer.connect() lagi jika gagal (anti rate-limit 0.peerjs.com) */
+const RECONNECT_COOLDOWN_MS = 15000;
+
+/** Interval heartbeat PING ringan sekali tiap 20 detik HANYA pada koneksi yang sudah terbuka */
+const HEARTBEAT_INTERVAL_MS = 20000;
+
 /**
  * Konfigurasi ICE Servers untuk WebRTC (DataChannel & Panggilan Suara/Video).
  * Menggunakan server STUN publik Google secara default.
@@ -259,6 +265,8 @@ export class WA6PeerManager {
   private incomingFileBuffers = new Map<string, IncomingFileBuffer>();
   private completedReceivedFiles = new Map<string, string>(); // fileId -> messageId
   private awaitingFileAcks = new Map<string, PendingAckTransfer>();
+  private lastConnectAttempt = new Map<string, number>();
+  private heartbeatTimer: number | null = null;
   private reconnectTimer: number | null = null;
   private destroyed = false;
 
@@ -327,6 +335,7 @@ export class WA6PeerManager {
     peer.on('open', () => {
       if (this.destroyed) return;
       this.callbacks.onStatusChange('online');
+      this.startHeartbeatLoop();
     });
 
     peer.on('connection', (conn) => {
@@ -354,7 +363,14 @@ export class WA6PeerManager {
       if (errType === 'peer-unavailable') {
         const match = err.message?.match(/WA6-(\d{6})/);
         if (match && match[1]) {
-          this.callbacks.onPeerPresence(match[1], false);
+          const unavailableId = match[1];
+          // Simpan timestamp kegagalan agar tidak mencoba connect lagi sebelum 15 detik
+          this.lastConnectAttempt.set(unavailableId, Date.now());
+          const stale = this.connections.get(unavailableId);
+          if (stale && !isConnectionLive(stale)) {
+            this.connections.delete(unavailableId);
+          }
+          this.callbacks.onPeerPresence(unavailableId, false);
         }
         return;
       }
@@ -373,6 +389,33 @@ export class WA6PeerManager {
     });
   }
 
+  /**
+   * Heartbeat PING ringan sekali setiap 20 detik HANYA pada koneksi DataConnection yang sudah terbuka.
+   * Tidak pernah memanggil peer.connect() agar bebas rate-limit broker 0.peerjs.com.
+   */
+  private startHeartbeatLoop(): void {
+    if (this.heartbeatTimer !== null) {
+      window.clearInterval(this.heartbeatTimer);
+    }
+    this.heartbeatTimer = window.setInterval(() => {
+      if (this.destroyed) return;
+      const now = Date.now();
+      this.connections.forEach((conn, peerSixId) => {
+        if (!isConnectionLive(conn)) return;
+        try {
+          conn.send({
+            kind: 'PING',
+            fromId: this.profile.id,
+            ts: now,
+          } satisfies PeerPacket);
+        } catch {
+          this.connections.delete(peerSixId);
+          this.callbacks.onPeerPresence(peerSixId, false);
+        }
+      });
+    }, HEARTBEAT_INTERVAL_MS);
+  }
+
   private scheduleReconnect(): void {
     if (this.destroyed || this.reconnectTimer !== null) return;
     this.reconnectTimer = window.setTimeout(() => {
@@ -387,7 +430,7 @@ export class WA6PeerManager {
       } else if (!this.peer || this.peer.destroyed) {
         this.connect();
       }
-    }, 3000);
+    }, RECONNECT_COOLDOWN_MS);
   }
 
   private waitForPeerOpen(timeoutMs = 3500): Promise<boolean> {
@@ -455,26 +498,34 @@ export class WA6PeerManager {
       return refreshed;
     }
 
-    // Jika ada koneksi lama yang macet/tidak terbuka, tutup bersih agar tidak bentrok
-    if (refreshed && !refreshed.open) {
-      try {
-        refreshed.close();
-      } catch {
-        // ignore
-      }
-      if (this.connections.get(targetSixDigitId) === refreshed) {
-        this.connections.delete(targetSixDigitId);
-      }
-    }
-
+    const lastTry = this.lastConnectAttempt.get(targetSixDigitId) ?? 0;
     let conn: DataConnection;
-    try {
-      conn = this.peer.connect(toFullPeerId(targetSixDigitId), {
-        reliable: true,
-      });
-      this.attachConnection(conn);
-    } catch {
-      return null;
+
+    // Jika sudah ada satu jalur DataConnection yang sedang proses handshake (< 8 detik), tunggu jalur itu (jangan gandakan)
+    if (refreshed && !refreshed.open && Date.now() - lastTry < CONNECTION_OPEN_TIMEOUT_MS) {
+      conn = refreshed;
+    } else {
+      // Jika ada koneksi lama yang benar-benar macet/kedaluwarsa, tutup bersih sebelum buat jalur tunggal baru
+      if (refreshed && !refreshed.open) {
+        try {
+          refreshed.close();
+        } catch {
+          // ignore
+        }
+        if (this.connections.get(targetSixDigitId) === refreshed) {
+          this.connections.delete(targetSixDigitId);
+        }
+      }
+
+      try {
+        this.lastConnectAttempt.set(targetSixDigitId, Date.now());
+        conn = this.peer.connect(toFullPeerId(targetSixDigitId), {
+          reliable: true,
+        });
+        this.attachConnection(conn);
+      } catch {
+        return null;
+      }
     }
 
     if (isConnectionLive(conn)) {
@@ -1067,6 +1118,9 @@ export class WA6PeerManager {
         }
 
         this.callbacks.onPacket(peerSixId, pkt);
+        if (pkt.kind === 'HELLO' || pkt.kind === 'MESSAGE') {
+          this.callbacks.onPeerReady?.(peerSixId);
+        }
       }
     });
 
@@ -1085,7 +1139,11 @@ export class WA6PeerManager {
     });
   }
 
-  public ensureConnection(targetSixDigitId: string): DataConnection | null {
+  /**
+   * Pastikan hanya ada SATU jalur koneksi DataConnection per kontak.
+   * Hanya membuat koneksi baru jika belum ada koneksi terbuka dan sudah melewati jeda minimal 15 detik.
+   */
+  public ensureConnection(targetSixDigitId: string, force = false): DataConnection | null {
     if (!this.peer || this.peer.destroyed || !this.peer.open) return null;
     if (targetSixDigitId === this.profile.id) return null;
 
@@ -1094,6 +1152,18 @@ export class WA6PeerManager {
       return existing;
     }
 
+    const now = Date.now();
+    const lastAttempt = this.lastConnectAttempt.get(targetSixDigitId) ?? 0;
+
+    // Jika koneksi tunggal masih dalam tahap membuka atau belum melewati jeda 15 detik, jangan buka koneksi baru
+    if (existing && !existing.open && now - lastAttempt < RECONNECT_COOLDOWN_MS) {
+      return existing;
+    }
+    if (!force && now - lastAttempt < RECONNECT_COOLDOWN_MS) {
+      return null;
+    }
+
+    this.lastConnectAttempt.set(targetSixDigitId, now);
     try {
       const conn = this.peer.connect(toFullPeerId(targetSixDigitId), {
         reliable: true,
@@ -1114,11 +1184,11 @@ export class WA6PeerManager {
         existing.send(packet);
         return true;
       } catch {
-        // Fall through to reconnect & queue
+        // Fall through to queue
       }
     }
 
-    if (packet.kind !== 'TYPING') {
+    if (packet.kind !== 'TYPING' && packet.kind !== 'PING' && packet.kind !== 'PONG') {
       const queue = this.pendingQueues.get(targetSixDigitId) || [];
       if (queue.length < 40) {
         queue.push(packet);
@@ -1126,7 +1196,8 @@ export class WA6PeerManager {
       }
     }
 
-    this.ensureConnection(targetSixDigitId);
+    // Hormati jeda 15 detik agar tidak membanjiri server 0.peerjs.com
+    this.ensureConnection(targetSixDigitId, false);
     return false;
   }
 
@@ -1143,8 +1214,7 @@ export class WA6PeerManager {
   }
 
   /**
-   * Mengirim sinyal PING ke peer bila koneksi terbuka, atau mencoba menghubungkan ulang bila belum terbuka.
-   * Mengembalikan true jika koneksi sedang aktif terbuka.
+   * Mengirim sinyal PING ringan HANYA pada koneksi DataConnection yang sudah terbuka (tanpa polling reconnect).
    */
   public pingPeer(targetSixDigitId: string): boolean {
     if (this.destroyed || targetSixDigitId === this.profile.id) return false;
@@ -1158,28 +1228,10 @@ export class WA6PeerManager {
         } satisfies PeerPacket);
         return true;
       } catch {
-        // Koneksi rusak — bersihkan dan coba sambung ulang
-        try {
-          existing.close();
-        } catch {
-          // ignore
-        }
         this.connections.delete(targetSixDigitId);
         this.callbacks.onPeerPresence(targetSixDigitId, false);
       }
     }
-
-    if (this.peer && !this.peer.destroyed && this.peer.disconnected) {
-      try {
-        this.peer.reconnect();
-      } catch {
-        this.connect();
-      }
-    } else if (!this.peer || this.peer.destroyed) {
-      this.connect();
-    }
-
-    this.ensureConnection(targetSixDigitId);
     return false;
   }
 
@@ -1335,10 +1387,15 @@ export class WA6PeerManager {
   }
 
   private cleanupPeer(): void {
+    if (this.heartbeatTimer !== null) {
+      window.clearInterval(this.heartbeatTimer);
+      this.heartbeatTimer = null;
+    }
     if (this.reconnectTimer !== null) {
       window.clearTimeout(this.reconnectTimer);
       this.reconnectTimer = null;
     }
+    this.lastConnectAttempt.clear();
     this.awaitingFileAcks.forEach((entry) => {
       if (entry.retryTimer !== null) {
         window.clearTimeout(entry.retryTimer);

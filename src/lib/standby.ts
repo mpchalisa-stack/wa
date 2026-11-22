@@ -2,8 +2,7 @@ import { getSharedAudioContext, triggerAlertVibration } from './audio';
 
 /**
  * Menghasilkan WAV PCM 16-bit mono 1 detik yang hampir hening (tanpa dependensi file eksternal)
- * untuk diputar melingkar pada elemen <audio> dengan volume 0.001.
- * Ini menjaga tab browser Android tetap dianggap aktif memutar media saat layar redup/terkunci.
+ * untuk diputar melingkar pada elemen <audio> dengan volume 0.001 saat Mode Siaga aktif.
  */
 function createSilentLoopWavDataUrl(): string {
   const sampleRate = 8000;
@@ -21,9 +20,9 @@ function createSilentLoopWavDataUrl(): string {
   view.setUint32(4, 36 + numSamples * 2, true);
   writeStr(8, 'WAVE');
   writeStr(12, 'fmt ');
-  view.setUint32(16, 16, true); // PCM header size
-  view.setUint16(20, 1, true); // PCM format
-  view.setUint16(22, 1, true); // 1 channel (mono)
+  view.setUint32(16, 16, true);
+  view.setUint16(20, 1, true);
+  view.setUint16(22, 1, true);
   view.setUint32(24, sampleRate, true);
   view.setUint32(28, sampleRate * 2, true);
   view.setUint16(32, 2, true);
@@ -31,7 +30,6 @@ function createSilentLoopWavDataUrl(): string {
   writeStr(36, 'data');
   view.setUint32(40, numSamples * 2, true);
 
-  // Isi nilai sangat kecil (±1 LSB) agar decoder audio tidak menganggap stream kosong
   for (let i = 0; i < numSamples; i++) {
     view.setInt16(44 + i * 2, i % 2 === 0 ? 1 : -1, true);
   }
@@ -57,6 +55,8 @@ type NavigatorWithOptionalWakeLock = {
 };
 
 let isStandbyActive = false;
+let isPausedForCall = false;
+let resumeTimer: number | null = null;
 let wakeLockSentinel: WakeLockSentinelLike | null = null;
 let keepAliveAudioEl: HTMLAudioElement | null = null;
 let keepAliveOsc: OscillatorNode | null = null;
@@ -97,6 +97,8 @@ async function releaseScreenWakeLock(): Promise<void> {
 }
 
 function startSilentAudioKeepAlive(): boolean {
+  // Jangan pernah menyalakan silent keep-alive saat sedang ada panggilan aktif atau Mode Siaga mati
+  if (!isStandbyActive || isPausedForCall) return false;
   let started = false;
 
   // 1. Silent Web Audio API Oscillator (volume 0.001) agar AudioContext tetap hidup
@@ -119,7 +121,7 @@ function startSilentAudioKeepAlive(): boolean {
     // ignore
   }
 
-  // 2. Looping HTML5 <audio> volume 0.001 agar Android OS mempertahankan tab & WebRTC di background
+  // 2. Looping HTML5 <audio> volume 0.001
   try {
     if (!keepAliveAudioEl) {
       const audio = document.createElement('audio');
@@ -132,13 +134,10 @@ function startSilentAudioKeepAlive(): boolean {
     keepAliveAudioEl.volume = 0.001;
     const playPromise = keepAliveAudioEl.play();
     if (playPromise && typeof playPromise.then === 'function') {
-      playPromise.catch(() => {
-        // ignore if autoplay restricted
-      });
+      playPromise.catch(() => {});
     }
     started = true;
 
-    // Daftarkan MediaSession agar Android mengenali sesi aktif WattappsAU Mode Siaga
     if ('mediaSession' in navigator && typeof MediaMetadata !== 'undefined') {
       navigator.mediaSession.metadata = new MediaMetadata({
         title: 'WattappsAU — Mode Siaga Aktif',
@@ -192,17 +191,48 @@ function stopSilentAudioKeepAlive(): void {
 const handleStandbyVisibilityChange = () => {
   if (!isStandbyActive) return;
   if (document.visibilityState === 'visible') {
-    // Sesuai spesifikasi W3C, Wake Lock dilepas saat tab tersembunyi -> minta ulang saat kembali
     void requestScreenWakeLock();
-    const ctx = getSharedAudioContext();
-    if (ctx && ctx.state === 'suspended') {
-      void ctx.resume();
-    }
-    if (keepAliveAudioEl && keepAliveAudioEl.paused) {
-      keepAliveAudioEl.play().catch(() => {});
+    if (!isPausedForCall) {
+      const ctx = getSharedAudioContext();
+      if (ctx && ctx.state === 'suspended') {
+        void ctx.resume();
+      }
+      if (keepAliveAudioEl && keepAliveAudioEl.paused) {
+        keepAliveAudioEl.play().catch(() => {});
+      }
     }
   }
 };
+
+/**
+ * Hentikan otomatis Silent Audio Keep-Alive saat panggilan masuk/keluar dimulai
+ * agar tidak membentrokkan AudioContext mikrofon & speaker pada perangkat Android (Poco X8 Pro, Galaxy Tab S8, dll).
+ */
+export function pauseKeepAliveForCall(): void {
+  if (resumeTimer !== null) {
+    window.clearTimeout(resumeTimer);
+    resumeTimer = null;
+  }
+  isPausedForCall = true;
+  stopSilentAudioKeepAlive();
+}
+
+/**
+ * Lanjutkan Silent Audio Keep-Alive setelah panggilan berakhir jika Mode Siaga masih menyala.
+ */
+export function resumeKeepAliveAfterCall(): void {
+  isPausedForCall = false;
+  if (!isStandbyActive) return;
+  if (resumeTimer !== null) {
+    window.clearTimeout(resumeTimer);
+  }
+  resumeTimer = window.setTimeout(() => {
+    resumeTimer = null;
+    if (isStandbyActive && !isPausedForCall) {
+      startSilentAudioKeepAlive();
+    }
+  }, 700);
+}
 
 export async function requestNotificationPermission(): Promise<NotificationPermission | 'unsupported'> {
   if (typeof window === 'undefined' || !('Notification' in window)) {
@@ -218,6 +248,13 @@ export async function requestNotificationPermission(): Promise<NotificationPermi
   }
 }
 
+export function getNotificationPermissionState(): NotificationPermission | 'unsupported' {
+  if (typeof window === 'undefined' || !('Notification' in window)) {
+    return 'unsupported';
+  }
+  return Notification.permission;
+}
+
 export async function enableStandbyMode(): Promise<{
   wakeLockActive: boolean;
   audioKeepAliveActive: boolean;
@@ -230,7 +267,7 @@ export async function enableStandbyMode(): Promise<{
     visibilityListenerAttached = true;
   }
 
-  const audioKeepAliveActive = startSilentAudioKeepAlive();
+  const audioKeepAliveActive = !isPausedForCall ? startSilentAudioKeepAlive() : false;
   const [wakeLockActive, notificationPermission] = await Promise.all([
     requestScreenWakeLock(),
     requestNotificationPermission(),
@@ -241,6 +278,10 @@ export async function enableStandbyMode(): Promise<{
 
 export async function disableStandbyMode(): Promise<void> {
   isStandbyActive = false;
+  if (resumeTimer !== null) {
+    window.clearTimeout(resumeTimer);
+    resumeTimer = null;
+  }
   if (visibilityListenerAttached && typeof document !== 'undefined') {
     document.removeEventListener('visibilitychange', handleStandbyVisibilityChange);
     visibilityListenerAttached = false;
@@ -256,12 +297,12 @@ export function showIncomingWebNotification(options: {
   isCall?: boolean;
   onClick?: () => void;
 }): void {
-  triggerAlertVibration([500, 200, 500]);
+  triggerAlertVibration(options.isCall ? [800, 400, 800] : [500, 200, 500]);
 
   if (typeof window === 'undefined' || !('Notification' in window)) return;
   if (Notification.permission !== 'granted') return;
 
-  // Tampilkan notifikasi sistem bila layar/tab tidak aktif, sedang panggilan masuk, atau Mode Siaga aktif
+  // Untuk panggilan masuk, selalu tampilkan banner mengambang; untuk pesan, tampilkan jika tab tidak fokus/latar belakang atau Mode Siaga aktif
   const shouldNotify =
     options.isCall ||
     isStandbyActive ||
@@ -270,9 +311,14 @@ export function showIncomingWebNotification(options: {
 
   if (!shouldNotify) return;
 
+  const notifTitle = options.isCall ? 'Panggilan Masuk - WattappsAU' : options.title;
+  const notifBody = options.isCall
+    ? options.body || 'Ketuk untuk menjawab panggilan...'
+    : options.body;
+
   try {
-    const notif = new Notification(options.title, {
-      body: options.body,
+    const notif = new Notification(notifTitle, {
+      body: notifBody,
       icon: '/icon-512.png',
       badge: '/icon-512.png',
       tag: options.tag,
@@ -290,12 +336,12 @@ export function showIncomingWebNotification(options: {
       notif.close();
     };
   } catch {
-    // Fallback melalui ServiceWorkerRegistration bila Notification constructor dibatasi (Android PWA)
+    // Fallback melalui ServiceWorkerRegistration untuk Android PWA
     if ('serviceWorker' in navigator) {
       navigator.serviceWorker.ready
         .then((reg) => {
-          void reg.showNotification(options.title, {
-            body: options.body,
+          void reg.showNotification(notifTitle, {
+            body: notifBody,
             icon: '/icon-512.png',
             badge: '/icon-512.png',
             tag: options.tag,

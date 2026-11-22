@@ -48,6 +48,7 @@ import {
   getSavedUnreadCounts,
   loadAllLocalData,
   resetAllLocalData,
+  saveOutboxMessages,
   saveTheme,
   saveUnreadCounts,
   saveUserProfile,
@@ -58,6 +59,7 @@ import {
   fromFullPeerId,
 } from './lib/peerManager';
 import {
+  initGlobalAudioUnlock,
   playMessagePop,
   startIncomingRingtone,
   startOutgoingRingback,
@@ -66,8 +68,12 @@ import {
 import {
   disableStandbyMode,
   enableStandbyMode,
+  pauseKeepAliveForCall,
+  requestNotificationPermission,
+  resumeKeepAliveAfterCall,
   showIncomingWebNotification,
 } from './lib/standby';
+import { sendNtfyWakeSignal, subscribeNtfySignal } from './lib/ntfy';
 import { estimateDataUrlBytes, formatSixDigitId, generateUid } from './lib/media';
 import { OnboardingScreen } from './components/OnboardingScreen';
 import { ChatList } from './components/ChatList';
@@ -162,6 +168,7 @@ export default function App() {
   const activeChatIdRef = useRef<string | null>(activeChatId);
   const callRuntimeRef = useRef<ActiveCallRuntime | null>(null);
   const callTimerRef = useRef<number | null>(null);
+  const wakeRingtoneTimerRef = useRef<number | null>(null);
   const typingClearTimersRef = useRef<Record<string, number>>({});
   const toastTimerRef = useRef<number | null>(null);
 
@@ -199,6 +206,17 @@ export default function App() {
     saveUnreadCounts(unreadCounts);
   }, [unreadCounts]);
 
+  // Sync outboxMessages metadata to localStorage
+  useEffect(() => {
+    if (!dataLoaded) return;
+    saveOutboxMessages(pendingMessages);
+  }, [pendingMessages, dataLoaded]);
+
+  // Unlock global AudioContext on first user touch/click anywhere on screen
+  useEffect(() => {
+    return initGlobalAudioUnlock();
+  }, []);
+
   const showToast = useCallback((message: string) => {
     setToast(message);
     if (toastTimerRef.current !== null) {
@@ -229,6 +247,9 @@ export default function App() {
   // Release Wake Lock & silent audio on unmount
   useEffect(() => {
     return () => {
+      if (wakeRingtoneTimerRef.current !== null) {
+        window.clearTimeout(wakeRingtoneTimerRef.current);
+      }
       void disableStandbyMode();
     };
   }, []);
@@ -328,6 +349,10 @@ export default function App() {
   // Clean up any active call & record call history
   const finalizeCall = useCallback(
     (statusOverride?: 'answered' | 'missed' | 'rejected') => {
+      if (wakeRingtoneTimerRef.current !== null) {
+        window.clearTimeout(wakeRingtoneTimerRef.current);
+        wakeRingtoneTimerRef.current = null;
+      }
       stopRingtone();
       if (callTimerRef.current !== null) {
         window.clearInterval(callTimerRef.current);
@@ -337,6 +362,9 @@ export default function App() {
       const rt = callRuntimeRef.current;
       callRuntimeRef.current = null;
       setActiveCallUI(null);
+
+      // Lanjutkan kembali silent keep-alive jika Mode Siaga masih aktif setelah panggilan selesai
+      resumeKeepAliveAfterCall();
 
       if (!rt) return;
 
@@ -601,6 +629,35 @@ export default function App() {
           break;
         }
 
+        case 'CALL_REQUEST': {
+          // Mulai nada dering 440Hz+480Hz + notifikasi mengambang segera saat sinyal panggilan masuk tiba
+          if (!callRuntimeRef.current) {
+            pauseKeepAliveForCall();
+            startIncomingRingtone();
+            const callerName =
+              contactsRef.current.find((c) => c.id === fromId)?.name ||
+              packet.fromName ||
+              `ID ${fromId}`;
+            showIncomingWebNotification({
+              title: 'Panggilan Masuk - WattappsAU',
+              body: `${callerName} menelepon · Ketuk untuk menjawab panggilan...`,
+              tag: `call-${packet.callId}`,
+              isCall: true,
+            });
+            if (wakeRingtoneTimerRef.current !== null) {
+              window.clearTimeout(wakeRingtoneTimerRef.current);
+            }
+            wakeRingtoneTimerRef.current = window.setTimeout(() => {
+              wakeRingtoneTimerRef.current = null;
+              if (!callRuntimeRef.current) {
+                stopRingtone();
+                resumeKeepAliveAfterCall();
+              }
+            }, 25000);
+          }
+          break;
+        }
+
         case 'CALL_SIGNAL': {
           const rt = callRuntimeRef.current;
           if (packet.action === 'reject' && rt && rt.peerId === fromId) {
@@ -641,6 +698,14 @@ export default function App() {
         mediaCall.close();
         return;
       }
+
+      if (wakeRingtoneTimerRef.current !== null) {
+        window.clearTimeout(wakeRingtoneTimerRef.current);
+        wakeRingtoneTimerRef.current = null;
+      }
+
+      // Hentikan otomatis Silent Audio Keep-Alive agar tidak bentrok dengan audio mikrofon/speaker panggilan
+      pauseKeepAliveForCall();
 
       const meta = (mediaCall.metadata || {}) as {
         callId?: string;
@@ -685,12 +750,9 @@ export default function App() {
       });
 
       startIncomingRingtone();
-      void showIncomingWebNotification({
-        title: callerName,
-        body:
-          callType === 'video'
-            ? 'Panggilan Video WattappsAU Masuk'
-            : 'Panggilan Suara WattappsAU Masuk',
+      showIncomingWebNotification({
+        title: 'Panggilan Masuk - WattappsAU',
+        body: `${callerName} (${callType === 'video' ? 'Video' : 'Suara'}) · Ketuk untuk menjawab panggilan...`,
         tag: `call-${callId}`,
         isCall: true,
       });
@@ -1069,41 +1131,71 @@ export default function App() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [profile?.id]);
 
-  // Loop pemantau otomatis setiap 4 detik untuk antrean pendingMessages & keep-alive PING
+  // Stream SSE tunggal & hemat baterai ke https://ntfy.sh/wattappsau-signal-{my6DigitId}/sse
+  // Menggantikan polling timer agresif agar broker PeerJS stabil & bebas rate-limit
   useEffect(() => {
-    if (!profile || !dataLoaded) return;
-    let tickCount = 0;
+    if (!profile) return;
+    void requestNotificationPermission();
 
-    const intervalId = window.setInterval(() => {
-      tickCount += 1;
-      const manager = peerManagerRef.current;
-      if (!manager) return;
+    const unsubscribe = subscribeNtfySignal(profile.id, (signal) => {
+      const senderLabel =
+        (signal.fromId
+          ? contactsRef.current.find((c) => c.id === signal.fromId)?.name
+          : undefined) ||
+        signal.fromName ||
+        (signal.fromId ? `ID ${signal.fromId}` : 'Kontak WattappsAU');
 
-      const pendingList = pendingMessagesRef.current;
-      if (pendingList.length > 0) {
-        const uniqueRecipients = Array.from(new Set(pendingList.map((p) => p.recipientId)));
-        for (const recipientId of uniqueRecipients) {
-          const isLive = manager.pingPeer(recipientId);
-          if (isLive || manager.isPeerOnline(recipientId)) {
-            void flushPendingForPeer(recipientId);
+      if (signal.type === 'INCOMING_CALL') {
+        if (!callRuntimeRef.current) {
+          pauseKeepAliveForCall();
+          startIncomingRingtone();
+          showIncomingWebNotification({
+            title: 'Panggilan Masuk - WattappsAU',
+            body: `${senderLabel} menelepon · Ketuk untuk menjawab panggilan...`,
+            tag: `call-${signal.callId || signal.ts}`,
+            isCall: true,
+          });
+          if (wakeRingtoneTimerRef.current !== null) {
+            window.clearTimeout(wakeRingtoneTimerRef.current);
           }
+          wakeRingtoneTimerRef.current = window.setTimeout(() => {
+            wakeRingtoneTimerRef.current = null;
+            if (!callRuntimeRef.current) {
+              stopRingtone();
+              resumeKeepAliveAfterCall();
+            }
+          }, 25000);
+        }
+        if (signal.fromId) {
+          peerManagerRef.current?.ensureConnection(signal.fromId, false);
+        }
+      } else if (signal.type === 'NEW_MSG') {
+        const isViewing = Boolean(signal.fromId && activeChatIdRef.current === signal.fromId);
+        if (!isViewing || document.hidden || standbyModeRef.current) {
+          playMessagePop(true);
+          showIncomingWebNotification({
+            title: senderLabel,
+            body: 'Pesan baru masuk · Ketuk untuk membuka WattappsAU',
+            tag: `ntfy-msg-${signal.fromId || signal.ts}`,
+            onClick: () => {
+              if (signal.fromId) {
+                setActiveTab('chats');
+                setActiveChatId(signal.fromId);
+              }
+            },
+          });
+        }
+        // Sambungkan satu jalur secara alami agar outboxMessages lawan langsung tersinkron
+        if (signal.fromId) {
+          peerManagerRef.current?.ensureConnection(signal.fromId, false);
         }
       }
-
-      // Saat Mode Siaga aktif, kirim PING berkala tiap 16 detik ke kontak 1:1 agar WebRTC tetap hidup
-      if (standbyModeRef.current && tickCount % 4 === 0) {
-        contactsRef.current
-          .filter((c) => !c.isGroup)
-          .forEach((c) => {
-            manager.pingPeer(c.id);
-          });
-      }
-    }, 4000);
+    });
 
     return () => {
-      window.clearInterval(intervalId);
+      unsubscribe();
     };
-  }, [profile?.id, dataLoaded, flushPendingForPeer]);
+  }, [profile?.id]);
 
   // Whenever user opens a chat room, clear unread badge & send READ_ACK
   useEffect(() => {
@@ -1327,8 +1419,14 @@ export default function App() {
             });
           }
         } else {
-          // Penerima Offline: coba buka koneksi di latar belakang; loop 4 detik & onPeerReady akan menguras otomatis
-          manager.ensureConnection(recipientId);
+          // Penerima Offline: simpan di outboxMessages & kirim sinyal bangun terenkripsi via ntfy.sh (tanpa polling loop)
+          void sendNtfyWakeSignal({
+            targetId: recipientId,
+            type: 'NEW_MSG',
+            fromId: me.id,
+            fromName: me.name,
+          });
+          manager.ensureConnection(recipientId, false);
         }
       });
     },
@@ -1563,16 +1661,42 @@ export default function App() {
       return;
     }
 
+    const callId = generateUid('call');
+    const contact = contacts.find((c) => c.id === peerId);
+    const peerName = contact?.name || `ID ${peerId}`;
+    const peerAvatar = contact?.avatar || '';
+
+    // Hentikan otomatis Silent Audio Keep-Alive sebelum mengakses mikrofon/speaker panggilan
+    pauseKeepAliveForCall();
+
+    // Jika lawan sedang Offline / koneksi DataChannel belum terbuka, kirim sinyal bangun prioritas urgent via ntfy.sh
+    if (!manager.isPeerOnline(peerId)) {
+      void sendNtfyWakeSignal({
+        targetId: peerId,
+        type: 'INCOMING_CALL',
+        fromId: profile.id,
+        fromName: profile.name,
+        callType,
+        callId,
+      });
+      showToast(`Sinyal bangun panggilan dikirim ke ${peerName} via ntfy`);
+    } else {
+      // Kirim paket CALL_REQUEST langsung lewat DataChannel agar dering 440Hz+480Hz lawan segera berbunyi
+      manager.sendPacket(peerId, {
+        kind: 'CALL_REQUEST',
+        callId,
+        callType,
+        fromId: profile.id,
+        fromName: profile.name,
+        fromAvatar: profile.avatar,
+      });
+    }
+
     try {
       const localStream = await navigator.mediaDevices.getUserMedia({
         audio: true,
         video: callType === 'video' ? { facingMode: 'user' } : false,
       });
-
-      const callId = generateUid('call');
-      const contact = contacts.find((c) => c.id === peerId);
-      const peerName = contact?.name || `ID ${peerId}`;
-      const peerAvatar = contact?.avatar || '';
 
       const mediaCall = manager.startMediaCall(peerId, localStream, {
         callId,
@@ -1583,6 +1707,7 @@ export default function App() {
 
       if (!mediaCall) {
         localStream.getTracks().forEach((t) => t.stop());
+        resumeKeepAliveAfterCall();
         showToast('Gagal memulai panggilan. Pastikan teman sedang online.');
         return;
       }
@@ -1647,6 +1772,7 @@ export default function App() {
         }
       });
     } catch {
+      resumeKeepAliveAfterCall();
       showToast(
         callType === 'video'
           ? 'Izin kamera dan mikrofon diperlukan untuk panggilan video.'
