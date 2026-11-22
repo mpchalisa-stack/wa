@@ -4,8 +4,10 @@ import {
   Camera,
   Copy,
   Lock,
+  LogOut,
   Moon,
   MoreVertical,
+  Power,
   QrCode,
   RefreshCw,
   Search,
@@ -156,6 +158,7 @@ export default function App() {
   const [showNewGroupModal, setShowNewGroupModal] = useState(false);
   const [showShareAppModal, setShowShareAppModal] = useState(false);
   const [showResetConfirm, setShowResetConfirm] = useState(false);
+  const [isExited, setIsExited] = useState(false);
   const [pendingInvite, setPendingInvite] = useState<{ id: string; name?: string } | null>(() => {
     if (typeof window === 'undefined') return null;
     try {
@@ -218,6 +221,21 @@ export default function App() {
   const typingClearTimersRef = useRef<Record<string, number>>({});
   const toastTimerRef = useRef<number | null>(null);
 
+  const isExitedRef = useRef<boolean>(isExited);
+  const backGuardStateRef = useRef({
+    activeTab,
+    activeChatId,
+    searchOpen,
+    showMainMenu,
+    showProfileDrawer,
+    showNewChatModal,
+    showNewGroupModal,
+    showShareAppModal,
+    showResetConfirm,
+    cameraPurpose,
+    lightboxMedia,
+  });
+
   useEffect(() => {
     profileRef.current = profile;
   }, [profile]);
@@ -236,6 +254,36 @@ export default function App() {
   useEffect(() => {
     activeChatIdRef.current = activeChatId;
   }, [activeChatId]);
+  useEffect(() => {
+    isExitedRef.current = isExited;
+  }, [isExited]);
+  useEffect(() => {
+    backGuardStateRef.current = {
+      activeTab,
+      activeChatId,
+      searchOpen,
+      showMainMenu,
+      showProfileDrawer,
+      showNewChatModal,
+      showNewGroupModal,
+      showShareAppModal,
+      showResetConfirm,
+      cameraPurpose,
+      lightboxMedia,
+    };
+  }, [
+    activeTab,
+    activeChatId,
+    searchOpen,
+    showMainMenu,
+    showProfileDrawer,
+    showNewChatModal,
+    showNewGroupModal,
+    showShareAppModal,
+    showResetConfirm,
+    cameraPurpose,
+    lightboxMedia,
+  ]);
 
   // Sync Tailwind dark class & browser theme-color
   useEffect(() => {
@@ -263,14 +311,14 @@ export default function App() {
     return initGlobalAudioUnlock();
   }, []);
 
-  const showToast = useCallback((message: string) => {
+  const showToast = useCallback((message: string, durationMs = 2800) => {
     setToast(message);
     if (toastTimerRef.current !== null) {
       window.clearTimeout(toastTimerRef.current);
     }
     toastTimerRef.current = window.setTimeout(() => {
       setToast(null);
-    }, 2800);
+    }, durationMs);
   }, []);
 
   // Load IndexedDB data on startup
@@ -292,6 +340,7 @@ export default function App() {
 
   // Aktifkan Mode Siaga secara default saat aplikasi pertama kali aktif dengan profil
   useEffect(() => {
+    if (isExited) return;
     setStandbyExternalListener((active) => {
       setStandbyMode(active);
     });
@@ -301,7 +350,7 @@ export default function App() {
     return () => {
       setStandbyExternalListener(null);
     };
-  }, [profile?.id]);
+  }, [profile?.id, isExited]);
 
   // Release Wake Lock & silent audio on unmount
   useEffect(() => {
@@ -1505,9 +1554,9 @@ export default function App() {
     [removePendingEntry, sendMediaMessageToPeer]
   );
 
-  // Initialize PeerJS whenever profile is ready
+  // Initialize PeerJS whenever profile is ready and app is active
   useEffect(() => {
-    if (!profile) return;
+    if (!profile || isExited) return;
 
     const manager = new WA6PeerManager(profile, {
       onStatusChange: (state, errMsg) => {
@@ -1542,14 +1591,14 @@ export default function App() {
       manager.destroy();
       peerManagerRef.current = null;
     };
-    // Re-init only when user ID changes (login/reset)
+    // Re-init only when user ID or exited state changes (login/reset/exit)
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [profile?.id]);
+  }, [profile?.id, isExited]);
 
   // Stream SSE tunggal & hemat baterai ke https://ntfy.sh/wattappsau-signal-{my6DigitId}/sse
   // Menggantikan polling timer agresif agar broker PeerJS stabil & bebas rate-limit
   useEffect(() => {
-    if (!profile) return;
+    if (!profile || isExited) return;
     void requestNotificationPermission();
 
     const unsubscribe = subscribeNtfySignal(profile.id, (signal) => {
@@ -1641,7 +1690,7 @@ export default function App() {
     return () => {
       unsubscribe();
     };
-  }, [profile?.id, finalizeCall, presentPendingCallModal]);
+  }, [profile?.id, isExited, finalizeCall, presentPendingCallModal]);
 
   // Pemulihan koneksi otomatis (anti zombie socket) saat aplikasi kembali dari latar belakang (visibilitychange & focus)
   const wakeAndSyncPeer = useCallback(async () => {
@@ -1714,7 +1763,7 @@ export default function App() {
 
   // Dengarkan visibilitychange & window.focus untuk otomatis memulihkan PeerJS + zombie socket
   useEffect(() => {
-    if (!profile) return;
+    if (!profile || isExited) return;
 
     const handleVisibilityChange = () => {
       if (document.visibilityState === 'visible') {
@@ -1733,7 +1782,80 @@ export default function App() {
       document.removeEventListener('visibilitychange', handleVisibilityChange);
       window.removeEventListener('focus', handleWindowFocus);
     };
-  }, [profile?.id, wakeAndSyncPeer]);
+  }, [profile?.id, isExited, wakeAndSyncPeer]);
+
+  // Cegah tombol Back sistem Android (tombol segitiga) menutup aplikasi & mematikan Mode Siaga
+  useEffect(() => {
+    if (!profile || isExited || typeof window === 'undefined') return;
+
+    const pushLockedHistory = () => {
+      try {
+        window.history.pushState({ appLocked: true }, '');
+      } catch {
+        // ignore history errors in restricted frames
+      }
+    };
+
+    const currentState = window.history.state as { appLocked?: boolean } | null;
+    if (!currentState?.appLocked) {
+      pushLockedHistory();
+    }
+
+    // Pastikan Chrome Android menandai entri history sebagai user-activated setelah sentuhan pertama
+    const reinforceOnFirstGesture = () => {
+      if (!isExitedRef.current) {
+        pushLockedHistory();
+      }
+    };
+    window.addEventListener('pointerdown', reinforceOnFirstGesture, { once: true, passive: true });
+
+    const handlePopState = () => {
+      if (isExitedRef.current) return;
+
+      const ui = backGuardStateRef.current;
+
+      // Tutup modal, dropdown, pencarian, atau ruang chat terlebih dahulu sebelum kembali ke daftar chat utama
+      if (ui.lightboxMedia) {
+        setLightboxMedia(null);
+      } else if (ui.cameraPurpose) {
+        setCameraPurpose(null);
+      } else if (ui.showResetConfirm) {
+        setShowResetConfirm(false);
+      } else if (ui.showMainMenu) {
+        setShowMainMenu(false);
+      } else if (ui.showProfileDrawer) {
+        setShowProfileDrawer(false);
+      } else if (ui.showShareAppModal) {
+        setShowShareAppModal(false);
+      } else if (ui.showNewChatModal) {
+        setShowNewChatModal(false);
+      } else if (ui.showNewGroupModal) {
+        setShowNewGroupModal(false);
+      } else if (ui.searchOpen) {
+        setSearchOpen(false);
+        setSearchQuery('');
+      } else if (ui.activeChatId) {
+        setActiveChatId(null);
+      } else if (ui.activeTab !== 'chats') {
+        setActiveTab('chats');
+      } else {
+        // Sudah di layar utama daftar chat: JANGAN keluar & JANGAN hentikan audio latar belakang Mode Siaga
+        showToast(
+          'Gunakan tombol Home (bulat) untuk tetap siaga di latar belakang, atau pilih menu ⋮ > Exit untuk keluar.',
+          4200
+        );
+      }
+
+      // Dorong kembali state riwayat agar tombol Back berikutnya juga tertahan di dalam aplikasi
+      pushLockedHistory();
+    };
+
+    window.addEventListener('popstate', handlePopState);
+    return () => {
+      window.removeEventListener('pointerdown', reinforceOnFirstGesture);
+      window.removeEventListener('popstate', handlePopState);
+    };
+  }, [profile?.id, isExited, showToast]);
 
   // Buka ruang chat targetId & tampilkan modal Panggilan Masuk (Angkat/Tolak) dari URL parameter atau postMessage SW
   const applyNotificationTarget = useCallback(
@@ -1806,10 +1928,10 @@ export default function App() {
         }
       }
 
-      // Bersihkan query parameter dari URL agar tidak terpicu ulang saat reload
+      // Bersihkan query parameter dari URL agar tidak terpicu ulang saat reload (tetap jaga appLocked)
       try {
         if (window.location.search || window.location.pathname !== '/') {
-          window.history.replaceState({}, '', '/');
+          window.history.replaceState({ appLocked: true }, '', '/');
         }
       } catch {
         // ignore
@@ -1886,10 +2008,10 @@ export default function App() {
     const invite = pendingInvite;
     setPendingInvite(null);
 
-    // Clean query string from URL bar without reloading
+    // Clean query string from URL bar without reloading (keep appLocked state)
     try {
       const cleanUrl = `${window.location.origin}${window.location.pathname}`;
-      window.history.replaceState({}, '', cleanUrl);
+      window.history.replaceState({ appLocked: true }, '', cleanUrl);
     } catch {
       // ignore
     }
@@ -2678,6 +2800,69 @@ export default function App() {
     setProfile(null);
   };
 
+  // Keluar aplikasi secara resmi (matikan Mode Siaga, hentikan audio latar belakang, bersihkan Media Session & putus koneksi)
+  const handleExitApp = useCallback(async () => {
+    setShowMainMenu(false);
+    setShowProfileDrawer(false);
+    setShowShareAppModal(false);
+    setShowNewChatModal(false);
+    setShowNewGroupModal(false);
+    setShowResetConfirm(false);
+    setCameraPurpose(null);
+    setLightboxMedia(null);
+    setSearchOpen(false);
+    setActiveChatId(null);
+
+    if (callRuntimeRef.current || pendingCallRef.current) {
+      finalizeCall('rejected');
+    }
+    stopRingtone();
+
+    standbyModeRef.current = false;
+    setStandbyMode(false);
+    await disableStandbyMode();
+
+    // Pastikan elemen audio penjaga & Media Session benar-benar berhenti
+    try {
+      const keepAliveEl = document.getElementById('keepalive-audio') as HTMLAudioElement | null;
+      if (keepAliveEl) {
+        keepAliveEl.pause();
+        keepAliveEl.currentTime = 0;
+      }
+      if ('mediaSession' in navigator) {
+        navigator.mediaSession.playbackState = 'none';
+        navigator.mediaSession.metadata = null;
+      }
+    } catch {
+      // ignore
+    }
+
+    isExitedRef.current = true;
+    peerManagerRef.current?.destroy();
+    peerManagerRef.current = null;
+    setPeerState('disconnected');
+    setOnlinePeers({});
+    setIsExited(true);
+
+    // Coba tutup jendela/tab aplikasi (didukung di PWA/window tertentu)
+    try {
+      window.close();
+    } catch {
+      // ignore
+    }
+  }, [finalizeCall]);
+
+  // Buka kembali aplikasi dari layar istirahat/offline
+  const handleReopenApp = useCallback(async () => {
+    isExitedRef.current = false;
+    standbyModeRef.current = true;
+    setStandbyMode(true);
+    setPeerState('connecting');
+    setIsExited(false);
+    await enableStandbyMode();
+    showToast('WattappsAU kembali aktif & siaga');
+  }, [showToast]);
+
   const activeContact = useMemo(
     () => contacts.find((c) => c.id === activeChatId) || null,
     [contacts, activeChatId]
@@ -2701,6 +2886,58 @@ export default function App() {
   // Show Welcome / Onboarding if no profile saved yet
   if (!profile) {
     return <OnboardingScreen onComplete={handleCompleteOnboarding} />;
+  }
+
+  // Layar Istirahat / Offline setelah pengguna memilih menu Exit
+  if (isExited) {
+    return (
+      <div className="h-dvh w-full flex flex-col items-center justify-center bg-[#0B141A] text-[#E9EDEF] px-6 text-center">
+        <div className="w-full max-w-sm rounded-3xl bg-[#111B21] border border-white/10 p-7 shadow-2xl flex flex-col items-center">
+          <div className="relative mb-5">
+            <AppLogo size={76} className="opacity-75 grayscale-[35%] ring-4 ring-white/10" />
+            <span className="absolute -bottom-1 -right-1 w-7 h-7 rounded-full bg-[#233138] border-2 border-[#111B21] flex items-center justify-center">
+              <Power className="w-3.5 h-3.5 text-orange-400" />
+            </span>
+          </div>
+
+          <span className="inline-flex items-center gap-1.5 px-3 py-1 rounded-full bg-orange-500/15 border border-orange-400/30 text-orange-300 text-[11px] font-semibold tracking-wide">
+            <span className="w-2 h-2 rounded-full bg-orange-400" />
+            Offline · Mode Siaga Nonaktif
+          </span>
+
+          <h1 className="mt-4 text-xl font-bold tracking-tight text-white">
+            WattappsAU Telah Berhenti
+          </h1>
+
+          <p className="mt-2.5 text-sm text-[#8696A0] leading-relaxed">
+            Layanan siaga latar belakang, audio penjaga, dan koneksi P2P telah dimatikan sepenuhnya. Aplikasi ini sekarang aman untuk ditutup.
+          </p>
+
+          <div className="mt-6 w-full flex flex-col gap-2.5">
+            <button
+              type="button"
+              onClick={() => void handleReopenApp()}
+              className="w-full h-11 rounded-xl bg-[#00A884] hover:bg-[#06CF9C] text-[#111B21] text-sm font-bold transition-colors cursor-pointer"
+            >
+              Buka Kembali WattappsAU
+            </button>
+            <button
+              type="button"
+              onClick={() => {
+                try {
+                  window.close();
+                } catch {
+                  // ignore
+                }
+              }}
+              className="w-full h-10 rounded-xl bg-white/5 hover:bg-white/10 text-[#AEBAC1] text-xs font-semibold transition-colors cursor-pointer"
+            >
+              Tutup Jendela / Swipe Keluar
+            </button>
+          </div>
+        </div>
+      </div>
+    );
   }
 
   return (
@@ -2949,6 +3186,17 @@ export default function App() {
                         >
                           <Trash2 className="w-4 h-4 shrink-0" />
                           <span>Reset Data</span>
+                        </button>
+
+                        <div className="my-1 border-t border-black/5 dark:border-white/10" />
+
+                        <button
+                          type="button"
+                          onClick={() => void handleExitApp()}
+                          className="w-full flex items-center gap-3 px-4 py-3 text-left text-sm font-semibold text-orange-600 dark:text-orange-400 hover:bg-orange-50/70 dark:hover:bg-orange-950/30 transition-colors cursor-pointer"
+                        >
+                          <LogOut className="w-4 h-4 shrink-0" />
+                          <span>Exit</span>
                         </button>
                       </div>
                     </>
@@ -3254,7 +3502,7 @@ export default function App() {
 
       {/* Subtle Toast Notification */}
       {toast && (
-        <div className="fixed bottom-6 left-1/2 -translate-x-1/2 z-[140] px-4 py-2.5 rounded-xl bg-[#111B21]/95 dark:bg-[#233138] text-white text-xs font-medium shadow-xl border border-white/10 whitespace-nowrap">
+        <div className="fixed bottom-6 left-1/2 -translate-x-1/2 z-[140] max-w-[calc(100vw-2rem)] sm:max-w-md px-4 py-2.5 rounded-xl bg-[#111B21]/95 dark:bg-[#233138] text-white text-xs font-medium text-center leading-relaxed shadow-xl border border-white/10">
           {toast}
         </div>
       )}

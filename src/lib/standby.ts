@@ -214,6 +214,7 @@ function registerStandbyMediaSession(state: 'playing' | 'paused' | 'none'): void
     if (state === 'none') {
       navigator.mediaSession.playbackState = 'none';
       try {
+        navigator.mediaSession.metadata = null;
         navigator.mediaSession.setActionHandler('play', null);
         navigator.mediaSession.setActionHandler('pause', null);
       } catch {
@@ -353,9 +354,17 @@ async function startSilentAudioKeepAlive(): Promise<boolean> {
 }
 
 function stopSilentAudioKeepAlive(playbackState: 'paused' | 'none' = 'none'): void {
-  if (keepAliveAudioEl) {
+  const audio =
+    keepAliveAudioEl ||
+    (typeof document !== 'undefined'
+      ? (document.getElementById('keepalive-audio') as HTMLAudioElement | null)
+      : null);
+  if (audio) {
     try {
-      keepAliveAudioEl.pause();
+      audio.pause();
+      if (playbackState === 'none') {
+        audio.currentTime = 0;
+      }
     } catch {
       // ignore
     }
