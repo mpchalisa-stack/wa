@@ -1,0 +1,274 @@
+rules_version = '2';
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // Global Safety Net: Default-deny catch-all
+    match /{document=**} {
+      allow read, write: if false;
+    }
+
+    // =========================================================================
+    // Hardened Global Primitives
+    // =========================================================================
+    function isSignedIn() {
+      return request.auth != null;
+    }
+
+    function isVerified() {
+      return isSignedIn() && request.auth.token.email_verified == true;
+    }
+
+    function isOwner(uid) {
+      return isSignedIn() && request.auth.uid == uid;
+    }
+
+    function incoming() {
+      return request.resource.data;
+    }
+
+    function existing() {
+      return resource.data;
+    }
+
+    function isValidId(id) {
+      return id is string && id.size() > 0 && id.size() <= 128 && id.matches('^[a-zA-Z0-9_\\-]+$');
+    }
+
+    function isValidPeerId(peerId) {
+      return peerId is string && peerId.size() == 6 && peerId.matches('^[0-9]{6}$');
+    }
+
+    // =========================================================================
+    // Validation Blueprints (Anti-Update-Gap)
+    // =========================================================================
+    function isValidDeviceToken(data) {
+      return data.keys().hasAll([
+          'userId',
+          'peerId',
+          'fcmToken',
+          'platform',
+          'standbyEnabled',
+          'createdAt',
+          'updatedAt'
+        ])
+        && data.keys().hasOnly([
+          'userId',
+          'peerId',
+          'fcmToken',
+          'platform',
+          'standbyEnabled',
+          'createdAt',
+          'updatedAt'
+        ])
+        && isValidId(data.userId)
+        && data.userId == request.auth.uid
+        && isValidPeerId(data.peerId)
+        && data.fcmToken is string
+        && data.fcmToken.size() <= 512
+        && data.platform is string
+        && data.platform.size() <= 16
+        && data.platform in ['android', 'ios', 'web']
+        && data.standbyEnabled is bool
+        && data.createdAt is timestamp
+        && data.updatedAt is timestamp;
+    }
+
+    function isValidPeerDirectoryEntry(data) {
+      return data.keys().hasAll([
+          'peerId',
+          'ownerUid',
+          'displayName',
+          'pushReady',
+          'createdAt',
+          'updatedAt'
+        ])
+        && data.keys().hasOnly([
+          'peerId',
+          'ownerUid',
+          'displayName',
+          'pushReady',
+          'createdAt',
+          'updatedAt'
+        ])
+        && isValidPeerId(data.peerId)
+        && isValidId(data.ownerUid)
+        && data.ownerUid == request.auth.uid
+        && data.displayName is string
+        && data.displayName.size() >= 1
+        && data.displayName.size() <= 80
+        && data.pushReady is bool
+        && data.createdAt is timestamp
+        && data.updatedAt is timestamp;
+    }
+
+    function isValidWakeSignal(data) {
+      return data.keys().hasAll([
+          'signalId',
+          'senderUid',
+          'senderPeerId',
+          'senderName',
+          'recipientUid',
+          'recipientPeerId',
+          'type',
+          'callType',
+          'callId',
+          'status',
+          'createdAt',
+          'updatedAt'
+        ])
+        && data.keys().hasOnly([
+          'signalId',
+          'senderUid',
+          'senderPeerId',
+          'senderName',
+          'recipientUid',
+          'recipientPeerId',
+          'type',
+          'callType',
+          'callId',
+          'status',
+          'createdAt',
+          'updatedAt'
+        ])
+        && isValidId(data.signalId)
+        && isValidId(data.senderUid)
+        && isValidPeerId(data.senderPeerId)
+        && data.senderName is string
+        && data.senderName.size() >= 1
+        && data.senderName.size() <= 80
+        && isValidId(data.recipientUid)
+        && isValidPeerId(data.recipientPeerId)
+        && data.type is string
+        && data.type.size() <= 32
+        && data.type in ['INCOMING_CALL', 'NEW_MSG', 'PING']
+        && data.callType is string
+        && data.callType.size() <= 16
+        && data.callType in ['audio', 'video', 'none']
+        && data.callId is string
+        && data.callId.size() <= 128
+        && data.status is string
+        && data.status.size() <= 24
+        && data.status in ['pending', 'acknowledged']
+        && data.createdAt is timestamp
+        && data.updatedAt is timestamp;
+    }
+
+    // =========================================================================
+    // Collection 1: /devices/{userId} — Private FCM Token & Standby Registry
+    // =========================================================================
+    match /devices/{userId} {
+      allow get: if isSignedIn() && isValidId(userId) && isOwner(userId);
+      allow list: if false;
+
+      allow create: if isVerified()
+        && isValidId(userId)
+        && isOwner(userId)
+        && isValidDeviceToken(incoming())
+        && incoming().userId == userId
+        && incoming().createdAt == request.time
+        && incoming().updatedAt == request.time;
+
+      allow update: if isVerified()
+        && isValidId(userId)
+        && isOwner(userId)
+        && isValidDeviceToken(incoming())
+        && incoming().userId == existing().userId
+        && incoming().createdAt == existing().createdAt
+        && incoming().updatedAt == request.time
+        && incoming().diff(existing()).affectedKeys().hasOnly([
+          'peerId',
+          'fcmToken',
+          'platform',
+          'standbyEnabled',
+          'updatedAt'
+        ]);
+
+      allow delete: if isVerified() && isValidId(userId) && isOwner(userId);
+    }
+
+    // =========================================================================
+    // Collection 2: /peerDirectory/{peerId} — Non-PII 6-Digit Peer Lookup
+    // =========================================================================
+    match /peerDirectory/{peerId} {
+      // Single-doc lookup by exact 6-digit ID only (no list scraping)
+      allow get: if isSignedIn() && isValidPeerId(peerId);
+      allow list: if false;
+
+      allow create: if isVerified()
+        && isValidPeerId(peerId)
+        && isValidPeerDirectoryEntry(incoming())
+        && incoming().peerId == peerId
+        && incoming().ownerUid == request.auth.uid
+        && incoming().createdAt == request.time
+        && incoming().updatedAt == request.time;
+
+      allow update: if isVerified()
+        && isValidPeerId(peerId)
+        && isValidPeerDirectoryEntry(incoming())
+        && existing().ownerUid == request.auth.uid
+        && incoming().peerId == existing().peerId
+        && incoming().ownerUid == existing().ownerUid
+        && incoming().createdAt == existing().createdAt
+        && incoming().updatedAt == request.time
+        && incoming().diff(existing()).affectedKeys().hasOnly([
+          'displayName',
+          'pushReady',
+          'updatedAt'
+        ]);
+
+      allow delete: if isVerified()
+        && isValidPeerId(peerId)
+        && existing().ownerUid == request.auth.uid;
+    }
+
+    // =========================================================================
+    // Collection 3: /wakeSignals/{signalId} — Realtime Wake & Push Signal Queue
+    // =========================================================================
+    match /wakeSignals/{signalId} {
+      allow get: if isSignedIn()
+        && isValidId(signalId)
+        && (existing().recipientUid == request.auth.uid || existing().senderUid == request.auth.uid);
+
+      // Secure list query: recipient can only list their own incoming wake signals
+      allow list: if isSignedIn()
+        && resource.data.recipientUid == request.auth.uid;
+
+      allow create: if isVerified()
+        && isValidId(signalId)
+        && isValidWakeSignal(incoming())
+        && incoming().signalId == signalId
+        && incoming().senderUid == request.auth.uid
+        && incoming().status == 'pending'
+        && incoming().createdAt == request.time
+        && incoming().updatedAt == request.time
+        && exists(/databases/$(database)/documents/peerDirectory/$(incoming().recipientPeerId))
+        && get(/databases/$(database)/documents/peerDirectory/$(incoming().recipientPeerId)).data.ownerUid == incoming().recipientUid;
+
+      // Action-Based Update + Terminal State Locking:
+      // Only recipient can acknowledge a pending signal; acknowledged is terminal.
+      allow update: if isVerified()
+        && isValidId(signalId)
+        && isValidWakeSignal(incoming())
+        && existing().recipientUid == request.auth.uid
+        && existing().status == 'pending'
+        && incoming().status == 'acknowledged'
+        && incoming().signalId == existing().signalId
+        && incoming().senderUid == existing().senderUid
+        && incoming().senderPeerId == existing().senderPeerId
+        && incoming().senderName == existing().senderName
+        && incoming().recipientUid == existing().recipientUid
+        && incoming().recipientPeerId == existing().recipientPeerId
+        && incoming().type == existing().type
+        && incoming().callType == existing().callType
+        && incoming().callId == existing().callId
+        && incoming().createdAt == existing().createdAt
+        && incoming().updatedAt == request.time
+        && incoming().diff(existing()).affectedKeys().hasOnly(['status', 'updatedAt']);
+
+      allow delete: if isVerified()
+        && isValidId(signalId)
+        && (existing().recipientUid == request.auth.uid || existing().senderUid == request.auth.uid);
+    }
+  }
+}

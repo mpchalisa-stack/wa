@@ -1,4 +1,10 @@
 import { triggerAlertVibration } from './audio';
+import {
+  cancelNativeCallNotifications,
+  isNativeCapacitor,
+  scheduleNativeLocalNotification,
+  setNativeKeepAwake,
+} from './nativeAndroid';
 
 /**
  * Generator Audio Sub-Audible (Bukan Zero-Byte Silence):
@@ -457,6 +463,7 @@ export async function enableStandbyMode(): Promise<{
     audioPlayPromise,
     requestScreenWakeLock(),
     requestNotificationPermission(),
+    setNativeKeepAwake(true),
   ]);
 
   return { wakeLockActive, audioKeepAliveActive, notificationPermission };
@@ -475,7 +482,7 @@ export async function disableStandbyMode(): Promise<void> {
     visibilityListenerAttached = false;
   }
   stopSilentAudioKeepAlive('none');
-  await releaseScreenWakeLock();
+  await Promise.all([releaseScreenWakeLock(), setNativeKeepAwake(false)]);
 }
 
 export interface NotificationClickData {
@@ -545,17 +552,6 @@ export function showIncomingWebNotification(options: {
   const isCall = Boolean(options.isCall || options.data?.kind === 'call');
   triggerAlertVibration(isCall ? [1000, 500, 1000, 500, 1000] : [250, 120, 250]);
 
-  if (typeof window === 'undefined' || !('Notification' in window)) return;
-  if (Notification.permission !== 'granted') return;
-
-  const shouldNotify =
-    isCall ||
-    isStandbyActive ||
-    document.visibilityState !== 'visible' ||
-    !document.hasFocus();
-
-  if (!shouldNotify) return;
-
   const senderId =
     options.data?.callerId || options.data?.chatId || options.data?.fromId || '';
   const callerName =
@@ -573,6 +569,33 @@ export function showIncomingWebNotification(options: {
       ? 'Panggilan video WattappsAU'
       : 'Panggilan suara WattappsAU'
     : options.body;
+
+  // Pada aplikasi Android Native (Capacitor APK), kirim melalui LocalNotifications berprioritas tinggi di layar kunci
+  if (isNativeCapacitor()) {
+    void scheduleNativeLocalNotification({
+      title: notifTitle,
+      body: notifBody,
+      isCall,
+      callerId: senderId,
+      callerName,
+      callId: options.data?.callId,
+      callType: isVideo ? 'video' : 'audio',
+      chatId: options.data?.chatId || senderId,
+    });
+    return;
+  }
+
+  if (typeof window === 'undefined' || !('Notification' in window)) return;
+  if (Notification.permission !== 'granted') return;
+
+  const shouldNotify =
+    isCall ||
+    isStandbyActive ||
+    document.visibilityState !== 'visible' ||
+    !document.hasFocus();
+
+  if (!shouldNotify) return;
+
   const notifIcon =
     options.icon?.trim() || options.data?.callerAvatar?.trim() || '/icon-512.png';
   const notifTag = isCall ? `wattapps-call-${senderId || 'active'}` : options.tag;
@@ -669,6 +692,9 @@ export function showIncomingWebNotification(options: {
 }
 
 export function dismissIncomingCallNotification(peerId?: string): void {
+  if (isNativeCapacitor()) {
+    void cancelNativeCallNotifications();
+  }
   if (typeof navigator === 'undefined' || !('serviceWorker' in navigator)) return;
   navigator.serviceWorker
     .getRegistration()

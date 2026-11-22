@@ -80,7 +80,29 @@ import {
   setStandbyExternalListener,
   showIncomingWebNotification,
 } from './lib/standby';
+import type { User as FirebaseAuthUser } from 'firebase/auth';
 import { sendNtfyWakeSignal, subscribeNtfySignal } from './lib/ntfy';
+import {
+  acknowledgeFirestoreWakeSignal,
+  sendFirestoreWakeSignal,
+  signInWithGoogleForCloudPush,
+  signOutCloudPush,
+  subscribeFirebaseAuth,
+  subscribeFirestoreWakeSignals,
+  syncDeviceTokenToFirestore,
+} from './lib/firebase';
+import {
+  NativeNotificationActionEvent,
+  exitNativeApp,
+  getDevicePlatform,
+  initNativePushNotifications,
+  isNativeCapacitor,
+  listenNativeLocalNotificationActions,
+  minimizeNativeApp,
+  registerNativeAppStateListener,
+  registerNativeBackButtonHandler,
+  setupNativeNotificationChannelsAndActions,
+} from './lib/nativeAndroid';
 import { estimateDataUrlBytes, formatSixDigitId, generateUid } from './lib/media';
 import { OnboardingScreen } from './components/OnboardingScreen';
 import { ChatList } from './components/ChatList';
@@ -217,6 +239,10 @@ export default function App() {
   const [activeCallUI, setActiveCallUI] = useState<ActiveCallUIState | null>(null);
   const [incomingCall, setIncomingCall] = useState<IncomingCallState | null>(null);
   const [incomingCallModalForceTick, setIncomingCallModalForceTick] = useState(0);
+
+  // Firebase Auth & Native Android FCM Token state (optional Cloud Push sync)
+  const [firebaseUser, setFirebaseUser] = useState<FirebaseAuthUser | null>(null);
+  const [nativeFcmToken, setNativeFcmToken] = useState<string>('');
 
   // Refs for fresh state inside PeerJS callbacks
   const peerManagerRef = useRef<WA6PeerManager | null>(null);
@@ -2171,12 +2197,18 @@ export default function App() {
       } else if (ui.activeTab !== 'chats') {
         setActiveTab('chats');
       } else {
-        // (c) Sudah di halaman utama daftar chat: JANGAN keluar & JANGAN hentikan audio latar belakang Mode Siaga
-        showToast(
-          'Tombol Back dikunci agar Mode Siaga tetap aktif. Tekan tombol Home (bulat) untuk ke layar utama HP, atau pilih menu ⋮ > Exit untuk keluar.',
-          4500,
-          'warning'
-        );
+        // (c) Sudah di halaman utama daftar chat:
+        // Pada Android Native (APK), kirim aplikasi ke latar belakang seperti WhatsApp agar Mode Siaga tetap hidup.
+        // Pada Web/Chrome, tahan halaman dan tampilkan peringatan.
+        if (isNativeCapacitor()) {
+          void minimizeNativeApp();
+        } else {
+          showToast(
+            'Tombol Back dikunci agar Mode Siaga tetap aktif. Tekan tombol Home (bulat) untuk ke layar utama HP, atau pilih menu ⋮ > Exit untuk keluar.',
+            4500,
+            'warning'
+          );
+        }
       }
     };
 
@@ -2184,12 +2216,270 @@ export default function App() {
     window.addEventListener('touchstart', trapBackButton, { passive: true });
     window.addEventListener('popstate', handlePopState);
 
+    let removeNativeBack: (() => void) | null = null;
+    if (isNativeCapacitor()) {
+      void registerNativeBackButtonHandler(() => {
+        if (isExitedRef.current) return;
+        const ui = backGuardStateRef.current;
+        if (ui.hasCallModal || callRuntimeRef.current || incomingCallRef.current || pendingCallRef.current) {
+          handleRejectCallRef.current();
+        } else if (ui.lightboxMedia) {
+          setLightboxMedia(null);
+        } else if (ui.cameraPurpose) {
+          setCameraPurpose(null);
+        } else if (ui.showResetConfirm) {
+          setShowResetConfirm(false);
+        } else if (ui.showMainMenu) {
+          setShowMainMenu(false);
+        } else if (ui.showProfileDrawer) {
+          setShowProfileDrawer(false);
+        } else if (ui.showShareAppModal) {
+          setShowShareAppModal(false);
+        } else if (ui.showNewChatModal) {
+          setShowNewChatModal(false);
+        } else if (ui.showNewGroupModal) {
+          setShowNewGroupModal(false);
+        } else if (ui.searchOpen) {
+          setSearchOpen(false);
+          setSearchQuery('');
+        } else if (ui.activeChatId) {
+          setActiveChatId(null);
+        } else if (ui.activeTab !== 'chats') {
+          setActiveTab('chats');
+        } else {
+          void minimizeNativeApp();
+        }
+      }).then((cleanup) => {
+        removeNativeBack = cleanup;
+      });
+    }
+
     return () => {
       window.removeEventListener('pointerdown', trapBackButton);
       window.removeEventListener('touchstart', trapBackButton);
       window.removeEventListener('popstate', handlePopState);
+      if (removeNativeBack) removeNativeBack();
     };
   }, [isExited, showToast, finalizeCall]);
+
+  // Inisialisasi Capacitor Android Native (Notification Channels, Local/FCM Push Action Listeners, App Resume)
+  useEffect(() => {
+    if (!isNativeCapacitor() || isExited) return;
+
+    let disposed = false;
+    const cleanups: Array<() => void> = [];
+
+    const handleNativeAction = (ev: NativeNotificationActionEvent) => {
+      if (ev.actionId === 'reject_call') {
+        handleRejectCallRef.current({
+          callerId: ev.callerId,
+          callerName: ev.callerName,
+          callId: ev.callId,
+          callType: ev.callType,
+        });
+        return;
+      }
+
+      if (ev.actionId === 'accept_call') {
+        forceShowIncomingCallModal({
+          callerId: ev.callerId,
+          callerName: ev.callerName,
+          callId: ev.callId,
+          callType: ev.callType,
+          isVideo: ev.isVideo,
+        });
+        void wakeAndSyncPeer();
+        void handleAcceptCallRef.current(true);
+        return;
+      }
+
+      if (ev.kind === 'call') {
+        forceShowIncomingCallModal({
+          callerId: ev.callerId,
+          callerName: ev.callerName,
+          callId: ev.callId,
+          callType: ev.callType,
+          isVideo: ev.isVideo,
+        });
+        void wakeAndSyncPeer();
+        return;
+      }
+
+      const targetChat = ev.chatId || ev.callerId;
+      if (targetChat) {
+        const cleanId = fromFullPeerId(targetChat);
+        setActiveTab('chats');
+        setActiveChatId(cleanId);
+        activeChatIdRef.current = cleanId;
+        void wakeAndSyncPeer();
+      }
+    };
+
+    void (async () => {
+      await setupNativeNotificationChannelsAndActions();
+      if (disposed) return;
+
+      const stopLocalActions = await listenNativeLocalNotificationActions(handleNativeAction);
+      if (disposed) {
+        stopLocalActions();
+      } else {
+        cleanups.push(stopLocalActions);
+      }
+
+      const stopPush = await initNativePushNotifications({
+        onToken: (token) => {
+          if (!disposed) setNativeFcmToken(token);
+        },
+        onPushReceived: (payload) => {
+          if (disposed) return;
+          if (payload.kind === 'call' && payload.callerId) {
+            pauseKeepAliveForCall();
+            startIncomingRingtone();
+            forceShowIncomingCallModal({
+              callerId: payload.callerId,
+              callerName: payload.callerName,
+              callId: payload.callId,
+              callType: payload.callType,
+              isVideo: payload.isVideo,
+            });
+          }
+          void wakeAndSyncPeer();
+        },
+        onPushAction: handleNativeAction,
+      });
+      if (disposed) {
+        stopPush();
+      } else {
+        cleanups.push(stopPush);
+      }
+
+      const stopAppState = await registerNativeAppStateListener((isActive) => {
+        if (isActive && !disposed) {
+          void wakeAndSyncPeer();
+          if (incomingCallRef.current && isIncomingCallStillActive(incomingCallRef.current)) {
+            forceShowIncomingCallModal();
+          }
+        }
+      });
+      if (disposed) {
+        stopAppState();
+      } else {
+        cleanups.push(stopAppState);
+      }
+    })();
+
+    return () => {
+      disposed = true;
+      cleanups.forEach((fn) => fn());
+    };
+  }, [isExited, wakeAndSyncPeer, forceShowIncomingCallModal, isIncomingCallStillActive]);
+
+  // Sinkronisasi opsional Firebase Auth & Cloud Firestore (FCM Token + Antrean Sinyal Bangun)
+  useEffect(() => {
+    const unsubscribe = subscribeFirebaseAuth((user) => {
+      setFirebaseUser(user);
+    });
+    return () => unsubscribe();
+  }, []);
+
+  useEffect(() => {
+    if (!firebaseUser || !firebaseUser.emailVerified || !profile?.id || isExited) return;
+    void syncDeviceTokenToFirestore({
+      peerId: profile.id,
+      displayName: profile.name,
+      fcmToken: nativeFcmToken,
+      platform: getDevicePlatform(),
+      standbyEnabled: standbyMode,
+    }).catch((err) => {
+      console.warn('[WattappsAU Firebase] Device token sync skipped:', err);
+    });
+  }, [firebaseUser, profile?.id, profile?.name, nativeFcmToken, standbyMode, isExited]);
+
+  useEffect(() => {
+    if (!firebaseUser || !profile?.id || isExited) return;
+
+    const unsubscribe = subscribeFirestoreWakeSignals((signal) => {
+      void acknowledgeFirestoreWakeSignal(signal.signalId).catch(() => {});
+
+      const cleanId = fromFullPeerId(signal.senderPeerId);
+      const existingContact = contactsRef.current.find((c) => c.id === cleanId);
+      const callerName = existingContact?.name?.trim() || signal.senderName || `ID: ${cleanId}`;
+      const callerAvatar = existingContact?.avatar || '';
+
+      if (signal.type === 'INCOMING_CALL') {
+        const callId = signal.callId || generateUid('call');
+        if (!callRuntimeRef.current && pendingCallRef.current?.callId !== callId) {
+          pauseKeepAliveForCall();
+          startIncomingRingtone();
+          const isVideo = signal.callType === 'video';
+          const pending: PendingIncomingCall = {
+            callId,
+            peerId: cleanId,
+            peerName: callerName,
+            peerAvatar: callerAvatar,
+            callType: isVideo ? 'video' : 'audio',
+            receivedAt: Date.now(),
+          };
+          pendingCallRef.current = pending;
+          presentPendingCallModal(pending);
+          showIncomingWebNotification({
+            title: callerName,
+            body: isVideo ? 'Panggilan video WattappsAU' : 'Panggilan suara WattappsAU',
+            icon: callerAvatar || '/icon-512.png',
+            tag: `wattapps-call-${cleanId}`,
+            isCall: true,
+            data: {
+              action: 'ANSWER_CALL',
+              kind: 'call',
+              callerId: cleanId,
+              callerName,
+              callerAvatar,
+              fromId: cleanId,
+              fromName: callerName,
+              callId,
+              callType: pending.callType,
+              isVideo,
+            },
+            onClick: () => {
+              forceShowIncomingCallModal({
+                callerId: cleanId,
+                callerName,
+                callId,
+                callType: pending.callType,
+                isVideo,
+              });
+            },
+          });
+        }
+        peerManagerRef.current?.ensureConnection(cleanId, true);
+      } else if (signal.type === 'NEW_MSG') {
+        const isViewing = activeChatIdRef.current === cleanId;
+        if (!isViewing || document.hidden || standbyModeRef.current) {
+          playMessagePop(true);
+          showIncomingWebNotification({
+            title: callerName,
+            body: 'Pesan baru masuk',
+            icon: callerAvatar || '/icon-512.png',
+            tag: `fs-msg-${signal.signalId}`,
+            data: {
+              kind: 'message',
+              chatId: cleanId,
+              fromId: cleanId,
+              fromName: callerName,
+              callerAvatar,
+            },
+            onClick: () => {
+              setActiveTab('chats');
+              setActiveChatId(cleanId);
+            },
+          });
+        }
+        peerManagerRef.current?.ensureConnection(cleanId, false);
+      }
+    });
+
+    return () => unsubscribe();
+  }, [firebaseUser, profile?.id, isExited, presentPendingCallModal, forceShowIncomingCallModal]);
 
   // Buka ruang chat targetId & tampilkan modal Panggilan Masuk (Angkat/Tolak) dari URL parameter atau postMessage SW
   const applyNotificationTarget = useCallback(
@@ -2635,13 +2925,19 @@ export default function App() {
             });
           }
         } else {
-          // Penerima Offline: simpan di outboxMessages & kirim sinyal bangun terenkripsi via ntfy.sh (tanpa polling loop)
+          // Penerima Offline: simpan di outboxMessages & kirim sinyal bangun terenkripsi via ntfy.sh + Firestore (jika aktif)
           void sendNtfyWakeSignal({
             targetId: recipientId,
             type: 'NEW_MSG',
             fromId: me.id,
             fromName: me.name,
           });
+          void sendFirestoreWakeSignal({
+            recipientPeerId: recipientId,
+            senderPeerId: me.id,
+            senderName: me.name,
+            type: 'NEW_MSG',
+          }).catch(() => {});
           manager.ensureConnection(recipientId, false);
         }
       });
@@ -2885,7 +3181,7 @@ export default function App() {
     // Hentikan otomatis Silent Audio Keep-Alive sebelum mengakses mikrofon/speaker panggilan
     pauseKeepAliveForCall();
 
-    // Kirim sinyal bangun prioritas via ntfy.sh (menjamin lawan bangun walau socket lama sedang tidur/zombie)
+    // Kirim sinyal bangun prioritas via ntfy.sh & Firestore (menjamin lawan bangun walau socket lama sedang tidur/zombie)
     void sendNtfyWakeSignal({
       targetId: peerId,
       type: 'INCOMING_CALL',
@@ -2894,6 +3190,14 @@ export default function App() {
       callType,
       callId,
     });
+    void sendFirestoreWakeSignal({
+      recipientPeerId: peerId,
+      senderPeerId: profile.id,
+      senderName: profile.name,
+      type: 'INCOMING_CALL',
+      callType,
+      callId,
+    }).catch(() => {});
 
     if (!manager.isPeerOnline(peerId)) {
       showToast(`Sinyal bangun panggilan dikirim ke ${peerName} via ntfy`);
@@ -3355,6 +3659,12 @@ export default function App() {
     setPeerState('disconnected');
     setOnlinePeers({});
     setIsExited(true);
+
+    // Pada aplikasi Android Native (Capacitor APK), tutup proses aplikasi secara bersih
+    if (isNativeCapacitor()) {
+      await exitNativeApp();
+      return;
+    }
 
     // Coba tutup jendela/tab aplikasi (didukung di PWA/window tertentu)
     try {
@@ -3905,6 +4215,26 @@ export default function App() {
       {showProfileDrawer && (
         <ProfileDrawer
           profile={profile}
+          firebaseUserEmail={firebaseUser?.email ?? null}
+          nativeFcmToken={nativeFcmToken}
+          onSignInFirebase={async () => {
+            try {
+              const user = await signInWithGoogleForCloudPush();
+              if (user) {
+                showToast(`Cloud Push Firestore aktif (${user.email})`);
+              }
+            } catch {
+              showToast('Login Google dibatalkan atau gagal.');
+            }
+          }}
+          onSignOutFirebase={async () => {
+            try {
+              await signOutCloudPush();
+              showToast('Koneksi Cloud Push Firestore diputus.');
+            } catch {
+              showToast('Gagal memutus koneksi Cloud Push.');
+            }
+          }}
           onUpdateProfile={handleUpdateProfile}
           onOpenShareApp={() => {
             setShowProfileDrawer(false);

@@ -1,15 +1,20 @@
 import React, { useRef, useState } from 'react';
-import { ArrowLeft, Bell, Camera, Check, Copy, Pencil, QrCode, Share2 } from 'lucide-react';
+import { ArrowLeft, Bell, Camera, Check, Cloud, Copy, LogOut, Pencil, QrCode, Share2, Smartphone } from 'lucide-react';
 import { QRCodeSVG } from 'qrcode.react';
 import { UserProfile } from '../types';
 import { PRESET_AVATARS, compressImageFile, formatSixDigitId } from '../lib/media';
 import { getNtfyTopic } from '../lib/ntfy';
 import { getNotificationPermissionState, requestNotificationPermission } from '../lib/standby';
+import { isNativeCapacitor } from '../lib/nativeAndroid';
 import { Avatar } from './Avatar';
 import { PWAInstallButton } from './PWAInstallButton';
 
 interface ProfileDrawerProps {
   profile: UserProfile;
+  firebaseUserEmail?: string | null;
+  nativeFcmToken?: string;
+  onSignInFirebase?: () => Promise<void>;
+  onSignOutFirebase?: () => Promise<void>;
   onUpdateProfile: (updated: UserProfile) => void;
   onOpenShareApp: () => void;
   onClose: () => void;
@@ -18,6 +23,10 @@ interface ProfileDrawerProps {
 
 export const ProfileDrawer: React.FC<ProfileDrawerProps> = ({
   profile,
+  firebaseUserEmail,
+  nativeFcmToken,
+  onSignInFirebase,
+  onSignOutFirebase,
   onUpdateProfile,
   onOpenShareApp,
   onClose,
@@ -344,6 +353,67 @@ export const ProfileDrawer: React.FC<ProfileDrawerProps> = ({
               <li>Tekan ikon <strong className="text-[#111B21] dark:text-[#E9EDEF]">+</strong> lalu tempel nama topik di atas dan aktifkan notifikasi prioritas tinggi.</li>
               <li>Sinyal dikirim terenkripsi AES-256-GCM saat perangkat Anda offline.</li>
             </ol>
+          </div>
+
+          {/* Firebase Cloud Push (FCM & Firestore Wake Queue) Section */}
+          <div className="mt-3 bg-white dark:bg-[#111B21] px-6 py-5 border-y border-black/5 dark:border-white/5 space-y-3">
+            <div className="flex items-center justify-between gap-2">
+              <div className="flex items-center gap-2">
+                <Cloud className="w-4 h-4 text-[#008069] dark:text-[#00A884] shrink-0" />
+                <span className="text-xs font-semibold text-[#008069] dark:text-[#00A884]">
+                  Sinkronisasi Push Android &amp; Firestore (FCM)
+                </span>
+              </div>
+              <span className="text-[11px] font-semibold text-[#54656F] dark:text-[#8696A0] inline-flex items-center gap-1">
+                <Smartphone className="w-3 h-3" />
+                {isNativeCapacitor() ? 'Android APK' : 'Web PWA'}
+              </span>
+            </div>
+
+            <p className="text-xs text-[#54656F] dark:text-[#8696A0] leading-relaxed">
+              Hubungkan akun Google (opsional) untuk menyimpan token FCM perangkat ini dan menerima sinyal bangun panggilan/pesan secara instan melalui Cloud Firestore.
+            </p>
+
+            {firebaseUserEmail ? (
+              <div className="rounded-xl bg-[#F0F2F5] dark:bg-[#202C33] p-3 border border-[#00A884]/30 space-y-2">
+                <div className="flex items-center justify-between gap-2">
+                  <div className="min-w-0">
+                    <div className="text-xs font-semibold text-[#008069] dark:text-[#06CF9C]">
+                      Terhubung ke Cloud Push
+                    </div>
+                    <div className="text-xs text-[#111B21] dark:text-[#E9EDEF] truncate">
+                      {firebaseUserEmail}
+                    </div>
+                  </div>
+                  {onSignOutFirebase && (
+                    <button
+                      type="button"
+                      onClick={() => void onSignOutFirebase()}
+                      className="h-8 px-3 rounded-lg bg-rose-500/10 hover:bg-rose-500/20 text-rose-600 dark:text-rose-400 text-xs font-semibold inline-flex items-center gap-1.5 shrink-0 cursor-pointer"
+                    >
+                      <LogOut className="w-3.5 h-3.5" />
+                      <span>Putus</span>
+                    </button>
+                  )}
+                </div>
+                {nativeFcmToken && (
+                  <div className="text-[11px] font-mono text-[#54656F] dark:text-[#8696A0] truncate">
+                    Token FCM: {nativeFcmToken.slice(0, 28)}...
+                  </div>
+                )}
+              </div>
+            ) : (
+              onSignInFirebase && (
+                <button
+                  type="button"
+                  onClick={() => void onSignInFirebase()}
+                  className="w-full h-10 rounded-xl bg-[#008069] hover:bg-[#017561] dark:bg-[#00A884] dark:hover:bg-[#06CF9C] text-white dark:text-[#111B21] text-xs font-semibold flex items-center justify-center gap-2 transition-colors cursor-pointer"
+                >
+                  <Cloud className="w-4 h-4" />
+                  <span>Aktifkan Push Cloud (Login Google)</span>
+                </button>
+              )
+            )}
           </div>
 
           {/* Share App & PWA Install Section */}
