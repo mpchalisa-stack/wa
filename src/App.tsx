@@ -142,6 +142,8 @@ interface AwaitingMediaCallAnswer {
 const PENDING_CALL_TTL_MS = 45000;
 const APP_WAKE_SYNC_COOLDOWN_MS = 3000;
 
+let isHistoryTrapped = false;
+
 export default function App() {
   const [profile, setProfile] = useState<UserProfile | null>(() => getSavedProfile());
   const [theme, setTheme] = useState<ThemeMode>(() => getSavedTheme());
@@ -202,6 +204,7 @@ export default function App() {
   const [cameraPurpose, setCameraPurpose] = useState<'chat' | 'status' | null>(null);
   const [lightboxMedia, setLightboxMedia] = useState<LightboxMedia | null>(null);
   const [toast, setToast] = useState<string | null>(null);
+  const [toastTone, setToastTone] = useState<'default' | 'warning'>('default');
 
   // PeerJS real-time state
   const [peerState, setPeerState] = useState<PeerConnectionState>('connecting');
@@ -248,6 +251,7 @@ export default function App() {
     showResetConfirm,
     cameraPurpose,
     lightboxMedia,
+    hasCallModal: Boolean(activeCallUI || incomingCall),
   });
 
   useEffect(() => {
@@ -284,6 +288,7 @@ export default function App() {
       showResetConfirm,
       cameraPurpose,
       lightboxMedia,
+      hasCallModal: Boolean(activeCallUI || incomingCall),
     };
   }, [
     activeTab,
@@ -297,6 +302,8 @@ export default function App() {
     showResetConfirm,
     cameraPurpose,
     lightboxMedia,
+    activeCallUI,
+    incomingCall,
   ]);
 
   // Sync Tailwind dark class & browser theme-color
@@ -325,15 +332,19 @@ export default function App() {
     return initGlobalAudioUnlock();
   }, []);
 
-  const showToast = useCallback((message: string, durationMs = 2800) => {
-    setToast(message);
-    if (toastTimerRef.current !== null) {
-      window.clearTimeout(toastTimerRef.current);
-    }
-    toastTimerRef.current = window.setTimeout(() => {
-      setToast(null);
-    }, durationMs);
-  }, []);
+  const showToast = useCallback(
+    (message: string, durationMs = 2800, tone: 'default' | 'warning' = 'default') => {
+      setToastTone(tone);
+      setToast(message);
+      if (toastTimerRef.current !== null) {
+        window.clearTimeout(toastTimerRef.current);
+      }
+      toastTimerRef.current = window.setTimeout(() => {
+        setToast(null);
+      }, durationMs);
+    },
+    []
+  );
 
   // Load IndexedDB data on startup
   useEffect(() => {
@@ -2006,7 +2017,7 @@ export default function App() {
             callType: callTypeParam === 'video' ? 'video' : 'audio',
             isVideo: callTypeParam === 'video',
           });
-          window.history.replaceState({ appLocked: true }, '', '/');
+          window.history.replaceState({ wattappsGuard: true }, '', '/');
           return;
         }
       } catch {
@@ -2046,37 +2057,60 @@ export default function App() {
   ]);
 
   // Cegah tombol Back sistem Android (tombol segitiga) menutup aplikasi & mematikan Mode Siaga
+  // Suntikkan 2x history.pushState setelah sentuhan pengguna pertama (User Activation) agar tidak diabaikan Chrome Android
   useEffect(() => {
-    if (!profile || isExited || typeof window === 'undefined') return;
+    if (isExited || typeof window === 'undefined') return;
 
-    const pushLockedHistory = () => {
-      try {
-        window.history.pushState({ appLocked: true }, '');
-      } catch {
-        // ignore history errors in restricted frames
+    const trapBackButton = () => {
+      if (isExitedRef.current) return;
+      if (!isHistoryTrapped) {
+        try {
+          window.history.pushState({ wattappsGuard: true }, '', window.location.href);
+          window.history.pushState({ wattappsGuard: true }, '', window.location.href);
+          isHistoryTrapped = true;
+        } catch {
+          // ignore history errors in restricted frames
+        }
       }
     };
-
-    const currentState = window.history.state as { appLocked?: boolean } | null;
-    if (!currentState?.appLocked) {
-      pushLockedHistory();
-    }
-
-    // Pastikan Chrome Android menandai entri history sebagai user-activated setelah sentuhan pertama
-    const reinforceOnFirstGesture = () => {
-      if (!isExitedRef.current) {
-        pushLockedHistory();
-      }
-    };
-    window.addEventListener('pointerdown', reinforceOnFirstGesture, { once: true, passive: true });
 
     const handlePopState = () => {
-      if (isExitedRef.current) return;
+      if (isExitedRef.current || !isHistoryTrapped) return;
+
+      // (a) Segera dorong kembali state baru agar jebakan riwayat tidak pernah habis
+      try {
+        window.history.pushState({ wattappsGuard: true }, '', window.location.href);
+      } catch {
+        // ignore
+      }
 
       const ui = backGuardStateRef.current;
 
-      // Tutup modal, dropdown, pencarian, atau ruang chat terlebih dahulu sebelum kembali ke daftar chat utama
-      if (ui.lightboxMedia) {
+      // (b) Jika sedang membuka modal panggilan, lightbox, kamera, menu dropdown, modal profil, pencarian, atau ruang chat aktif, tutup tampilan tersebut
+      if (ui.hasCallModal || callRuntimeRef.current || incomingCallRef.current || pendingCallRef.current) {
+        const rt = callRuntimeRef.current;
+        const pending = pendingCallRef.current;
+        const ic = incomingCallRef.current;
+        const me = profileRef.current;
+        const isIncomingPhase = Boolean((rt && !rt.connectedAt && rt.direction === 'incoming') || pending || ic);
+        const targetPeerId = rt?.peerId || pending?.peerId || ic?.callerId;
+        const targetCallId = rt?.callId || pending?.callId || ic?.callId;
+        const targetCallType: CallType =
+          rt?.callType || pending?.callType || (ic?.isVideo ? 'video' : 'audio');
+
+        if (targetPeerId && targetCallId && me) {
+          peerManagerRef.current?.sendPacket(targetPeerId, {
+            kind: 'CALL_SIGNAL',
+            action: isIncomingPhase ? 'reject' : 'end',
+            callId: targetCallId,
+            callType: targetCallType,
+            fromId: me.id,
+            fromName: me.name,
+            fromAvatar: me.avatar,
+          });
+        }
+        finalizeCall(isIncomingPhase ? 'rejected' : undefined);
+      } else if (ui.lightboxMedia) {
         setLightboxMedia(null);
       } else if (ui.cameraPurpose) {
         setCameraPurpose(null);
@@ -2100,23 +2134,25 @@ export default function App() {
       } else if (ui.activeTab !== 'chats') {
         setActiveTab('chats');
       } else {
-        // Sudah di layar utama daftar chat: JANGAN keluar & JANGAN hentikan audio latar belakang Mode Siaga
+        // (c) Sudah di halaman utama daftar chat: JANGAN keluar & JANGAN hentikan audio latar belakang Mode Siaga
         showToast(
-          'Gunakan tombol Home (bulat) untuk tetap siaga di latar belakang, atau pilih menu ⋮ > Exit untuk keluar.',
-          4200
+          'Tombol Back dikunci agar Mode Siaga tetap aktif. Tekan tombol Home (bulat) untuk ke layar utama HP, atau pilih menu ⋮ > Exit untuk keluar.',
+          4500,
+          'warning'
         );
       }
-
-      // Dorong kembali state riwayat agar tombol Back berikutnya juga tertahan di dalam aplikasi
-      pushLockedHistory();
     };
 
+    window.addEventListener('pointerdown', trapBackButton, { passive: true });
+    window.addEventListener('touchstart', trapBackButton, { passive: true });
     window.addEventListener('popstate', handlePopState);
+
     return () => {
-      window.removeEventListener('pointerdown', reinforceOnFirstGesture);
+      window.removeEventListener('pointerdown', trapBackButton);
+      window.removeEventListener('touchstart', trapBackButton);
       window.removeEventListener('popstate', handlePopState);
     };
-  }, [profile?.id, isExited, showToast]);
+  }, [isExited, showToast, finalizeCall]);
 
   // Buka ruang chat targetId & tampilkan modal Panggilan Masuk (Angkat/Tolak) dari URL parameter atau postMessage SW
   const applyNotificationTarget = useCallback(
@@ -2191,10 +2227,10 @@ export default function App() {
         activeChatIdRef.current = cleanId;
       }
 
-      // Bersihkan query parameter dari URL agar tidak terpicu ulang saat reload (tetap jaga appLocked)
+      // Bersihkan query parameter dari URL agar tidak terpicu ulang saat reload (tetap jaga wattappsGuard)
       try {
         if (window.location.search || window.location.pathname !== '/') {
-          window.history.replaceState({ appLocked: true }, '', '/');
+          window.history.replaceState({ wattappsGuard: true }, '', '/');
         }
       } catch {
         // ignore
@@ -2298,10 +2334,10 @@ export default function App() {
     const invite = pendingInvite;
     setPendingInvite(null);
 
-    // Clean query string from URL bar without reloading (keep appLocked state)
+    // Clean query string from URL bar without reloading (keep wattappsGuard state)
     try {
       const cleanUrl = `${window.location.origin}${window.location.pathname}`;
-      window.history.replaceState({ appLocked: true }, '', cleanUrl);
+      window.history.replaceState({ wattappsGuard: true }, '', cleanUrl);
     } catch {
       // ignore
     }
@@ -3129,6 +3165,7 @@ export default function App() {
       // ignore
     }
 
+    isHistoryTrapped = false;
     isExitedRef.current = true;
     peerManagerRef.current?.destroy();
     peerManagerRef.current = null;
@@ -3146,6 +3183,7 @@ export default function App() {
 
   // Buka kembali aplikasi dari layar istirahat/offline
   const handleReopenApp = useCallback(async () => {
+    isHistoryTrapped = false;
     isExitedRef.current = false;
     standbyModeRef.current = true;
     setStandbyMode(true);
@@ -3808,9 +3846,15 @@ export default function App() {
         </div>
       )}
 
-      {/* Subtle Toast Notification */}
+      {/* Subtle / Warning Toast Notification */}
       {toast && (
-        <div className="fixed bottom-6 left-1/2 -translate-x-1/2 z-[140] max-w-[calc(100vw-2rem)] sm:max-w-md px-4 py-2.5 rounded-xl bg-[#111B21]/95 dark:bg-[#233138] text-white text-xs font-medium text-center leading-relaxed shadow-xl border border-white/10">
+        <div
+          className={`fixed bottom-6 left-1/2 -translate-x-1/2 z-[160] max-w-[calc(100vw-2rem)] sm:max-w-md px-4 py-2.5 rounded-xl text-xs font-medium text-center leading-relaxed shadow-xl border ${
+            toastTone === 'warning'
+              ? 'bg-[#0F2430]/95 text-amber-200 border-cyan-400/65 ring-1 ring-amber-400/35 shadow-[0_8px_28px_rgba(34,211,238,0.28)]'
+              : 'bg-[#111B21]/95 dark:bg-[#233138] text-white border-white/10'
+          }`}
+        >
           {toast}
         </div>
       )}
