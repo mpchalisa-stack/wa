@@ -316,7 +316,7 @@ export const ProfileDrawer: React.FC<ProfileDrawerProps> = ({
                   onClick={() => void handleEnableBrowserNotifications()}
                   className="text-[11px] font-semibold text-[#008069] dark:text-[#00A884] underline cursor-pointer"
                 >
-                  Izinkan Notifikasi
+                  Aktifkan Notifikasi
                 </button>
               ) : null}
             </div>
