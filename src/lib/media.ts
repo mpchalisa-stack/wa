@@ -261,7 +261,7 @@ export function compressImageFile(
 export function triggerDownload(dataUrl: string, fileName: string): void {
   const link = document.createElement('a');
   link.href = dataUrl;
-  link.download = fileName || 'file-wa6';
+  link.download = fileName || 'file-wattappsau';
   document.body.appendChild(link);
   link.click();
   document.body.removeChild(link);

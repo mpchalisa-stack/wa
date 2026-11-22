@@ -13,6 +13,7 @@ import { QRCodeSVG } from 'qrcode.react';
 import { UserProfile } from '../types';
 import { downloadSvgAsPng, encodeCode128B } from '../lib/barcode';
 import { formatSixDigitId } from '../lib/media';
+import { AppLogo } from './AppLogo';
 
 interface ShareAppModalProps {
   profile: UserProfile;
@@ -36,7 +37,7 @@ export const ShareAppModal: React.FC<ShareAppModalProps> = ({
     const base =
       typeof window !== 'undefined'
         ? `${window.location.origin}${window.location.pathname}`
-        : 'https://wa6.app/';
+        : 'https://wattappsau.app/';
     if (!includeMyId) return base;
     const params = new URLSearchParams({
       add: profile.id,
@@ -47,7 +48,7 @@ export const ShareAppModal: React.FC<ShareAppModalProps> = ({
 
   // Code 128B payload: concise & universally scannable by 1D barcode scanners
   const barcodeValue = useMemo(
-    () => (includeMyId ? `WA6-${profile.id}` : 'WA6-APP'),
+    () => (includeMyId ? `WattappsAU-${profile.id}` : 'WattappsAU'),
     [includeMyId, profile.id]
   );
 
@@ -66,13 +67,13 @@ export const ShareAppModal: React.FC<ShareAppModalProps> = ({
 
   const handleNativeShare = async () => {
     const shareText = includeMyId
-      ? `Yuk ngobrol & telepon gratis di WA6 tanpa nomor HP! Klik tautan ini untuk langsung terhubung dengan saya (${profile.name} · ID ${formatSixDigitId(profile.id)}):`
-      : 'Yuk coba WA6 — aplikasi chat & panggilan P2P mirip WhatsApp tanpa nomor HP dan tanpa database!';
+      ? `Yuk ngobrol & telepon gratis di WattappsAU tanpa nomor HP! Klik tautan ini untuk langsung terhubung dengan saya (${profile.name} · ID ${formatSixDigitId(profile.id)}):`
+      : 'Yuk coba WattappsAU — aplikasi chat & panggilan P2P tanpa nomor HP dan tanpa database!';
 
     if (typeof navigator !== 'undefined' && navigator.share) {
       try {
         await navigator.share({
-          title: 'WA6 — Pesan & Panggilan P2P',
+          title: 'WattappsAU — Pesan & Panggilan P2P',
           text: shareText,
           url: shareUrl,
         });
@@ -99,16 +100,16 @@ export const ShareAppModal: React.FC<ShareAppModalProps> = ({
       const svg = qrWrapperRef.current?.querySelector('svg') as SVGSVGElement | null;
       const ok = await downloadSvgAsPng(
         svg,
-        `WA6-QR-${includeMyId ? profile.id : 'App'}.png`,
-        includeMyId ? `WA6 · ${profile.name}` : 'Bagikan Aplikasi WA6',
+        `WattappsAU-QR-${includeMyId ? profile.id : 'App'}.png`,
+        includeMyId ? `WattappsAU · ${profile.name}` : 'Bagikan Aplikasi WattappsAU',
         includeMyId ? `ID: ${formatSixDigitId(profile.id)}` : shareUrl.replace(/^https?:\/\//, '')
       );
       onToast(ok ? 'Gambar QR Code berhasil diunduh' : 'Gagal mengunduh QR Code');
     } else {
       const ok = await downloadSvgAsPng(
         barcodeSvgRef.current,
-        `WA6-Barcode-${barcodeValue}.png`,
-        includeMyId ? `WA6 · ${profile.name}` : 'WA6 Messenger',
+        `WattappsAU-Barcode-${barcodeValue}.png`,
+        includeMyId ? `WattappsAU · ${profile.name}` : 'WattappsAU',
         barcodeValue
       );
       onToast(ok ? 'Gambar Barcode berhasil diunduh' : 'Gagal mengunduh Barcode');
@@ -145,10 +146,10 @@ export const ShareAppModal: React.FC<ShareAppModalProps> = ({
       >
         {/* Header */}
         <div className="bg-[#008069] dark:bg-[#1F2C34] text-white px-5 py-4 flex items-center justify-between shrink-0">
-          <div className="flex items-center gap-2.5">
-            <Share2 className="w-5 h-5" />
+          <div className="flex items-center gap-3">
+            <AppLogo size={38} className="shadow-sm ring-1 ring-white/25" />
             <div>
-              <h2 className="text-base font-semibold leading-tight">Bagikan Aplikasi</h2>
+              <h2 className="text-base font-semibold leading-tight">Bagikan WattappsAU</h2>
               <p className="text-xs text-white/75">Undang teman via Barcode, QR, atau Tautan</p>
             </div>
           </div>
@@ -194,6 +195,13 @@ export const ShareAppModal: React.FC<ShareAppModalProps> = ({
 
           {/* Code Display Card */}
           <div className="rounded-2xl bg-[#F7F8FA] dark:bg-[#111B21] border border-black/5 dark:border-white/5 p-5 flex flex-col items-center">
+            <div className="flex items-center gap-2 mb-3.5">
+              <AppLogo size={26} />
+              <span className="text-xs font-bold tracking-tight text-[#111B21] dark:text-[#E9EDEF]">
+                WattappsAU · Diskomlekau
+              </span>
+            </div>
+
             {codeTab === 'qr' ? (
               <>
                 <div
@@ -210,8 +218,8 @@ export const ShareAppModal: React.FC<ShareAppModalProps> = ({
                 </div>
                 <p className="mt-3 text-xs text-center text-[#54656F] dark:text-[#8696A0] max-w-xs leading-relaxed">
                   {includeMyId
-                    ? `Pindai QR ini dengan kamera HP atau WA6 untuk membuka aplikasi dan langsung terhubung ke ID ${formatSixDigitId(profile.id)}.`
-                    : 'Pindai QR ini dengan kamera HP untuk langsung membuka halaman aplikasi WA6.'}
+                    ? `Pindai QR ini dengan kamera HP atau WattappsAU untuk membuka aplikasi dan langsung terhubung ke ID ${formatSixDigitId(profile.id)}.`
+                    : 'Pindai QR ini dengan kamera HP untuk langsung membuka halaman aplikasi WattappsAU.'}
                 </p>
               </>
             ) : (
@@ -242,7 +250,7 @@ export const ShareAppModal: React.FC<ShareAppModalProps> = ({
                   </div>
                 </div>
                 <p className="mt-3 text-xs text-center text-[#54656F] dark:text-[#8696A0] max-w-xs leading-relaxed">
-                  Barcode standar Code 128 yang mudah dipindai atau disimpan sebagai kartu undangan ID WA6 Anda.
+                  Barcode standar Code 128 yang mudah dipindai atau disimpan sebagai kartu undangan ID WattappsAU Anda.
                 </p>
               </>
             )}

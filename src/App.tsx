@@ -72,6 +72,7 @@ import { CallOverlay, ActiveCallUIState } from './components/CallOverlay';
 import { MediaLightbox, LightboxMedia } from './components/MediaLightbox';
 import { OfflineIndicator, PWAInstallButton } from './components/PWAInstallButton';
 import { ShareAppModal } from './components/ShareAppModal';
+import { AppLogo } from './components/AppLogo';
 
 interface ActiveCallRuntime {
   callId: string;
@@ -340,7 +341,7 @@ export default function App() {
               upsertContact({
                 id: packet.groupMeta.id,
                 name: packet.groupMeta.name,
-                bio: 'Grup P2P WA6',
+                bio: 'Grup P2P WattappsAU',
                 avatar: packet.groupMeta.avatar,
                 addedAt: Date.now(),
                 isGroup: true,
@@ -647,7 +648,7 @@ export default function App() {
           upsertContact({
             id: meta.groupMeta.id,
             name: meta.groupMeta.name,
-            bio: 'Grup P2P WA6',
+            bio: 'Grup P2P WattappsAU',
             avatar: meta.groupMeta.avatar,
             addedAt: Date.now(),
             isGroup: true,
@@ -1604,13 +1605,14 @@ export default function App() {
           ) : (
             <div className="h-[58px] px-4 flex items-center justify-between gap-2">
               {/* Brand & PeerJS Live Status Indicator */}
-              <div className="flex items-center gap-2.5 min-w-0">
+              <div className="flex items-center gap-2 min-w-0">
                 <button
                   type="button"
                   onClick={() => setShowProfileDrawer(true)}
-                  className="text-xl font-bold tracking-tight whitespace-nowrap hover:opacity-90 cursor-pointer"
+                  className="inline-flex items-center gap-2 text-lg font-bold tracking-tight whitespace-nowrap hover:opacity-90 cursor-pointer shrink-0"
                 >
-                  WA6
+                  <AppLogo size={32} className="shadow-xs ring-1 ring-white/25" />
+                  <span>WattappsAU</span>
                 </button>
                 <button
                   type="button"
@@ -1885,13 +1887,11 @@ export default function App() {
           />
         ) : (
           <div className="flex-1 flex flex-col items-center justify-center bg-[#F0F2F5] dark:bg-[#222E35] border-b-[6px] border-[#25D366] dark:border-[#00A884] px-8 text-center">
-            <div className="w-20 h-20 rounded-full bg-[#008069]/12 dark:bg-[#00A884]/15 flex items-center justify-center mb-6">
-              <span className="font-mono-id text-3xl font-bold text-[#008069] dark:text-[#00A884]">
-                6
-              </span>
+            <div className="mb-5">
+              <AppLogo size={96} className="shadow-lg ring-4 ring-white/80 dark:ring-white/10" />
             </div>
             <h1 className="text-2xl font-light text-[#41525D] dark:text-[#E9EDEF]">
-              WA6 Web &amp; PWA
+              WattappsAU Web &amp; PWA
             </h1>
             <p className="mt-2.5 text-sm text-[#667781] dark:text-[#8696A0] max-w-md leading-relaxed">
               Kirim pesan, Voice Note, dokumen, Status 24 jam, dan panggilan suara atau video secara langsung Peer-to-Peer tanpa nomor telepon maupun database eksternal.

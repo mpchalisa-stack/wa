@@ -1,13 +1,9 @@
-const CACHE_NAME = 'wa6-pwa-cache-v1';
+const CACHE_NAME = 'wattappsau-pwa-cache-v2';
 const CORE_ASSETS = [
   '/',
   '/index.html',
   '/manifest.json',
-  '/icon.svg',
-  '/pwa-192x192.png',
-  '/pwa-512x512.png',
-  '/pwa-maskable-512x512.png',
-  '/apple-touch-icon.png'
+  '/icon-512.png'
 ];
 
 self.addEventListener('install', (event) => {

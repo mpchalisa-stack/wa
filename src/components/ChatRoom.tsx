@@ -773,7 +773,7 @@ export const ChatRoom: React.FC<ChatRoomProps> = ({
                     </div>
                     <button
                       type="button"
-                      onClick={() => triggerDownload(msg.mediaData!, msg.fileName || 'dokumen-wa6')}
+                      onClick={() => triggerDownload(msg.mediaData!, msg.fileName || 'dokumen-wattappsau')}
                       className="w-9 h-9 rounded-full bg-white/80 dark:bg-white/10 hover:bg-white dark:hover:bg-white/20 text-[#008069] dark:text-[#00A884] flex items-center justify-center shrink-0 transition-colors cursor-pointer"
                       title="Unduh Dokumen"
                     >

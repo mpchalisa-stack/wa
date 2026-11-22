@@ -108,8 +108,8 @@ export const CallOverlay: React.FC<CallOverlayProps> = ({
         <div className="text-xs font-medium text-[#25D366] tracking-wide mb-1">
           {call.phase === 'incoming'
             ? isVideo
-              ? 'Panggilan Video WA6 Masuk'
-              : 'Panggilan Suara WA6 Masuk'
+              ? 'Panggilan Video WattappsAU Masuk'
+              : 'Panggilan Suara WattappsAU Masuk'
             : call.phase === 'outgoing'
             ? 'Memanggil...'
             : isVideo

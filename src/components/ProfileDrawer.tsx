@@ -180,7 +180,7 @@ export const ProfileDrawer: React.FC<ProfileDrawerProps> = ({
                 />
               </div>
               <p className="mt-3 text-xs text-center text-[#54656F] dark:text-[#8696A0]">
-                Pindai kode QR ini dari aplikasi WA6 teman untuk langsung terhubung tanpa mengetik.
+                Pindai kode QR ini dari aplikasi WattappsAU teman untuk langsung terhubung tanpa mengetik.
               </p>
             </div>
           </div>

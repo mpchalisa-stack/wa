@@ -8,6 +8,7 @@ import {
   generateSixDigitId,
 } from '../lib/media';
 import { Avatar } from './Avatar';
+import { AppLogo } from './AppLogo';
 
 interface OnboardingScreenProps {
   onComplete: (profile: UserProfile) => void;
@@ -53,12 +54,10 @@ export const OnboardingScreen: React.FC<OnboardingScreenProps> = ({ onComplete }
       {/* Classic WhatsApp Top Teal Banner */}
       <div className="h-44 sm:h-52 w-full bg-[#008069] dark:bg-[#1F2C34] shrink-0 relative flex items-start justify-center pt-8 px-4">
         <div className="w-full max-w-md flex items-center gap-3 text-white">
-          <div className="w-10 h-10 rounded-full bg-[#25D366] flex items-center justify-center shadow-sm">
-            <span className="font-mono-id font-bold text-lg text-[#004D40]">6</span>
-          </div>
+          <AppLogo size={44} className="shadow-md ring-2 ring-white/25" />
           <div>
-            <h1 className="text-lg font-bold tracking-tight leading-tight">WA6 Messenger</h1>
-            <p className="text-xs text-white/80">Komunikasi P2P Langsung · Tanpa Nomor Telepon</p>
+            <h1 className="text-lg font-bold tracking-tight leading-tight">WattappsAU</h1>
+            <p className="text-xs text-white/80">Komunikasi P2P Diskomlekau · Tanpa Nomor Telepon</p>
           </div>
         </div>
       </div>
@@ -102,7 +101,7 @@ export const OnboardingScreen: React.FC<OnboardingScreenProps> = ({ onComplete }
           {/* Avatar Picker & Photo Upload */}
           <div className="flex flex-col items-center mb-6">
             <div className="relative group">
-              <Avatar src={avatar} name={name || 'WA6'} size="2xl" />
+              <Avatar src={avatar} name={name || 'WattappsAU'} size="2xl" />
               <button
                 type="button"
                 onClick={() => fileInputRef.current?.click()}
@@ -194,7 +193,7 @@ export const OnboardingScreen: React.FC<OnboardingScreenProps> = ({ onComplete }
             type="submit"
             className="mt-6 w-full h-12 rounded-xl bg-[#008069] hover:bg-[#017561] dark:bg-[#00A884] dark:hover:bg-[#06CF9C] text-white dark:text-[#111B21] font-semibold text-sm flex items-center justify-center gap-2 shadow-sm transition-colors cursor-pointer"
           >
-            <span>Lanjutkan ke WA6</span>
+            <span>Lanjutkan ke WattappsAU</span>
             <ArrowRight className="w-4 h-4" />
           </button>
 

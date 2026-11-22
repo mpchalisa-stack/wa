@@ -46,7 +46,7 @@ export const PWAInstallButton: React.FC<PWAInstallButtonProps> = ({
         >
           <Download className="w-4 h-4 shrink-0" />
           <span className="whitespace-nowrap">
-            {isInstallable ? 'Instal WA6 di Perangkat' : 'Cara Instal di Layar Utama'}
+            {isInstallable ? 'Instal WattappsAU di Perangkat' : 'Cara Instal di Layar Utama'}
           </span>
         </button>
       )}
@@ -62,7 +62,7 @@ export const PWAInstallButton: React.FC<PWAInstallButtonProps> = ({
           >
             <div className="flex items-center justify-between mb-4">
               <h3 className="text-base font-bold text-[#111B21] dark:text-[#E9EDEF]">
-                Instal WA6 ke Layar Utama
+                Instal WattappsAU ke Layar Utama
               </h3>
               <button
                 type="button"
@@ -96,13 +96,13 @@ export const PWAInstallButton: React.FC<PWAInstallButtonProps> = ({
                   <span className="w-6 h-6 rounded-full bg-[#008069]/15 text-[#008069] dark:text-[#00A884] font-semibold text-xs flex items-center justify-center shrink-0 mt-0.5">
                     3
                   </span>
-                  <span>Ketuk <strong>Tambah</strong> di pojok kanan atas untuk membuka WA6 secara layar penuh.</span>
+                  <span>Ketuk <strong>Tambah</strong> di pojok kanan atas untuk membuka WattappsAU secara layar penuh.</span>
                 </li>
               </ol>
             ) : (
               <p className="text-sm text-[#3B4A54] dark:text-[#D1D7DB] leading-relaxed">
                 Buka menu browser (ikon titik tiga di pojok kanan atas Chrome/Edge) lalu pilih{' '}
-                <strong>Instal aplikasi</strong> atau <strong>Tambahkan ke layar utama</strong> untuk menjalankan WA6 dalam mode standalone.
+                <strong>Instal aplikasi</strong> atau <strong>Tambahkan ke layar utama</strong> untuk menjalankan WattappsAU dalam mode standalone.
               </p>
             )}
 

@@ -22,10 +22,10 @@ function parseScannedQR(raw: string): { id: string; name?: string } | null {
   } catch {
     // ignore malformed URL
   }
-  // Format "WA6:482910:Budi" or Barcode "WA6-482910"
-  const wa6Match = trimmed.match(/^WA6[:\-](\d{6})(?::(.+))?$/i);
-  if (wa6Match) {
-    return { id: wa6Match[1], name: wa6Match[2]?.trim() };
+  // Format "WA6:482910:Budi", "WattappsAU:482910:Budi", atau Barcode "WattappsAU-482910" / "WA6-482910"
+  const appMatch = trimmed.match(/^(?:WA6|WattappsAU)[:\-](\d{6})(?::(.+))?$/i);
+  if (appMatch) {
+    return { id: appMatch[1], name: appMatch[2]?.trim() };
   }
   // Plain 6-digit number anywhere in string
   const digitsMatch = trimmed.match(/\b(\d{6})\b/);
@@ -160,7 +160,7 @@ export const NewChatModal: React.FC<NewChatModalProps> = ({
             return;
           }
         }
-        setCameraError('Kode QR WA6 tidak ditemukan pada gambar tersebut.');
+        setCameraError('Kode QR WattappsAU tidak ditemukan pada gambar tersebut.');
       };
       img.src = String(reader.result);
     };
@@ -308,7 +308,7 @@ export const NewChatModal: React.FC<NewChatModalProps> = ({
             </div>
 
             <p className="mt-3 text-xs text-center text-[#54656F] dark:text-[#8696A0]">
-              Arahkan kamera ke kode QR WA6 teman Anda untuk terhubung otomatis.
+              Arahkan kamera ke kode QR WattappsAU teman Anda untuk terhubung otomatis.
             </p>
 
             <button

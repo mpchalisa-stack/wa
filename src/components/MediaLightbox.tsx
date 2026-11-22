@@ -39,7 +39,7 @@ export const MediaLightbox: React.FC<MediaLightboxProps> = ({ media, onClose }) 
             onClick={() =>
               triggerDownload(
                 media.src,
-                media.fileName || `WA6-${media.timestamp}.${media.type === 'video' ? 'mp4' : 'jpg'}`
+                media.fileName || `WattappsAU-${media.timestamp}.${media.type === 'video' ? 'mp4' : 'jpg'}`
               )
             }
             className="w-11 h-11 rounded-full flex items-center justify-center hover:bg-white/10 transition-colors cursor-pointer"

@@ -1,8 +1,8 @@
 {
   "id": "/",
-  "name": "WA6 - Pesan & Panggilan P2P",
-  "short_name": "WA6",
-  "description": "Aplikasi komunikasi real-time Peer-to-Peer dengan ID 6 digit tanpa nomor telepon, tanpa email, dan tanpa database eksternal.",
+  "name": "WattappsAU — Komunikasi P2P",
+  "short_name": "WattappsAU",
+  "description": "Aplikasi komunikasi real-time Peer-to-Peer Diskomlekau dengan ID 6 digit tanpa nomor telepon, tanpa email, dan tanpa database eksternal.",
   "start_url": "/",
   "scope": "/",
   "display": "standalone",
@@ -12,28 +12,16 @@
   "categories": ["social", "communication"],
   "icons": [
     {
-      "src": "/pwa-192x192.png",
+      "src": "/icon-512.png",
       "sizes": "192x192",
       "type": "image/png",
-      "purpose": "any"
+      "purpose": "any maskable"
     },
     {
-      "src": "/pwa-512x512.png",
+      "src": "/icon-512.png",
       "sizes": "512x512",
       "type": "image/png",
-      "purpose": "any"
-    },
-    {
-      "src": "/pwa-maskable-512x512.png",
-      "sizes": "512x512",
-      "type": "image/png",
-      "purpose": "maskable"
-    },
-    {
-      "src": "/icon.svg",
-      "sizes": "any",
-      "type": "image/svg+xml",
-      "purpose": "any"
+      "purpose": "any maskable"
     }
   ]
 }
