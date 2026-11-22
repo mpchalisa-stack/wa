@@ -46,10 +46,11 @@ jobs:
             cp google-services.json android/app/google-services.json
           fi
 
-      - name: Sync Capacitor Android & Configure Permissions
-        run: |
-          npx cap sync android
-          node scripts/configure-android.mjs
+      - name: Sync Capacitor Android
+        run: npx cap sync android
+
+      - name: Configure Android Gradle, Firebase Plugin, Permissions & App Icon
+        run: node scripts/configure-android.mjs
 
       - name: Accept Android SDK Licenses
         run: yes | $ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager --licenses || true

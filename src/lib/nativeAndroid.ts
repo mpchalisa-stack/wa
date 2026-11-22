@@ -29,19 +29,34 @@ export interface NativeNotificationActionEvent {
 }
 
 export function isNativeAndroid(): boolean {
-  return Capacitor.isNativePlatform() && Capacitor.getPlatform() === 'android';
+  try {
+    return Capacitor.isNativePlatform() && Capacitor.getPlatform() === 'android';
+  } catch (err) {
+    console.error('[WattappsAU Native] isNativeAndroid error:', err);
+    return false;
+  }
 }
 
 export function isNativeCapacitor(): boolean {
-  return Capacitor.isNativePlatform();
+  try {
+    return Capacitor.isNativePlatform();
+  } catch (err) {
+    console.error('[WattappsAU Native] isNativeCapacitor error:', err);
+    return false;
+  }
 }
 
 export function getDevicePlatform(): 'android' | 'ios' | 'web' {
-  if (!Capacitor.isNativePlatform()) return 'web';
-  const platform = Capacitor.getPlatform();
-  if (platform === 'android') return 'android';
-  if (platform === 'ios') return 'ios';
-  return 'web';
+  try {
+    if (!Capacitor.isNativePlatform()) return 'web';
+    const platform = Capacitor.getPlatform();
+    if (platform === 'android') return 'android';
+    if (platform === 'ios') return 'ios';
+    return 'web';
+  } catch (err) {
+    console.error('[WattappsAU Native] getDevicePlatform error:', err);
+    return 'web';
+  }
 }
 
 let cachedNativeFcmToken = '';
@@ -53,78 +68,95 @@ export function getCachedNativeFcmToken(): string {
 /**
  * Creates high-priority WhatsApp-style Android notification channels & action buttons
  * (Tolak / Jawab for incoming calls, Balas / Buka Chat for messages).
+ * Fully guarded with try/catch so startup on Android 14/15/16 never crashes.
  */
 export async function setupNativeNotificationChannelsAndActions(): Promise<void> {
-  if (!Capacitor.isNativePlatform()) return;
+  if (!isNativeCapacitor()) return;
 
   try {
-    const perm = await LocalNotifications.checkPermissions();
-    if (perm.display !== 'granted') {
-      await LocalNotifications.requestPermissions();
+    try {
+      const perm = await LocalNotifications.checkPermissions();
+      if (perm.display !== 'granted') {
+        await LocalNotifications.requestPermissions();
+      }
+    } catch (err) {
+      console.error('[WattappsAU Native] LocalNotifications permission check failed:', err);
     }
 
     if (Capacitor.getPlatform() === 'android') {
-      await LocalNotifications.createChannel({
-        id: ANDROID_CALL_CHANNEL_ID,
-        name: 'Panggilan Masuk WattappsAU',
-        description: 'Notifikasi panggilan suara & video berprioritas tinggi di layar kunci',
-        importance: 5, // IMPORTANCE_HIGH / MAX heads-up on lock screen
-        visibility: 1, // VISIBILITY_PUBLIC
-        vibration: true,
-        lights: true,
-        lightColor: '#00a884',
-      });
+      try {
+        await LocalNotifications.createChannel({
+          id: ANDROID_CALL_CHANNEL_ID,
+          name: 'Panggilan Masuk WattappsAU',
+          description: 'Notifikasi panggilan suara & video berprioritas tinggi di layar kunci',
+          importance: 5, // IMPORTANCE_HIGH / MAX heads-up on lock screen
+          visibility: 1, // VISIBILITY_PUBLIC
+          vibration: true,
+          lights: true,
+          lightColor: '#00a884',
+        });
+      } catch (err) {
+        console.error('[WattappsAU Native] Failed to create call channel:', err);
+      }
 
-      await LocalNotifications.createChannel({
-        id: ANDROID_MSG_CHANNEL_ID,
-        name: 'Pesan WattappsAU',
-        description: 'Notifikasi pesan taktis masuk WattappsAU',
-        importance: 4, // IMPORTANCE_HIGH
-        visibility: 1,
-        vibration: true,
-        lights: true,
-        lightColor: '#00a884',
-      });
+      try {
+        await LocalNotifications.createChannel({
+          id: ANDROID_MSG_CHANNEL_ID,
+          name: 'Pesan WattappsAU',
+          description: 'Notifikasi pesan taktis masuk WattappsAU',
+          importance: 4, // IMPORTANCE_HIGH
+          visibility: 1,
+          vibration: true,
+          lights: true,
+          lightColor: '#00a884',
+        });
+      } catch (err) {
+        console.error('[WattappsAU Native] Failed to create message channel:', err);
+      }
     }
 
-    await LocalNotifications.registerActionTypes({
-      types: [
-        {
-          id: CALL_ACTION_TYPE_ID,
-          actions: [
-            {
-              id: 'reject_call',
-              title: 'Tolak',
-              destructive: true,
-              foreground: false,
-            },
-            {
-              id: 'accept_call',
-              title: 'Jawab',
-              foreground: true,
-            },
-          ],
-        },
-        {
-          id: CHAT_ACTION_TYPE_ID,
-          actions: [
-            {
-              id: 'open_chat',
-              title: 'Balas / Buka Chat',
-              foreground: true,
-            },
-          ],
-        },
-      ],
-    });
+    try {
+      await LocalNotifications.registerActionTypes({
+        types: [
+          {
+            id: CALL_ACTION_TYPE_ID,
+            actions: [
+              {
+                id: 'reject_call',
+                title: 'Tolak',
+                destructive: true,
+                foreground: false,
+              },
+              {
+                id: 'accept_call',
+                title: 'Jawab',
+                foreground: true,
+              },
+            ],
+          },
+          {
+            id: CHAT_ACTION_TYPE_ID,
+            actions: [
+              {
+                id: 'open_chat',
+                title: 'Balas / Buka Chat',
+                foreground: true,
+              },
+            ],
+          },
+        ],
+      });
+    } catch (err) {
+      console.error('[WattappsAU Native] Failed to register action types:', err);
+    }
   } catch (err) {
-    console.warn('[WattappsAU Native] Failed to setup notification channels:', err);
+    console.error('[WattappsAU Native] Failed to setup notification channels:', err);
   }
 }
 
 /**
  * Schedules a high-priority native Android lock-screen notification via Capacitor LocalNotifications.
- * Returns true if dispatched natively, false on web so caller can fall back to Service Worker Notification.
+ * Uses default app launcher icon (no custom missing smallIcon drawable) to prevent Resources$NotFoundException.
  */
 export async function scheduleNativeLocalNotification(options: {
   id?: number;
@@ -137,7 +169,7 @@ export async function scheduleNativeLocalNotification(options: {
   callType?: 'audio' | 'video';
   chatId?: string;
 }): Promise<boolean> {
-  if (!Capacitor.isNativePlatform()) return false;
+  if (!isNativeCapacitor()) return false;
 
   try {
     const notifId =
@@ -154,7 +186,6 @@ export async function scheduleNativeLocalNotification(options: {
           body: options.body,
           channelId: options.isCall ? ANDROID_CALL_CHANNEL_ID : ANDROID_MSG_CHANNEL_ID,
           actionTypeId: options.isCall ? CALL_ACTION_TYPE_ID : CHAT_ACTION_TYPE_ID,
-          smallIcon: 'ic_stat_icon_config_sample',
           iconColor: '#00a884',
           ongoing: options.isCall,
           autoCancel: !options.isCall,
@@ -172,17 +203,17 @@ export async function scheduleNativeLocalNotification(options: {
     });
     return true;
   } catch (err) {
-    console.warn('[WattappsAU Native] LocalNotification schedule failed:', err);
+    console.error('[WattappsAU Native] LocalNotification schedule failed:', err);
     return false;
   }
 }
 
 export async function cancelNativeCallNotifications(): Promise<void> {
-  if (!Capacitor.isNativePlatform()) return;
+  if (!isNativeCapacitor()) return;
   try {
     await LocalNotifications.cancel({ notifications: [{ id: 900001 }] });
-  } catch {
-    // ignore
+  } catch (err) {
+    console.error('[WattappsAU Native] cancelNativeCallNotifications error:', err);
   }
 }
 
@@ -192,52 +223,66 @@ export async function cancelNativeCallNotifications(): Promise<void> {
 export async function listenNativeLocalNotificationActions(
   onAction: (event: NativeNotificationActionEvent) => void
 ): Promise<() => void> {
-  if (!Capacitor.isNativePlatform()) return () => {};
+  if (!isNativeCapacitor()) return () => {};
 
-  const handle = await LocalNotifications.addListener(
-    'localNotificationActionPerformed',
-    (performed: LocalNotificationActionPerformed) => {
-      const extra = (performed.notification.extra || {}) as Record<string, unknown>;
-      const rawAction = performed.actionId || 'tap';
-      const actionId: NativeNotificationActionEvent['actionId'] =
-        rawAction === 'reject_call' ||
-        rawAction === 'accept_call' ||
-        rawAction === 'open_chat'
-          ? rawAction
-          : 'tap';
+  try {
+    const handle = await LocalNotifications.addListener(
+      'localNotificationActionPerformed',
+      (performed: LocalNotificationActionPerformed) => {
+        try {
+          const extra = (performed.notification.extra || {}) as Record<string, unknown>;
+          const rawAction = performed.actionId || 'tap';
+          const actionId: NativeNotificationActionEvent['actionId'] =
+            rawAction === 'reject_call' ||
+            rawAction === 'accept_call' ||
+            rawAction === 'open_chat'
+              ? rawAction
+              : 'tap';
 
-      const kind: 'call' | 'message' =
-        extra.kind === 'call' || actionId === 'reject_call' || actionId === 'accept_call'
-          ? 'call'
-          : 'message';
+          const kind: 'call' | 'message' =
+            extra.kind === 'call' || actionId === 'reject_call' || actionId === 'accept_call'
+              ? 'call'
+              : 'message';
 
-      onAction({
-        actionId,
-        kind,
-        callerId: typeof extra.callerId === 'string' ? extra.callerId : undefined,
-        callerName: typeof extra.callerName === 'string' ? extra.callerName : undefined,
-        callId: typeof extra.callId === 'string' ? extra.callId : undefined,
-        callType: extra.callType === 'video' ? 'video' : 'audio',
-        isVideo: Boolean(extra.isVideo || extra.callType === 'video'),
-        chatId: typeof extra.chatId === 'string' ? extra.chatId : undefined,
-      });
-    }
-  );
+          onAction({
+            actionId,
+            kind,
+            callerId: typeof extra.callerId === 'string' ? extra.callerId : undefined,
+            callerName: typeof extra.callerName === 'string' ? extra.callerName : undefined,
+            callId: typeof extra.callId === 'string' ? extra.callId : undefined,
+            callType: extra.callType === 'video' ? 'video' : 'audio',
+            isVideo: Boolean(extra.isVideo || extra.callType === 'video'),
+            chatId: typeof extra.chatId === 'string' ? extra.chatId : undefined,
+          });
+        } catch (err) {
+          console.error('[WattappsAU Native] Local notification action handler error:', err);
+        }
+      }
+    );
 
-  return () => {
-    void handle.remove();
-  };
+    return () => {
+      try {
+        void handle.remove();
+      } catch (err) {
+        console.error('[WattappsAU Native] Remove local notification listener error:', err);
+      }
+    };
+  } catch (err) {
+    console.error('[WattappsAU Native] listenNativeLocalNotificationActions error:', err);
+    return () => {};
+  }
 }
 
 /**
  * Initializes Firebase Cloud Messaging (FCM) via @capacitor/push-notifications on Native Android.
+ * Non-blocking and fully guarded so missing google-services.json or unready FirebaseApp never crashes startup.
  */
 export async function initNativePushNotifications(callbacks: {
   onToken: (token: string) => void;
   onPushReceived: (payload: NativeNotificationActionEvent) => void;
   onPushAction: (payload: NativeNotificationActionEvent) => void;
 }): Promise<() => void> {
-  if (!Capacitor.isNativePlatform()) return () => {};
+  if (!isNativeCapacitor()) return () => {};
 
   const cleanups: Array<() => Promise<void>> = [];
 
@@ -250,8 +295,12 @@ export async function initNativePushNotifications(callbacks: {
     const regHandle = await PushNotifications.addListener(
       'registration',
       (token: PushToken) => {
-        cachedNativeFcmToken = token.value;
-        callbacks.onToken(token.value);
+        try {
+          cachedNativeFcmToken = token.value;
+          callbacks.onToken(token.value);
+        } catch (err) {
+          console.error('[WattappsAU FCM] onToken callback error:', err);
+        }
       }
     );
     cleanups.push(() => regHandle.remove());
@@ -259,7 +308,7 @@ export async function initNativePushNotifications(callbacks: {
     const regErrHandle = await PushNotifications.addListener(
       'registrationError',
       (err) => {
-        console.warn('[WattappsAU FCM] Registration error:', err);
+        console.error('[WattappsAU FCM] Registration error:', err);
       }
     );
     cleanups.push(() => regErrHandle.remove());
@@ -299,9 +348,13 @@ export async function initNativePushNotifications(callbacks: {
     const recvHandle = await PushNotifications.addListener(
       'pushNotificationReceived',
       (notification: PushNotificationSchema) => {
-        callbacks.onPushReceived(
-          parsePushData(notification.data as Record<string, unknown>, 'tap')
-        );
+        try {
+          callbacks.onPushReceived(
+            parsePushData(notification.data as Record<string, unknown>, 'tap')
+          );
+        } catch (err) {
+          console.error('[WattappsAU FCM] pushNotificationReceived error:', err);
+        }
       }
     );
     cleanups.push(() => recvHandle.remove());
@@ -309,33 +362,45 @@ export async function initNativePushNotifications(callbacks: {
     const actionHandle = await PushNotifications.addListener(
       'pushNotificationActionPerformed',
       (performed: PushActionPerformed) => {
-        const rawAction = performed.actionId || 'tap';
-        const actionId: NativeNotificationActionEvent['actionId'] =
-          rawAction === 'reject_call' ||
-          rawAction === 'accept_call' ||
-          rawAction === 'open_chat'
-            ? rawAction
-            : 'tap';
-        callbacks.onPushAction(
-          parsePushData(
-            performed.notification.data as Record<string, unknown>,
-            actionId
-          )
-        );
+        try {
+          const rawAction = performed.actionId || 'tap';
+          const actionId: NativeNotificationActionEvent['actionId'] =
+            rawAction === 'reject_call' ||
+            rawAction === 'accept_call' ||
+            rawAction === 'open_chat'
+              ? rawAction
+              : 'tap';
+          callbacks.onPushAction(
+            parsePushData(
+              performed.notification.data as Record<string, unknown>,
+              actionId
+            )
+          );
+        } catch (err) {
+          console.error('[WattappsAU FCM] pushNotificationActionPerformed error:', err);
+        }
       }
     );
     cleanups.push(() => actionHandle.remove());
 
     if (permStatus.receive === 'granted') {
-      await PushNotifications.register();
+      try {
+        await PushNotifications.register();
+      } catch (err) {
+        console.error('[WattappsAU FCM] PushNotifications.register() failed:', err);
+      }
     }
   } catch (err) {
-    console.warn('[WattappsAU FCM] Push initialization skipped:', err);
+    console.error('[WattappsAU FCM] Push initialization error:', err);
   }
 
   return () => {
     cleanups.forEach((fn) => {
-      void fn();
+      try {
+        void fn().catch((err) => console.error('[WattappsAU FCM] Cleanup error:', err));
+      } catch (err) {
+        console.error('[WattappsAU FCM] Cleanup sync error:', err);
+      }
     });
   };
 }
@@ -344,15 +409,15 @@ export async function initNativePushNotifications(callbacks: {
  * Keeps CPU & screen awake on Android Native when Mode Siaga is enabled.
  */
 export async function setNativeKeepAwake(enabled: boolean): Promise<void> {
-  if (!Capacitor.isNativePlatform()) return;
+  if (!isNativeCapacitor()) return;
   try {
     if (enabled) {
       await KeepAwake.keepAwake();
     } else {
       await KeepAwake.allowSleep();
     }
-  } catch {
-    // ignore if unsupported
+  } catch (err) {
+    console.error('[WattappsAU Native] KeepAwake error:', err);
   }
 }
 
@@ -362,15 +427,24 @@ export async function setNativeKeepAwake(enabled: boolean): Promise<void> {
 export async function registerNativeBackButtonHandler(
   handler: () => void
 ): Promise<() => void> {
-  if (!Capacitor.isNativePlatform()) return () => {};
+  if (!isNativeCapacitor()) return () => {};
   try {
     const handle = await CapApp.addListener('backButton', () => {
-      handler();
+      try {
+        handler();
+      } catch (err) {
+        console.error('[WattappsAU Native] backButton handler error:', err);
+      }
     });
     return () => {
-      void handle.remove();
+      try {
+        void handle.remove();
+      } catch (err) {
+        console.error('[WattappsAU Native] Remove backButton listener error:', err);
+      }
     };
-  } catch {
+  } catch (err) {
+    console.error('[WattappsAU Native] registerNativeBackButtonHandler error:', err);
     return () => {};
   }
 }
@@ -381,15 +455,24 @@ export async function registerNativeBackButtonHandler(
 export async function registerNativeAppStateListener(
   onStateChange: (isActive: boolean) => void
 ): Promise<() => void> {
-  if (!Capacitor.isNativePlatform()) return () => {};
+  if (!isNativeCapacitor()) return () => {};
   try {
     const handle = await CapApp.addListener('appStateChange', ({ isActive }) => {
-      onStateChange(isActive);
+      try {
+        onStateChange(isActive);
+      } catch (err) {
+        console.error('[WattappsAU Native] appStateChange handler error:', err);
+      }
     });
     return () => {
-      void handle.remove();
+      try {
+        void handle.remove();
+      } catch (err) {
+        console.error('[WattappsAU Native] Remove appStateChange listener error:', err);
+      }
     };
-  } catch {
+  } catch (err) {
+    console.error('[WattappsAU Native] registerNativeAppStateListener error:', err);
     return () => {};
   }
 }
@@ -398,11 +481,12 @@ export async function registerNativeAppStateListener(
  * Sends Android app to background (like WhatsApp) without killing background standby services.
  */
 export async function minimizeNativeApp(): Promise<boolean> {
-  if (!Capacitor.isNativePlatform()) return false;
+  if (!isNativeCapacitor()) return false;
   try {
     await CapApp.minimizeApp();
     return true;
-  } catch {
+  } catch (err) {
+    console.error('[WattappsAU Native] minimizeApp error:', err);
     return false;
   }
 }
@@ -411,12 +495,13 @@ export async function minimizeNativeApp(): Promise<boolean> {
  * Cleanly terminates the Android Native app when the user chooses ⋮ > Exit.
  */
 export async function exitNativeApp(): Promise<boolean> {
-  if (!Capacitor.isNativePlatform()) return false;
+  if (!isNativeCapacitor()) return false;
   try {
     await setNativeKeepAwake(false);
     await CapApp.exitApp();
     return true;
-  } catch {
+  } catch (err) {
+    console.error('[WattappsAU Native] exitApp error:', err);
     return false;
   }
 }

@@ -2,8 +2,11 @@ import fs from 'fs';
 import path from 'path';
 
 const androidRoot = path.resolve(process.cwd(), 'android');
+const rootBuildGradlePath = path.join(androidRoot, 'build.gradle');
+const appBuildGradlePath = path.join(androidRoot, 'app', 'build.gradle');
 const manifestPath = path.join(androidRoot, 'app', 'src', 'main', 'AndroidManifest.xml');
-const resDrawableDir = path.join(androidRoot, 'app', 'src', 'main', 'res', 'drawable');
+const rootGoogleServices = path.resolve(process.cwd(), 'google-services.json');
+const targetGoogleServices = path.join(androidRoot, 'app', 'google-services.json');
 const publicIconPath = path.resolve(process.cwd(), 'public', 'icon-512.png');
 
 if (!fs.existsSync(manifestPath)) {
@@ -11,7 +14,46 @@ if (!fs.existsSync(manifestPath)) {
   process.exit(0);
 }
 
-// 1. Inject WhatsApp-grade Android permissions into AndroidManifest.xml
+// 1. Copy root google-services.json into android/app/google-services.json if not already copied
+if (fs.existsSync(rootGoogleServices) && !fs.existsSync(targetGoogleServices)) {
+  fs.copyFileSync(rootGoogleServices, targetGoogleServices);
+  console.log('[configure-android] Copied google-services.json to android/app/google-services.json.');
+}
+
+// 2. Ensure classpath 'com.google.gms:google-services:4.4.2' is present in android/build.gradle
+if (fs.existsSync(rootBuildGradlePath)) {
+  let rootGradle = fs.readFileSync(rootBuildGradlePath, 'utf8');
+  if (!rootGradle.includes('com.google.gms:google-services')) {
+    const depAnchor = /(dependencies\s*\{)/;
+    if (depAnchor.test(rootGradle)) {
+      rootGradle = rootGradle.replace(
+        depAnchor,
+        "$1\n        classpath 'com.google.gms:google-services:4.4.2'"
+      );
+      fs.writeFileSync(rootBuildGradlePath, rootGradle, 'utf8');
+      console.log("[configure-android] Injected classpath 'com.google.gms:google-services:4.4.2' into android/build.gradle.");
+    }
+  } else {
+    console.log('[configure-android] com.google.gms:google-services classpath already present in android/build.gradle.');
+  }
+}
+
+// 3. Ensure apply plugin: 'com.google.gms.google-services' is present in android/app/build.gradle when google-services.json exists
+const hasGoogleServicesJson = fs.existsSync(targetGoogleServices);
+if (hasGoogleServicesJson && fs.existsSync(appBuildGradlePath)) {
+  let appGradle = fs.readFileSync(appBuildGradlePath, 'utf8');
+  if (!appGradle.includes("com.google.gms.google-services")) {
+    appGradle = `${appGradle.trimEnd()}\n\napply plugin: 'com.google.gms.google-services'\n`;
+    fs.writeFileSync(appBuildGradlePath, appGradle, 'utf8');
+    console.log("[configure-android] Appended apply plugin: 'com.google.gms.google-services' to android/app/build.gradle.");
+  } else {
+    console.log('[configure-android] google-services plugin already configured in android/app/build.gradle.');
+  }
+} else {
+  console.log('[configure-android] google-services.json not present in android/app/; skipping google-services plugin injection.');
+}
+
+// 4. Inject safe Android permissions into AndroidManifest.xml (avoiding broken custom drawable refs)
 const REQUIRED_PERMISSIONS = [
   'android.permission.INTERNET',
   'android.permission.ACCESS_NETWORK_STATE',
@@ -23,10 +65,6 @@ const REQUIRED_PERMISSIONS = [
   'android.permission.POST_NOTIFICATIONS',
   'android.permission.USE_FULL_SCREEN_INTENT',
   'android.permission.RECEIVE_BOOT_COMPLETED',
-  'android.permission.FOREGROUND_SERVICE',
-  'android.permission.FOREGROUND_SERVICE_MEDIA_PLAYBACK',
-  'android.permission.FOREGROUND_SERVICE_MICROPHONE',
-  'android.permission.FOREGROUND_SERVICE_CAMERA',
 ];
 
 let manifest = fs.readFileSync(manifestPath, 'utf8');
@@ -40,7 +78,6 @@ for (const perm of REQUIRED_PERMISSIONS) {
   }
 }
 
-// Enable cleartext & lock-screen wake attributes on MainActivity for incoming call modal
 if (!manifest.includes('android:showWhenLocked="true"')) {
   manifest = manifest.replace(
     'android:name=".MainActivity"',
@@ -49,43 +86,27 @@ if (!manifest.includes('android:showWhenLocked="true"')) {
 }
 
 fs.writeFileSync(manifestPath, manifest, 'utf8');
-console.log(`[configure-android] Updated AndroidManifest.xml (+${addedCount} permissions, showWhenLocked/turnScreenOn enabled).`);
+console.log(`[configure-android] Updated AndroidManifest.xml (+${addedCount} permissions).`);
 
-// 2. Ensure ic_stat_icon_config_sample vector drawable exists for Capacitor LocalNotifications
-fs.mkdirSync(resDrawableDir, { recursive: true });
-const statIconPath = path.join(resDrawableDir, 'ic_stat_icon_config_sample.xml');
-const statIconXml = `<vector xmlns:android="http://schemas.android.com/apk/res/android"
-    android:width="24dp"
-    android:height="24dp"
-    android:viewportWidth="24"
-    android:viewportHeight="24"
-    android:tint="#FFFFFF">
-    <path
-        android:fillColor="#FFFFFFFF"
-        android:pathData="M12,2C6.48,2 2,6.48 2,12c0,1.85 0.5,3.58 1.37,5.07L2,22l5.09,-1.33C8.55,21.52 10.22,22 12,22c5.52,0 10,-4.48 10,-10S17.52,2 12,2zM12,16.5c-0.83,0 -1.5,-0.67 -1.5,-1.5s0.67,-1.5 1.5,-1.5 1.5,0.67 1.5,1.5 -0.67,1.5 -1.5,1.5zM15.5,12.5c-0.96,-0.96 -2.23,-1.5 -3.5,-1.5s-2.54,0.54 -3.5,1.5l-1.06,-1.06C8.69,10.19 10.29,9.5 12,9.5s3.31,0.69 4.56,1.94L15.5,12.5zM17.62,10.38C16.12,8.88 14.13,8 12,8s-4.12,0.88 -5.62,2.38L5.32,9.32C7.1,7.54 9.48,6.5 12,6.5s4.9,1.04 6.68,2.82L17.62,10.38z" />
-</vector>
-`;
-fs.writeFileSync(statIconPath, statIconXml, 'utf8');
-console.log('[configure-android] Generated res/drawable/ic_stat_icon_config_sample.xml.');
-
-// 3. Copy WattappsAU 512px icon into mipmap launcher fallback if present
-if (fs.existsSync(publicIconPath)) {
-  const mipmapDirs = ['mipmap-hdpi', 'mipmap-mdpi', 'mipmap-xhdpi', 'mipmap-xxhdpi', 'mipmap-xxxhdpi'];
-  for (const dirName of mipmapDirs) {
-    const targetDir = path.join(androidRoot, 'app', 'src', 'main', 'res', dirName);
-    if (fs.existsSync(targetDir)) {
-      fs.copyFileSync(publicIconPath, path.join(targetDir, 'ic_launcher.png'));
-      fs.copyFileSync(publicIconPath, path.join(targetDir, 'ic_launcher_round.png'));
-      fs.copyFileSync(publicIconPath, path.join(targetDir, 'ic_launcher_foreground.png'));
-    }
-  }
-  console.log('[configure-android] Synced WattappsAU app icons to Android mipmap directories.');
+// 5. Remove any stale custom ic_stat_icon_config_sample drawable if present
+const staleStatIconPath = path.join(
+  androidRoot,
+  'app',
+  'src',
+  'main',
+  'res',
+  'drawable',
+  'ic_stat_icon_config_sample.xml'
+);
+if (fs.existsSync(staleStatIconPath)) {
+  fs.unlinkSync(staleStatIconPath);
 }
 
-// 4. Copy root google-services.json into android/app/google-services.json for native FCM push
-const rootGoogleServices = path.resolve(process.cwd(), 'google-services.json');
-const targetGoogleServices = path.join(androidRoot, 'app', 'google-services.json');
-if (fs.existsSync(rootGoogleServices)) {
-  fs.copyFileSync(rootGoogleServices, targetGoogleServices);
-  console.log('[configure-android] Copied google-services.json to android/app/google-services.json.');
+// 6. Safely copy public/icon-512.png into mipmap-xxxhdpi/ic_launcher.png (if directory exists)
+if (fs.existsSync(publicIconPath)) {
+  const xxxhdpiDir = path.join(androidRoot, 'app', 'src', 'main', 'res', 'mipmap-xxxhdpi');
+  if (fs.existsSync(xxxhdpiDir)) {
+    fs.copyFileSync(publicIconPath, path.join(xxxhdpiDir, 'ic_launcher.png'));
+    console.log('[configure-android] Copied public/icon-512.png to mipmap-xxxhdpi/ic_launcher.png.');
+  }
 }

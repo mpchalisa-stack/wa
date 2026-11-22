@@ -95,14 +95,11 @@ import {
   NativeNotificationActionEvent,
   exitNativeApp,
   getDevicePlatform,
-  initNativePushNotifications,
   isNativeCapacitor,
-  listenNativeLocalNotificationActions,
   minimizeNativeApp,
-  registerNativeAppStateListener,
   registerNativeBackButtonHandler,
-  setupNativeNotificationChannelsAndActions,
 } from './lib/nativeAndroid';
+import { startSafeNativePushAndServices } from './services/nativePush';
 import { estimateDataUrlBytes, formatSixDigitId, generateUid } from './lib/media';
 import { OnboardingScreen } from './components/OnboardingScreen';
 import { ChatList } from './components/ChatList';
@@ -2201,7 +2198,11 @@ export default function App() {
         // Pada Android Native (APK), kirim aplikasi ke latar belakang seperti WhatsApp agar Mode Siaga tetap hidup.
         // Pada Web/Chrome, tahan halaman dan tampilkan peringatan.
         if (isNativeCapacitor()) {
-          void minimizeNativeApp();
+          try {
+            void minimizeNativeApp();
+          } catch (err) {
+            console.error('[App] minimizeNativeApp error:', err);
+          }
         } else {
           showToast(
             'Tombol Back dikunci agar Mode Siaga tetap aktif. Tekan tombol Home (bulat) untuk ke layar utama HP, atau pilih menu ⋮ > Exit untuk keluar.',
@@ -2218,160 +2219,162 @@ export default function App() {
 
     let removeNativeBack: (() => void) | null = null;
     if (isNativeCapacitor()) {
-      void registerNativeBackButtonHandler(() => {
-        if (isExitedRef.current) return;
-        const ui = backGuardStateRef.current;
-        if (ui.hasCallModal || callRuntimeRef.current || incomingCallRef.current || pendingCallRef.current) {
-          handleRejectCallRef.current();
-        } else if (ui.lightboxMedia) {
-          setLightboxMedia(null);
-        } else if (ui.cameraPurpose) {
-          setCameraPurpose(null);
-        } else if (ui.showResetConfirm) {
-          setShowResetConfirm(false);
-        } else if (ui.showMainMenu) {
-          setShowMainMenu(false);
-        } else if (ui.showProfileDrawer) {
-          setShowProfileDrawer(false);
-        } else if (ui.showShareAppModal) {
-          setShowShareAppModal(false);
-        } else if (ui.showNewChatModal) {
-          setShowNewChatModal(false);
-        } else if (ui.showNewGroupModal) {
-          setShowNewGroupModal(false);
-        } else if (ui.searchOpen) {
-          setSearchOpen(false);
-          setSearchQuery('');
-        } else if (ui.activeChatId) {
-          setActiveChatId(null);
-        } else if (ui.activeTab !== 'chats') {
-          setActiveTab('chats');
-        } else {
-          void minimizeNativeApp();
-        }
-      }).then((cleanup) => {
-        removeNativeBack = cleanup;
-      });
+      try {
+        void registerNativeBackButtonHandler(() => {
+          try {
+            if (isExitedRef.current) return;
+            const ui = backGuardStateRef.current;
+            if (ui.hasCallModal || callRuntimeRef.current || incomingCallRef.current || pendingCallRef.current) {
+              handleRejectCallRef.current();
+            } else if (ui.lightboxMedia) {
+              setLightboxMedia(null);
+            } else if (ui.cameraPurpose) {
+              setCameraPurpose(null);
+            } else if (ui.showResetConfirm) {
+              setShowResetConfirm(false);
+            } else if (ui.showMainMenu) {
+              setShowMainMenu(false);
+            } else if (ui.showProfileDrawer) {
+              setShowProfileDrawer(false);
+            } else if (ui.showShareAppModal) {
+              setShowShareAppModal(false);
+            } else if (ui.showNewChatModal) {
+              setShowNewChatModal(false);
+            } else if (ui.showNewGroupModal) {
+              setShowNewGroupModal(false);
+            } else if (ui.searchOpen) {
+              setSearchOpen(false);
+              setSearchQuery('');
+            } else if (ui.activeChatId) {
+              setActiveChatId(null);
+            } else if (ui.activeTab !== 'chats') {
+              setActiveTab('chats');
+            } else {
+              void minimizeNativeApp();
+            }
+          } catch (err) {
+            console.error('[App] Native back button callback error:', err);
+          }
+        })
+          .then((cleanup) => {
+            removeNativeBack = cleanup;
+          })
+          .catch((err) => {
+            console.error('[App] registerNativeBackButtonHandler error:', err);
+          });
+      } catch (err) {
+        console.error('[App] Native back button setup error:', err);
+      }
     }
 
     return () => {
       window.removeEventListener('pointerdown', trapBackButton);
       window.removeEventListener('touchstart', trapBackButton);
       window.removeEventListener('popstate', handlePopState);
-      if (removeNativeBack) removeNativeBack();
+      try {
+        if (removeNativeBack) removeNativeBack();
+      } catch (err) {
+        console.error('[App] Remove native back listener error:', err);
+      }
     };
   }, [isExited, showToast, finalizeCall]);
 
-  // Inisialisasi Capacitor Android Native (Notification Channels, Local/FCM Push Action Listeners, App Resume)
+  // Inisialisasi Capacitor Android Native secara aman & non-blocking setelah React render (anti force-close Android 14/15/16)
   useEffect(() => {
     if (!isNativeCapacitor() || isExited) return;
 
-    let disposed = false;
-    const cleanups: Array<() => void> = [];
-
     const handleNativeAction = (ev: NativeNotificationActionEvent) => {
-      if (ev.actionId === 'reject_call') {
-        handleRejectCallRef.current({
-          callerId: ev.callerId,
-          callerName: ev.callerName,
-          callId: ev.callId,
-          callType: ev.callType,
-        });
-        return;
-      }
-
-      if (ev.actionId === 'accept_call') {
-        forceShowIncomingCallModal({
-          callerId: ev.callerId,
-          callerName: ev.callerName,
-          callId: ev.callId,
-          callType: ev.callType,
-          isVideo: ev.isVideo,
-        });
-        void wakeAndSyncPeer();
-        void handleAcceptCallRef.current(true);
-        return;
-      }
-
-      if (ev.kind === 'call') {
-        forceShowIncomingCallModal({
-          callerId: ev.callerId,
-          callerName: ev.callerName,
-          callId: ev.callId,
-          callType: ev.callType,
-          isVideo: ev.isVideo,
-        });
-        void wakeAndSyncPeer();
-        return;
-      }
-
-      const targetChat = ev.chatId || ev.callerId;
-      if (targetChat) {
-        const cleanId = fromFullPeerId(targetChat);
-        setActiveTab('chats');
-        setActiveChatId(cleanId);
-        activeChatIdRef.current = cleanId;
-        void wakeAndSyncPeer();
-      }
-    };
-
-    void (async () => {
-      await setupNativeNotificationChannelsAndActions();
-      if (disposed) return;
-
-      const stopLocalActions = await listenNativeLocalNotificationActions(handleNativeAction);
-      if (disposed) {
-        stopLocalActions();
-      } else {
-        cleanups.push(stopLocalActions);
-      }
-
-      const stopPush = await initNativePushNotifications({
-        onToken: (token) => {
-          if (!disposed) setNativeFcmToken(token);
-        },
-        onPushReceived: (payload) => {
-          if (disposed) return;
-          if (payload.kind === 'call' && payload.callerId) {
-            pauseKeepAliveForCall();
-            startIncomingRingtone();
-            forceShowIncomingCallModal({
-              callerId: payload.callerId,
-              callerName: payload.callerName,
-              callId: payload.callId,
-              callType: payload.callType,
-              isVideo: payload.isVideo,
-            });
-          }
-          void wakeAndSyncPeer();
-        },
-        onPushAction: handleNativeAction,
-      });
-      if (disposed) {
-        stopPush();
-      } else {
-        cleanups.push(stopPush);
-      }
-
-      const stopAppState = await registerNativeAppStateListener((isActive) => {
-        if (isActive && !disposed) {
-          void wakeAndSyncPeer();
-          if (incomingCallRef.current && isIncomingCallStillActive(incomingCallRef.current)) {
-            forceShowIncomingCallModal();
-          }
+      try {
+        if (ev.actionId === 'reject_call') {
+          handleRejectCallRef.current({
+            callerId: ev.callerId,
+            callerName: ev.callerName,
+            callId: ev.callId,
+            callType: ev.callType,
+          });
+          return;
         }
-      });
-      if (disposed) {
-        stopAppState();
-      } else {
-        cleanups.push(stopAppState);
-      }
-    })();
 
-    return () => {
-      disposed = true;
-      cleanups.forEach((fn) => fn());
+        if (ev.actionId === 'accept_call') {
+          forceShowIncomingCallModal({
+            callerId: ev.callerId,
+            callerName: ev.callerName,
+            callId: ev.callId,
+            callType: ev.callType,
+            isVideo: ev.isVideo,
+          });
+          void wakeAndSyncPeer();
+          void handleAcceptCallRef.current(true);
+          return;
+        }
+
+        if (ev.kind === 'call') {
+          forceShowIncomingCallModal({
+            callerId: ev.callerId,
+            callerName: ev.callerName,
+            callId: ev.callId,
+            callType: ev.callType,
+            isVideo: ev.isVideo,
+          });
+          void wakeAndSyncPeer();
+          return;
+        }
+
+        const targetChat = ev.chatId || ev.callerId;
+        if (targetChat) {
+          const cleanId = fromFullPeerId(targetChat);
+          setActiveTab('chats');
+          setActiveChatId(cleanId);
+          activeChatIdRef.current = cleanId;
+          void wakeAndSyncPeer();
+        }
+      } catch (err) {
+        console.error('[App] handleNativeAction error:', err);
+      }
     };
+
+    try {
+      return startSafeNativePushAndServices({
+        standbyEnabled: standbyModeRef.current,
+        onToken: (token) => {
+          setNativeFcmToken(token);
+        },
+        onNotificationAction: handleNativeAction,
+        onPushReceived: (payload) => {
+          try {
+            if (payload.kind === 'call' && payload.callerId) {
+              pauseKeepAliveForCall();
+              startIncomingRingtone();
+              forceShowIncomingCallModal({
+                callerId: payload.callerId,
+                callerName: payload.callerName,
+                callId: payload.callId,
+                callType: payload.callType,
+                isVideo: payload.isVideo,
+              });
+            }
+            void wakeAndSyncPeer();
+          } catch (err) {
+            console.error('[App] onPushReceived error:', err);
+          }
+        },
+        onAppStateChange: (isActive) => {
+          try {
+            if (isActive) {
+              void wakeAndSyncPeer();
+              if (incomingCallRef.current && isIncomingCallStillActive(incomingCallRef.current)) {
+                forceShowIncomingCallModal();
+              }
+            }
+          } catch (err) {
+            console.error('[App] onAppStateChange error:', err);
+          }
+        },
+      });
+    } catch (err) {
+      console.error('[App] startSafeNativePushAndServices error:', err);
+      return undefined;
+    }
   }, [isExited, wakeAndSyncPeer, forceShowIncomingCallModal, isIncomingCallStillActive]);
 
   // Sinkronisasi opsional Firebase Auth & Cloud Firestore (FCM Token + Antrean Sinyal Bangun)
@@ -3662,7 +3665,11 @@ export default function App() {
 
     // Pada aplikasi Android Native (Capacitor APK), tutup proses aplikasi secara bersih
     if (isNativeCapacitor()) {
-      await exitNativeApp();
+      try {
+        await exitNativeApp();
+      } catch (err) {
+        console.error('[App] exitNativeApp error:', err);
+      }
       return;
     }
 
