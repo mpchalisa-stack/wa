@@ -81,3 +81,11 @@ if (fs.existsSync(publicIconPath)) {
   }
   console.log('[configure-android] Synced WattappsAU app icons to Android mipmap directories.');
 }
+
+// 4. Copy root google-services.json into android/app/google-services.json for native FCM push
+const rootGoogleServices = path.resolve(process.cwd(), 'google-services.json');
+const targetGoogleServices = path.join(androidRoot, 'app', 'google-services.json');
+if (fs.existsSync(rootGoogleServices)) {
+  fs.copyFileSync(rootGoogleServices, targetGoogleServices);
+  console.log('[configure-android] Copied google-services.json to android/app/google-services.json.');
+}
