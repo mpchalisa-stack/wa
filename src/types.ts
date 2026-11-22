@@ -25,8 +25,16 @@ export interface Contact {
   lastSeen?: number;
 }
 
-export type MessageType = 'text' | 'image' | 'video' | 'document' | 'voice';
+export type MessageType = 'text' | 'image' | 'video' | 'document' | 'voice' | 'call_log';
 export type MessageStatus = 'pending' | 'sending' | 'sent' | 'delivered' | 'read';
+
+export interface CallLogMeta {
+  callId: string;
+  callType: CallType;
+  direction: CallDirection;
+  status: CallRecordStatus;
+  duration: number; // Seconds
+}
 
 export interface ReplyPreview {
   id: string;
@@ -56,6 +64,7 @@ export interface ChatMessage {
   replyTo?: ReplyPreview;
   deleted?: boolean;
   isGroup?: boolean;
+  callLog?: CallLogMeta;
 }
 
 export interface StatusItem {

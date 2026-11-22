@@ -119,6 +119,94 @@ async function releaseScreenWakeLock(): Promise<void> {
   }
 }
 
+let cachedMinimalArtworkDataUrl: string | null = null;
+
+/**
+ * Menghasilkan ikon minimalis 192x192px (gelap netral transparan dengan gelombang sinyal halus)
+ * dalam bentuk DataURL khusus untuk artwork Media Session layar kunci agar tidak mencolok.
+ */
+function createMinimalStandbyArtworkDataUrl(): string {
+  if (cachedMinimalArtworkDataUrl) return cachedMinimalArtworkDataUrl;
+
+  const fallbackSvg =
+    'data:image/svg+xml;charset=utf-8,' +
+    encodeURIComponent(
+      `<svg xmlns="http://www.w3.org/2000/svg" width="192" height="192" viewBox="0 0 192 192">` +
+        `<rect width="192" height="192" rx="36" fill="#1e293b" fill-opacity="0.88"/>` +
+        `<g fill="none" stroke="#94a3b8" stroke-width="6" stroke-linecap="round" stroke-opacity="0.65">` +
+        `<path d="M68 68 A40 40 0 0 0 68 124"/>` +
+        `<path d="M124 68 A40 40 0 0 1 124 124"/>` +
+        `<path d="M50 50 A65 65 0 0 0 50 142" stroke-opacity="0.38"/>` +
+        `<path d="M142 50 A65 65 0 0 1 142 142" stroke-opacity="0.38"/>` +
+        `</g>` +
+        `<circle cx="96" cy="96" r="10" fill="#94a3b8" fill-opacity="0.8"/>` +
+        `</svg>`
+    );
+
+  if (typeof document === 'undefined') {
+    cachedMinimalArtworkDataUrl = fallbackSvg;
+    return cachedMinimalArtworkDataUrl;
+  }
+
+  try {
+    const size = 192;
+    const canvas = document.createElement('canvas');
+    canvas.width = size;
+    canvas.height = size;
+    const ctx = canvas.getContext('2d');
+    if (!ctx) {
+      cachedMinimalArtworkDataUrl = fallbackSvg;
+      return cachedMinimalArtworkDataUrl;
+    }
+
+    // Latar belakang gelap abu-abu transparan netral
+    ctx.clearRect(0, 0, size, size);
+    ctx.fillStyle = 'rgba(24, 34, 41, 0.88)';
+    ctx.beginPath();
+    ctx.roundRect(10, 10, size - 20, size - 20, 36);
+    ctx.fill();
+
+    ctx.strokeStyle = 'rgba(148, 163, 184, 0.16)';
+    ctx.lineWidth = 2;
+    ctx.stroke();
+
+    const cx = size / 2;
+    const cy = size / 2;
+
+    // Gelombang sinyal netral minimalis (kiri & kanan)
+    ctx.lineCap = 'round';
+    ctx.strokeStyle = 'rgba(148, 163, 184, 0.65)';
+    ctx.lineWidth = 5.5;
+    ctx.beginPath();
+    ctx.arc(cx, cy, 32, Math.PI * 0.72, Math.PI * 1.28);
+    ctx.stroke();
+    ctx.beginPath();
+    ctx.arc(cx, cy, 32, -Math.PI * 0.28, Math.PI * 0.28);
+    ctx.stroke();
+
+    ctx.strokeStyle = 'rgba(148, 163, 184, 0.34)';
+    ctx.lineWidth = 5;
+    ctx.beginPath();
+    ctx.arc(cx, cy, 54, Math.PI * 0.74, Math.PI * 1.26);
+    ctx.stroke();
+    ctx.beginPath();
+    ctx.arc(cx, cy, 54, -Math.PI * 0.26, Math.PI * 0.26);
+    ctx.stroke();
+
+    // Titik pusat sinyal netral
+    ctx.fillStyle = 'rgba(148, 163, 184, 0.82)';
+    ctx.beginPath();
+    ctx.arc(cx, cy, 9, 0, Math.PI * 2);
+    ctx.fill();
+
+    cachedMinimalArtworkDataUrl = canvas.toDataURL('image/png');
+    return cachedMinimalArtworkDataUrl;
+  } catch {
+    cachedMinimalArtworkDataUrl = fallbackSvg;
+    return cachedMinimalArtworkDataUrl;
+  }
+}
+
 function registerStandbyMediaSession(state: 'playing' | 'paused' | 'none'): void {
   try {
     if (typeof navigator === 'undefined' || !('mediaSession' in navigator)) return;
@@ -135,10 +223,18 @@ function registerStandbyMediaSession(state: 'playing' | 'paused' | 'none'): void
     }
 
     if (typeof MediaMetadata !== 'undefined') {
+      const minimalArtwork = createMinimalStandbyArtworkDataUrl();
       navigator.mediaSession.metadata = new MediaMetadata({
-        title: 'WattappsAU — Saluran Siaga Aktif',
-        artist: 'Komunikasi Taktis P2P',
-        artwork: [{ src: '/icon-512.png', sizes: '512x512', type: 'image/png' }],
+        title: 'Layanan Siaga Aktif',
+        artist: 'Terhubung',
+        album: '',
+        artwork: [
+          {
+            src: minimalArtwork,
+            sizes: '192x192',
+            type: minimalArtwork.startsWith('data:image/png') ? 'image/png' : 'image/svg+xml',
+          },
+        ],
       });
     }
 

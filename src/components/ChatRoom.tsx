@@ -17,6 +17,9 @@ import {
   MoreVertical,
   Paperclip,
   Phone,
+  PhoneIncoming,
+  PhoneMissed,
+  PhoneOutgoing,
   Play,
   Reply,
   SendHorizontal,
@@ -382,9 +385,9 @@ export const ChatRoom: React.FC<ChatRoomProps> = ({
         lastDateStr = dateStr;
         prevSender = '';
       }
-      const showTail = m.senderId !== prevSender;
+      const showTail = m.type !== 'call_log' && m.senderId !== prevSender;
       out.push({ kind: 'msg', msg: m, showTail });
-      prevSender = m.senderId;
+      prevSender = m.type === 'call_log' ? '' : m.senderId;
     }
     return out;
   }, [messages]);
@@ -548,6 +551,97 @@ export const ChatRoom: React.FC<ChatRoomProps> = ({
           }
 
           const { msg, showTail } = entry;
+
+          // Gelembung Log Riwayat Panggilan Sistem di Dalam Ruang Chat
+          if (msg.type === 'call_log' && msg.callLog) {
+            const { callLog } = msg;
+            const isVideoCall = callLog.callType === 'video';
+            const isMissedOrRejected =
+              callLog.status === 'missed' || callLog.status === 'rejected';
+            const isOutgoingAnswered =
+              callLog.status === 'answered' && callLog.direction === 'outgoing';
+
+            const callTitle = isMissedOrRejected
+              ? isVideoCall
+                ? 'Panggilan video tak terjawab'
+                : 'Panggilan suara tak terjawab'
+              : isOutgoingAnswered
+              ? isVideoCall
+                ? 'Panggilan video keluar'
+                : 'Panggilan suara keluar'
+              : isVideoCall
+              ? 'Panggilan video masuk'
+              : 'Panggilan suara masuk';
+
+            const iconToneClass = isMissedOrRejected
+              ? 'bg-rose-500/15 border-rose-500/35 text-rose-400'
+              : isOutgoingAnswered
+              ? 'bg-emerald-500/15 border-emerald-500/35 text-[#25D366]'
+              : 'bg-sky-500/15 border-sky-500/35 text-[#38bdf8]';
+
+            const titleToneClass = isMissedOrRejected
+              ? 'text-rose-300'
+              : isOutgoingAnswered
+              ? 'text-[#D9FDD3]'
+              : 'text-sky-200';
+
+            return (
+              <div key={msg.id} className="flex justify-center my-2.5">
+                <div className="w-full max-w-[320px] rounded-xl bg-[#182229]/95 border border-[#38bdf8]/15 shadow-md px-3 py-2.5 flex items-center gap-3 text-[#E9EDEF]">
+                  <div
+                    className={`w-10 h-10 rounded-full border flex items-center justify-center shrink-0 ${iconToneClass}`}
+                  >
+                    {isVideoCall ? (
+                      <Video className="w-4 h-4" />
+                    ) : isMissedOrRejected ? (
+                      <PhoneMissed className="w-4 h-4" />
+                    ) : isOutgoingAnswered ? (
+                      <PhoneOutgoing className="w-4 h-4" />
+                    ) : (
+                      <PhoneIncoming className="w-4 h-4" />
+                    )}
+                  </div>
+
+                  <div className="min-w-0 flex-1">
+                    <div className={`text-[13px] font-semibold leading-tight truncate ${titleToneClass}`}>
+                      {callTitle}
+                    </div>
+                    <div className="mt-0.5 flex items-center gap-1.5 text-[11px] text-[#8696A0] tabular-nums">
+                      {!isMissedOrRejected && callLog.duration > 0 && (
+                        <>
+                          <span className="font-mono-id text-[#CBD5E1]">
+                            {formatDuration(callLog.duration)}
+                          </span>
+                          <span>·</span>
+                        </>
+                      )}
+                      <span>{formatTime(msg.timestamp)}</span>
+                    </div>
+                  </div>
+
+                  {!contact.isGroup && (
+                    <button
+                      type="button"
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        onStartCall(contact.id, callLog.callType);
+                      }}
+                      className="shrink-0 inline-flex items-center gap-1 px-2.5 py-1.5 rounded-lg bg-[#00A884]/15 hover:bg-[#00A884]/25 border border-[#00A884]/40 text-[#25D366] text-[11px] font-semibold transition-colors cursor-pointer"
+                      title={`Panggil lagi (${isVideoCall ? 'Video' : 'Suara'})`}
+                    >
+                      {isVideoCall ? (
+                        <Video className="w-3.5 h-3.5" />
+                      ) : (
+                        <Phone className="w-3.5 h-3.5" />
+                      )}
+                      <span>Panggil Lagi</span>
+                    </button>
+                  )}
+                </div>
+              </div>
+            );
+          }
+
           const isMine = msg.senderId === profile.id;
 
           return (

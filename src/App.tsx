@@ -213,6 +213,7 @@ export default function App() {
   const awaitingMediaCallAnswerRef = useRef<AwaitingMediaCallAnswer | null>(null);
   const lastAppWakeSyncRef = useRef<number>(0);
   const callTimerRef = useRef<number | null>(null);
+  const unansweredCallTimerRef = useRef<number | null>(null);
   const wakeRingtoneTimerRef = useRef<number | null>(null);
   const typingClearTimersRef = useRef<Record<string, number>>({});
   const toastTimerRef = useRef<number | null>(null);
@@ -308,6 +309,9 @@ export default function App() {
       if (wakeRingtoneTimerRef.current !== null) {
         window.clearTimeout(wakeRingtoneTimerRef.current);
       }
+      if (unansweredCallTimerRef.current !== null) {
+        window.clearTimeout(unansweredCallTimerRef.current);
+      }
       void disableStandbyMode();
     };
   }, []);
@@ -369,7 +373,11 @@ export default function App() {
     if (!me || !manager) return;
 
     const unreadFromPeer = messagesRef.current.filter(
-      (m) => m.chatId === chatId && m.senderId !== me.id && m.status !== 'read'
+      (m) =>
+        m.chatId === chatId &&
+        m.type !== 'call_log' &&
+        m.senderId !== me.id &&
+        m.status !== 'read'
     );
     if (unreadFromPeer.length === 0) return;
 
@@ -404,12 +412,73 @@ export default function App() {
     );
   }, []);
 
-  // Clean up any active or pending call & record call history
+  // Simpan gelembung Log Riwayat Panggilan otomatis ke ruang chat kontak & IndexedDB
+  const appendCallLogToChat = useCallback(
+    (record: CallRecord) => {
+      const me = profileRef.current;
+      if (!me) return;
+
+      if (!contactsRef.current.some((c) => c.id === record.peerId)) {
+        upsertContact({
+          id: record.peerId,
+          name: record.peerName || `Teman ${record.peerId}`,
+          bio: 'Ada',
+          avatar: record.peerAvatar || '',
+          addedAt: Date.now(),
+        });
+      }
+
+      const isVideo = record.callType === 'video';
+      const isMissedOrRejected = record.status === 'missed' || record.status === 'rejected';
+      const label = isMissedOrRejected
+        ? isVideo
+          ? 'Panggilan video tak terjawab'
+          : 'Panggilan suara tak terjawab'
+        : record.direction === 'outgoing'
+        ? isVideo
+          ? 'Panggilan video keluar'
+          : 'Panggilan suara keluar'
+        : isVideo
+        ? 'Panggilan video masuk'
+        : 'Panggilan suara masuk';
+
+      const callLogMsg: ChatMessage = {
+        id: `calllog-${record.id}`,
+        chatId: record.peerId,
+        senderId: record.direction === 'outgoing' ? me.id : record.peerId,
+        senderName: record.direction === 'outgoing' ? me.name : record.peerName,
+        type: 'call_log',
+        text: label,
+        timestamp: record.timestamp,
+        status: 'read',
+        callLog: {
+          callId: record.id,
+          callType: record.callType,
+          direction: record.direction,
+          status: record.status,
+          duration: record.duration,
+        },
+      };
+
+      setMessages((prev) => {
+        if (prev.some((m) => m.id === callLogMsg.id)) return prev;
+        return [...prev, callLogMsg];
+      });
+      void dbSaveMessage(callLogMsg);
+    },
+    [upsertContact]
+  );
+
+  // Clean up any active or pending call & record call history + chat call log bubble
   const finalizeCall = useCallback(
     (statusOverride?: 'answered' | 'missed' | 'rejected') => {
       if (wakeRingtoneTimerRef.current !== null) {
         window.clearTimeout(wakeRingtoneTimerRef.current);
         wakeRingtoneTimerRef.current = null;
+      }
+      if (unansweredCallTimerRef.current !== null) {
+        window.clearTimeout(unansweredCallTimerRef.current);
+        unansweredCallTimerRef.current = null;
       }
       stopRingtone();
       if (callTimerRef.current !== null) {
@@ -449,6 +518,7 @@ export default function App() {
           };
           setCalls((prev) => (prev.some((c) => c.id === record.id) ? prev : [record, ...prev]));
           void dbSaveCall(record);
+          appendCallLogToChat(record);
         }
         return;
       }
@@ -479,10 +549,11 @@ export default function App() {
         timestamp: rt.startedAt,
         duration,
       };
-      setCalls((prev) => [record, ...prev]);
+      setCalls((prev) => (prev.some((c) => c.id === record.id) ? prev : [record, ...prev]));
       void dbSaveCall(record);
+      appendCallLogToChat(record);
     },
-    []
+    [appendCallLogToChat]
   );
 
   // Tampilkan pop-up panggilan masuk untuk pendingCall (misal saat kembali dari latar belakang / klik notifikasi)
@@ -524,6 +595,10 @@ export default function App() {
     (callId: string, mediaCall: MediaConnection) => {
       mediaCall.on('stream', (remoteStream) => {
         if (callRuntimeRef.current?.callId !== callId) return;
+        if (unansweredCallTimerRef.current !== null) {
+          window.clearTimeout(unansweredCallTimerRef.current);
+          unansweredCallTimerRef.current = null;
+        }
         stopRingtone();
         if (!callRuntimeRef.current.connectedAt) {
           callRuntimeRef.current.connectedAt = Date.now();
@@ -1057,6 +1132,19 @@ export default function App() {
       });
 
       startIncomingRingtone();
+      if (unansweredCallTimerRef.current !== null) {
+        window.clearTimeout(unansweredCallTimerRef.current);
+      }
+      // Jika penerima tidak mengangkat dalam 30 detik, akhiri sebagai Panggilan tak terjawab
+      unansweredCallTimerRef.current = window.setTimeout(() => {
+        unansweredCallTimerRef.current = null;
+        if (
+          callRuntimeRef.current?.callId === callId &&
+          !callRuntimeRef.current.connectedAt
+        ) {
+          finalizeCall('missed');
+        }
+      }, 30000);
       showIncomingWebNotification({
         title: 'Panggilan Masuk - WattappsAU',
         body: `${callerName} (${callType === 'video' ? 'Video' : 'Suara'}) · Ketuk untuk menjawab panggilan...`,
@@ -2313,6 +2401,28 @@ export default function App() {
 
       startOutgoingRingback();
       bindOutgoingMediaCall(callId, mediaCall);
+
+      if (unansweredCallTimerRef.current !== null) {
+        window.clearTimeout(unansweredCallTimerRef.current);
+      }
+      // Jika lawan bicara tidak mengangkat dalam 30 detik, tandai sebagai Panggilan tak terjawab
+      unansweredCallTimerRef.current = window.setTimeout(() => {
+        unansweredCallTimerRef.current = null;
+        const currentRt = callRuntimeRef.current;
+        if (currentRt && currentRt.callId === callId && !currentRt.connectedAt) {
+          peerManagerRef.current?.sendPacket(peerId, {
+            kind: 'CALL_SIGNAL',
+            action: 'end',
+            callId,
+            callType,
+            fromId: profile.id,
+            fromName: profile.name,
+            fromAvatar: profile.avatar,
+          });
+          showToast(`${peerName} tidak menjawab panggilan`);
+          finalizeCall('missed');
+        }
+      }, 30000);
     } catch {
       resumeKeepAliveAfterCall();
       showToast(
@@ -2334,6 +2444,10 @@ export default function App() {
     if (wakeRingtoneTimerRef.current !== null) {
       window.clearTimeout(wakeRingtoneTimerRef.current);
       wakeRingtoneTimerRef.current = null;
+    }
+    if (unansweredCallTimerRef.current !== null) {
+      window.clearTimeout(unansweredCallTimerRef.current);
+      unansweredCallTimerRef.current = null;
     }
 
     // Kasus 1: MediaConnection sudah masuk secara normal

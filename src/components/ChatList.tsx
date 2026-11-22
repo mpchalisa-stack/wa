@@ -10,6 +10,8 @@ import {
   MessageSquarePlus,
   Mic,
   Ban,
+  Phone,
+  Video,
 } from 'lucide-react';
 import { ChatMessage, Contact } from '../types';
 import { formatChatListTime, formatSixDigitId } from '../lib/media';
@@ -91,7 +93,7 @@ export const ChatList: React.FC<ChatListProps> = ({
 
     return (
       <div className="flex items-center gap-1 min-w-0 text-[13px] text-[#667781] dark:text-[#8696A0]">
-        {isMine && !last.deleted && (
+        {isMine && !last.deleted && last.type !== 'call_log' && (
           <span className="shrink-0 flex items-center">
             {last.status === 'read' ? (
               <CheckCheck className="w-4 h-4 text-[#53BDEB]" />
@@ -111,6 +113,31 @@ export const ChatList: React.FC<ChatListProps> = ({
           <span className="inline-flex items-center gap-1 italic truncate">
             <Ban className="w-3.5 h-3.5 shrink-0" />
             Pesan ini telah dihapus
+          </span>
+        ) : last.type === 'call_log' && last.callLog ? (
+          <span className="inline-flex items-center gap-1.5 truncate">
+            {last.callLog.callType === 'video' ? (
+              <Video
+                className={`w-3.5 h-3.5 shrink-0 ${
+                  last.callLog.status === 'missed' || last.callLog.status === 'rejected'
+                    ? 'text-rose-500'
+                    : last.callLog.direction === 'outgoing'
+                    ? 'text-[#00A884]'
+                    : 'text-[#38bdf8]'
+                }`}
+              />
+            ) : (
+              <Phone
+                className={`w-3.5 h-3.5 shrink-0 ${
+                  last.callLog.status === 'missed' || last.callLog.status === 'rejected'
+                    ? 'text-rose-500'
+                    : last.callLog.direction === 'outgoing'
+                    ? 'text-[#00A884]'
+                    : 'text-[#38bdf8]'
+                }`}
+              />
+            )}
+            <span className="truncate">{last.text || 'Panggilan'}</span>
           </span>
         ) : last.type === 'image' ? (
           <span className="inline-flex items-center gap-1 truncate">
