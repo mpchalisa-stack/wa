@@ -173,11 +173,11 @@ export const CallOverlay: React.FC<CallOverlayProps> = ({
                 type="button"
                 onClick={onAccept}
                 className="w-16 h-16 rounded-full bg-[#25D366] hover:bg-[#1FD060] text-white shadow-xl flex items-center justify-center active:scale-95 transition-transform cursor-pointer"
-                aria-label="Terima panggilan"
+                aria-label="Angkat panggilan"
               >
                 {isVideo ? <Video className="w-7 h-7" /> : <Phone className="w-7 h-7" />}
               </button>
-              <span className="text-xs font-medium text-white/80">Terima</span>
+              <span className="text-xs font-medium text-white/80">Angkat</span>
             </div>
           </div>
         ) : (

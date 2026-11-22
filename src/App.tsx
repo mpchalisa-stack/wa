@@ -169,6 +169,22 @@ export default function App() {
     }
     return null;
   });
+  const [pendingNotificationTargetUrl, setPendingNotificationTargetUrl] = useState<string | null>(
+    () => {
+      if (typeof window === 'undefined') return null;
+      try {
+        const params = new URLSearchParams(window.location.search);
+        const targetId = params.get('targetId')?.trim();
+        const action = params.get('action')?.trim();
+        if (targetId || action === 'call' || action === 'chat') {
+          return window.location.search;
+        }
+      } catch {
+        // ignore
+      }
+      return null;
+    }
+  );
   const [cameraPurpose, setCameraPurpose] = useState<'chat' | 'status' | null>(null);
   const [lightboxMedia, setLightboxMedia] = useState<LightboxMedia | null>(null);
   const [toast, setToast] = useState<string | null>(null);
@@ -1631,69 +1647,124 @@ export default function App() {
     };
   }, [profile?.id, wakeAndSyncPeer]);
 
-  // Dengarkan pesan NOTIFICATION_CLICKED dari Service Worker (public/sw.js) untuk buka ruang chat / modal panggilan
-  useEffect(() => {
-    if (typeof navigator === 'undefined' || !('serviceWorker' in navigator)) return;
+  // Buka ruang chat targetId & tampilkan modal Panggilan Masuk (Angkat/Tolak) dari URL parameter atau postMessage SW
+  const applyNotificationTarget = useCallback(
+    (targetUrl?: string, extraData?: NotificationClickData) => {
+      let params: URLSearchParams;
+      try {
+        if (targetUrl) {
+          const parsed = targetUrl.startsWith('?')
+            ? new URL(`/${targetUrl}`, window.location.origin)
+            : new URL(targetUrl, window.location.origin);
+          params = new URLSearchParams(parsed.search);
+        } else {
+          params = new URLSearchParams(window.location.search);
+        }
+      } catch {
+        params = new URLSearchParams(window.location.search);
+      }
 
-    const handleSwMessage = (event: MessageEvent) => {
-      const payload = event.data as
-        | { type?: string; data?: NotificationClickData }
-        | undefined;
-      if (!payload || payload.type !== 'NOTIFICATION_CLICKED') return;
-
-      const data = payload.data;
+      const targetId =
+        params.get('targetId')?.trim() ||
+        extraData?.chatId?.trim() ||
+        extraData?.fromId?.trim() ||
+        '';
+      const action =
+        params.get('action')?.trim() ||
+        (extraData?.kind === 'call' ? 'call' : targetId ? 'chat' : '');
+      const callTypeParam = params.get('callType')?.trim() || extraData?.callType;
+      const callIdParam = params.get('callId')?.trim() || extraData?.callId;
+      const nameParam = params.get('name')?.trim() || extraData?.fromName;
 
       setShowMainMenu(false);
       setShowProfileDrawer(false);
       setShowShareAppModal(false);
       setLightboxMedia(null);
 
-      if (data?.kind === 'call') {
-        if (!callRuntimeRef.current) {
-          if (pendingCallRef.current) {
-            presentPendingCallModal(pendingCallRef.current);
-          } else if (data.fromId) {
-            const existingContact = contactsRef.current.find((c) => c.id === data.fromId);
-            const pending: PendingIncomingCall = {
-              callId: data.callId || generateUid('call'),
-              peerId: data.fromId,
-              peerName: existingContact?.name || data.fromName || `ID ${data.fromId}`,
-              peerAvatar: existingContact?.avatar || '',
-              callType: data.callType === 'video' ? 'video' : 'audio',
-              receivedAt: Date.now(),
-            };
-            pendingCallRef.current = pending;
-            presentPendingCallModal(pending);
-          }
-        }
-        void wakeAndSyncPeer();
-        return;
-      }
-
-      const targetChatId = data?.chatId || data?.fromId;
-      if (targetChatId) {
-        if (data?.fromId && !contactsRef.current.some((c) => c.id === targetChatId)) {
+      // (a) Langsung pilih dan buka ruang chat milik targetId tersebut
+      if (targetId && targetId !== profileRef.current?.id) {
+        if (!contactsRef.current.some((c) => c.id === targetId)) {
           upsertContact({
-            id: targetChatId,
-            name: data.fromName || `Teman ${targetChatId}`,
+            id: targetId,
+            name: nameParam || `Teman ${targetId}`,
             bio: 'Ada',
             avatar: '',
             addedAt: Date.now(),
           });
         }
         setActiveTab('chats');
-        setActiveChatId(targetChatId);
-        activeChatIdRef.current = targetChatId;
+        setActiveChatId(targetId);
+        activeChatIdRef.current = targetId;
+      }
+
+      // (b) Jika action === 'call', langsung tampilkan layar modal Panggilan Masuk (Angkat & Tolak)
+      if (action === 'call') {
+        if (!callRuntimeRef.current) {
+          if (pendingCallRef.current && (!targetId || pendingCallRef.current.peerId === targetId)) {
+            presentPendingCallModal(pendingCallRef.current);
+          } else if (targetId) {
+            const existingContact = contactsRef.current.find((c) => c.id === targetId);
+            const pending: PendingIncomingCall = {
+              callId: callIdParam || generateUid('call'),
+              peerId: targetId,
+              peerName: existingContact?.name || nameParam || `ID ${targetId}`,
+              peerAvatar: existingContact?.avatar || '',
+              callType: callTypeParam === 'video' ? 'video' : 'audio',
+              receivedAt: Date.now(),
+            };
+            pendingCallRef.current = pending;
+            presentPendingCallModal(pending);
+          }
+        }
+      }
+
+      // Bersihkan query parameter dari URL agar tidak terpicu ulang saat reload
+      try {
+        if (window.location.search || window.location.pathname !== '/') {
+          window.history.replaceState({}, '', '/');
+        }
+      } catch {
+        // ignore
       }
 
       void wakeAndSyncPeer();
+    },
+    [wakeAndSyncPeer, presentPendingCallModal, upsertContact]
+  );
+
+  // Tangkap parameter ?targetId=...&action=... saat aplikasi baru dimuat (misal dibuka dari clients.openWindow)
+  useEffect(() => {
+    if (!profile || !dataLoaded || !pendingNotificationTargetUrl) return;
+    const urlToOpen = pendingNotificationTargetUrl;
+    setPendingNotificationTargetUrl(null);
+    applyNotificationTarget(urlToOpen);
+  }, [profile, dataLoaded, pendingNotificationTargetUrl, applyNotificationTarget]);
+
+  // Dengarkan pesan OPEN_TARGET (dan NOTIFICATION_CLICKED) dari Service Worker (public/sw.js)
+  useEffect(() => {
+    if (typeof navigator === 'undefined' || !('serviceWorker' in navigator)) return;
+
+    const handleSwMessage = (event: MessageEvent) => {
+      const payload = event.data as
+        | { type?: string; url?: string; data?: NotificationClickData }
+        | undefined;
+      if (!payload) return;
+
+      if (payload.type === 'OPEN_TARGET') {
+        applyNotificationTarget(payload.url, payload.data);
+        return;
+      }
+
+      if (payload.type === 'NOTIFICATION_CLICKED') {
+        applyNotificationTarget(payload.data?.url, payload.data);
+      }
     };
 
     navigator.serviceWorker.addEventListener('message', handleSwMessage);
     return () => {
       navigator.serviceWorker.removeEventListener('message', handleSwMessage);
     };
-  }, [wakeAndSyncPeer, presentPendingCallModal, upsertContact]);
+  }, [applyNotificationTarget]);
 
   // Whenever user opens a chat room, clear unread badge & send READ_ACK
   useEffect(() => {

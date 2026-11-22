@@ -375,11 +375,34 @@ export async function disableStandbyMode(): Promise<void> {
 
 export interface NotificationClickData {
   kind: 'message' | 'call';
+  url?: string;
   chatId?: string;
   fromId?: string;
   fromName?: string;
   callId?: string;
   callType?: 'audio' | 'video';
+}
+
+export function buildNotificationUrl(options: {
+  senderId?: string;
+  eventType: 'call' | 'chat';
+  callType?: 'audio' | 'video';
+  callId?: string;
+  fromName?: string;
+}): string {
+  const senderId = options.senderId?.trim();
+  if (!senderId) return '/';
+  let url = `/?targetId=${encodeURIComponent(senderId)}&action=${encodeURIComponent(options.eventType)}`;
+  if (options.callType) {
+    url += `&callType=${encodeURIComponent(options.callType)}`;
+  }
+  if (options.callId) {
+    url += `&callId=${encodeURIComponent(options.callId)}`;
+  }
+  if (options.fromName) {
+    url += `&name=${encodeURIComponent(options.fromName)}`;
+  }
+  return url;
 }
 
 export function showIncomingWebNotification(options: {
@@ -408,6 +431,24 @@ export function showIncomingWebNotification(options: {
     ? options.body || 'Ketuk untuk menjawab panggilan...'
     : options.body;
 
+  const senderId = options.data?.chatId || options.data?.fromId || '';
+  const eventType: 'call' | 'chat' =
+    options.isCall || options.data?.kind === 'call' ? 'call' : 'chat';
+  const targetUrl =
+    options.data?.url ||
+    buildNotificationUrl({
+      senderId,
+      eventType,
+      callType: options.data?.callType,
+      callId: options.data?.callId,
+      fromName: options.data?.fromName,
+    });
+
+  const enrichedData: NotificationClickData = {
+    ...(options.data || { kind: eventType === 'call' ? 'call' : 'message' }),
+    url: targetUrl,
+  };
+
   const showWindowNotificationFallback = () => {
     try {
       const notif = new Notification(notifTitle, {
@@ -417,7 +458,7 @@ export function showIncomingWebNotification(options: {
         tag: options.tag,
         requireInteraction: Boolean(options.isCall),
         silent: false,
-        data: options.data,
+        data: enrichedData,
       });
 
       notif.onclick = () => {
@@ -434,7 +475,8 @@ export function showIncomingWebNotification(options: {
     }
   };
 
-  // Utamakan Service Worker showNotification agar event notificationclick di sw.js selalu berjalan di Android & PWA
+  // Utamakan Service Worker showNotification dengan data: { url: '/?targetId=...&action=...' }
+  // agar event notificationclick di sw.js selalu memfokuskan/membuka aplikasi di Android & PWA
   if ('serviceWorker' in navigator) {
     navigator.serviceWorker
       .getRegistration()
@@ -447,11 +489,20 @@ export function showIncomingWebNotification(options: {
             tag: options.tag,
             requireInteraction: Boolean(options.isCall),
             silent: false,
-            data: options.data,
+            data: enrichedData,
           });
         }
-        showWindowNotificationFallback();
-        return undefined;
+        return navigator.serviceWorker.ready.then((readyReg) =>
+          readyReg.showNotification(notifTitle, {
+            body: notifBody,
+            icon: '/icon-512.png',
+            badge: '/icon-512.png',
+            tag: options.tag,
+            requireInteraction: Boolean(options.isCall),
+            silent: false,
+            data: enrichedData,
+          })
+        );
       })
       .catch(() => {
         showWindowNotificationFallback();
