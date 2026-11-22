@@ -33,6 +33,7 @@ export interface ActiveCallUIState {
 
 interface CallOverlayProps {
   call: ActiveCallUIState;
+  forceFullscreenTick?: number;
   onAccept: () => void;
   onReject: () => void;
   onEnd: () => void;
@@ -44,6 +45,7 @@ interface CallOverlayProps {
 
 export const CallOverlay: React.FC<CallOverlayProps> = ({
   call,
+  forceFullscreenTick = 0,
   onAccept,
   onReject,
   onEnd,
@@ -59,13 +61,11 @@ export const CallOverlay: React.FC<CallOverlayProps> = ({
   const [minimizedBanner, setMinimizedBanner] = useState(false);
   const [logoImgFailed, setLogoImgFailed] = useState(false);
 
-  // Reset animasi getar & mode banner setiap kali panggilan baru masuk atau fase berubah
+  // Reset animasi getar & paksa layar penuh setiap kali panggilan masuk baru / dipicu notifikasi
   useEffect(() => {
     setShakeStopped(false);
-    if (call.phase !== 'incoming') {
-      setMinimizedBanner(false);
-    }
-  }, [call.callId, call.phase]);
+    setMinimizedBanner(false);
+  }, [call.callId, call.phase, forceFullscreenTick]);
 
   useEffect(() => {
     if (remoteVideoRef.current && call.remoteStream) {
@@ -133,7 +133,7 @@ export const CallOverlay: React.FC<CallOverlayProps> = ({
               className="relative z-10 w-10 h-10 rounded-full overflow-hidden shadow-md ring-2 ring-[#38bdf8]/70"
               style={
                 isIncomingRinging
-                  ? { animation: 'wa-ring-shake 1.1s infinite ease-in-out' }
+                  ? { animation: 'wa-ring-shake 0.9s infinite ease-in-out' }
                   : undefined
               }
             >
@@ -152,7 +152,7 @@ export const CallOverlay: React.FC<CallOverlayProps> = ({
 
           <div className="min-w-0 flex-1">
             <div
-              className="text-[11px] font-semibold text-[#38bdf8] truncate"
+              className="text-[11px] font-semibold text-cyan-400 truncate"
               style={
                 isIncomingRinging
                   ? { animation: 'wa-text-pulse 1.2s infinite ease-in-out' }
@@ -162,7 +162,7 @@ export const CallOverlay: React.FC<CallOverlayProps> = ({
               {isVideo ? 'Panggilan Video Masuk...' : 'Panggilan Suara Masuk...'}
             </div>
             <div
-              className="text-sm font-bold truncate"
+              className="text-sm font-bold text-white truncate"
               style={
                 isIncomingRinging
                   ? { animation: 'wa-text-pulse 1.2s infinite ease-in-out' }
@@ -171,8 +171,8 @@ export const CallOverlay: React.FC<CallOverlayProps> = ({
             >
               {call.peerName}
             </div>
-            <div className="text-[11px] font-mono-id text-white/65 truncate">
-              ID {formatSixDigitId(call.peerId)}
+            <div className="text-[11px] font-mono text-cyan-400 truncate">
+              ID: {formatSixDigitId(call.peerId)}
             </div>
           </div>
 
@@ -207,7 +207,7 @@ export const CallOverlay: React.FC<CallOverlayProps> = ({
   }
 
   return (
-    <div className="fixed inset-0 z-[130] bg-[#0B141A] text-white flex flex-col justify-between overflow-hidden select-none">
+    <div className="fixed inset-0 z-[150] bg-[#0B141A] text-white flex flex-col justify-between overflow-hidden select-none">
       {/* Remote Audio Element (always active for voice/video audio playback) */}
       <audio ref={remoteAudioRef} autoPlay playsInline className="hidden" />
 
@@ -245,130 +245,145 @@ export const CallOverlay: React.FC<CallOverlayProps> = ({
         </button>
       )}
 
-      {/* Top Caller Info */}
-      <div className="relative z-10 pt-10 pt-safe px-6 flex flex-col items-center text-center">
-        <div
-          className="text-xs font-semibold text-[#38bdf8] tracking-wide mb-1"
-          style={
-            isIncomingRinging
-              ? { animation: 'wa-text-pulse 1.2s infinite ease-in-out' }
-              : undefined
-          }
-        >
-          {call.phase === 'incoming'
-            ? isVideo
-              ? 'Panggilan Video Masuk...'
-              : 'Panggilan Suara Masuk...'
-            : call.phase === 'outgoing'
-            ? 'Memanggil...'
-            : isVideo
-            ? 'Panggilan Video Terenkripsi P2P'
-            : 'Panggilan Suara Terenkripsi P2P'}
-        </div>
+      {call.phase === 'incoming' ? (
+        /* Modal Panggilan Masuk: Logo WattappsAU Bergetar + Radar Cyan di Tengah Atas, diikuti Nama & ID 6 Digit */
+        <div className="relative z-10 flex-1 flex flex-col items-center justify-center px-6 pt-12 pt-safe text-center">
+          <div className="relative w-36 h-36 flex items-center justify-center mb-7">
+            {/* Lingkaran Gelombang Radar Cyan (wa-radar-pulse) di Belakang Logo */}
+            {isIncomingRinging && (
+              <>
+                <span
+                  className="pointer-events-none absolute inset-2 rounded-full border-2 border-cyan-400 bg-cyan-400/20 shadow-[0_0_28px_rgba(34,211,238,0.4)]"
+                  style={{ animation: 'wa-radar-pulse 1.5s infinite ease-out' }}
+                />
+                <span
+                  className="pointer-events-none absolute inset-2 rounded-full border-2 border-[#25D366] bg-[#25D366]/15 shadow-[0_0_24px_rgba(37,211,102,0.3)]"
+                  style={{
+                    animation: 'wa-radar-pulse 1.5s infinite ease-out',
+                    animationDelay: '0.75s',
+                  }}
+                />
+              </>
+            )}
 
-        <h2
-          className="text-2xl sm:text-3xl font-bold tracking-tight"
-          style={
-            isIncomingRinging
-              ? { animation: 'wa-text-pulse 1.2s infinite ease-in-out' }
-              : undefined
-          }
-        >
-          {call.peerName}
-        </h2>
-        <div className="mt-1 font-mono-id text-sm text-white/75">
-          {call.phase === 'connected'
-            ? formatDuration(call.duration)
-            : `ID ${formatSixDigitId(call.peerId)}`}
-        </div>
-      </div>
-
-      {/* Center Visual: Shaking WattappsAU Logo (96x96 / w-24 h-24) + Dual Cyan/Green Radar Waves for Incoming Call */}
-      {!showRemoteVideo && (
-        <div className="relative z-10 flex flex-col items-center justify-center my-auto px-6">
-          {call.phase === 'incoming' ? (
-            <div className="flex flex-col items-center gap-6">
-              <div className="relative w-32 h-32 flex items-center justify-center">
-                {/* 2 Lingkaran Gelombang Radar Cyan & Hijau di Belakang Logo */}
-                {isIncomingRinging && (
-                  <>
-                    <span
-                      className="pointer-events-none absolute inset-2 rounded-full border-2 border-[#38bdf8] bg-[#38bdf8]/20 shadow-[0_0_24px_rgba(56,189,248,0.35)]"
-                      style={{ animation: 'wa-radar-pulse 1.5s infinite ease-out' }}
-                    />
-                    <span
-                      className="pointer-events-none absolute inset-2 rounded-full border-2 border-[#25D366] bg-[#25D366]/15 shadow-[0_0_24px_rgba(37,211,102,0.3)]"
-                      style={{
-                        animation: 'wa-radar-pulse 1.5s infinite ease-out',
-                        animationDelay: '0.75s',
-                      }}
-                    />
-                  </>
-                )}
-
-                {/* Logo WattappsAU (/icon-512.png, w-24 h-24) Bergetar Kencang Kiri-Kanan */}
-                {logoImgFailed ? (
-                  <div
-                    className="relative z-10 rounded-full ring-2 ring-[#38bdf8]/75 shadow-[0_0_32px_rgba(56,189,248,0.4)]"
-                    style={
-                      isIncomingRinging
-                        ? { animation: 'wa-ring-shake 1.1s infinite ease-in-out' }
-                        : undefined
-                    }
-                  >
-                    <AppLogo size={96} />
-                  </div>
-                ) : (
-                  <img
-                    src="/icon-512.png"
-                    alt="WattappsAU"
-                    onError={() => setLogoImgFailed(true)}
-                    className="relative z-10 w-24 h-24 rounded-full object-cover ring-2 ring-[#38bdf8]/75 shadow-[0_0_32px_rgba(56,189,248,0.4)]"
-                    style={
-                      isIncomingRinging
-                        ? { animation: 'wa-ring-shake 1.1s infinite ease-in-out' }
-                        : undefined
-                    }
-                  />
-                )}
-              </div>
-
-              {/* Avatar & Identitas Penelpon Berdenyut di Bawah Logo */}
+            {/* Logo WattappsAU (/icon-512.png) Bergetar Kencang Kiri-Kanan (0.9s) */}
+            {logoImgFailed ? (
               <div
-                className="inline-flex items-center gap-2.5 px-4 py-1.5 rounded-full bg-white/10 border border-white/15 backdrop-blur-xs"
+                className="relative z-10 rounded-full ring-2 ring-cyan-400/80 shadow-[0_0_36px_rgba(34,211,238,0.45)]"
                 style={
                   isIncomingRinging
-                    ? { animation: 'wa-text-pulse 1.2s infinite ease-in-out' }
+                    ? { animation: 'wa-ring-shake 0.9s infinite ease-in-out' }
                     : undefined
                 }
               >
-                <div
-                  style={
-                    isIncomingRinging
-                      ? { animation: 'wa-ring-shake 1.1s infinite ease-in-out' }
-                      : undefined
-                  }
-                >
-                  <Avatar src={call.peerAvatar} name={call.peerName} size="sm" />
-                </div>
-                <span className="text-xs font-medium text-white/90">
-                  {isIncomingRinging
-                    ? `${call.peerName} memanggil...`
-                    : 'Menghubungkan...'}
-                </span>
+                <AppLogo size={96} />
               </div>
+            ) : (
+              <img
+                src="/icon-512.png"
+                alt="WattappsAU"
+                onError={() => setLogoImgFailed(true)}
+                className="relative z-10 w-24 h-24 rounded-full object-cover ring-2 ring-cyan-400/80 shadow-[0_0_36px_rgba(34,211,238,0.45)]"
+                style={
+                  isIncomingRinging
+                    ? { animation: 'wa-ring-shake 0.9s infinite ease-in-out' }
+                    : undefined
+                }
+              />
+            )}
+          </div>
+
+          <div
+            className="text-xs font-semibold uppercase tracking-widest text-cyan-300/90 mb-2"
+            style={
+              isIncomingRinging
+                ? { animation: 'wa-text-pulse 1.2s infinite ease-in-out' }
+                : undefined
+            }
+          >
+            {isVideo ? 'Panggilan Video Masuk...' : 'Panggilan Suara Masuk...'}
+          </div>
+
+          <h2
+            className="text-2xl sm:text-3xl font-bold text-white tracking-tight max-w-full truncate px-2"
+            style={
+              isIncomingRinging
+                ? { animation: 'wa-text-pulse 1.2s infinite ease-in-out' }
+                : undefined
+            }
+          >
+            {call.peerName}
+          </h2>
+
+          <div
+            className="mt-2 text-cyan-400 font-mono text-base font-semibold tracking-wider"
+            style={
+              isIncomingRinging
+                ? { animation: 'wa-text-pulse 1.2s infinite ease-in-out' }
+                : undefined
+            }
+          >
+            ID: {formatSixDigitId(call.peerId)}
+          </div>
+
+          {/* Chip Status Penelepon + Avatar Bergetar */}
+          <div
+            className="mt-6 inline-flex items-center gap-2.5 px-4 py-1.5 rounded-full bg-white/10 border border-white/15 backdrop-blur-xs"
+            style={
+              isIncomingRinging
+                ? { animation: 'wa-text-pulse 1.2s infinite ease-in-out' }
+                : undefined
+            }
+          >
+            <div
+              style={
+                isIncomingRinging
+                  ? { animation: 'wa-ring-shake 0.9s infinite ease-in-out' }
+                  : undefined
+              }
+            >
+              <Avatar src={call.peerAvatar} name={call.peerName} size="sm" />
             </div>
-          ) : (
-            <div className="relative">
-              {call.phase !== 'connected' && (
-                <span className="absolute -inset-4 rounded-full border-2 border-[#25D366]/40 animate-ping" />
-              )}
-              <div className="ring-4 ring-[#00A884]/40 rounded-full">
-                <Avatar src={call.peerAvatar} name={call.peerName} size="2xl" />
+            <span className="text-xs font-medium text-white/90">
+              {isIncomingRinging ? 'Saluran P2P Terenkripsi · Berdering...' : 'Menghubungkan...'}
+            </span>
+          </div>
+        </div>
+      ) : (
+        <>
+          {/* Top Caller Info (Outgoing / Connected) */}
+          <div className="relative z-10 pt-10 pt-safe px-6 flex flex-col items-center text-center">
+            <div className="text-xs font-semibold text-cyan-400 tracking-wide mb-1">
+              {call.phase === 'outgoing'
+                ? 'Memanggil...'
+                : isVideo
+                ? 'Panggilan Video Terenkripsi P2P'
+                : 'Panggilan Suara Terenkripsi P2P'}
+            </div>
+
+            <h2 className="text-2xl sm:text-3xl font-bold text-white tracking-tight">
+              {call.peerName}
+            </h2>
+            <div className="mt-1 font-mono text-sm text-cyan-400/90">
+              {call.phase === 'connected'
+                ? formatDuration(call.duration)
+                : `ID: ${formatSixDigitId(call.peerId)}`}
+            </div>
+          </div>
+
+          {!showRemoteVideo && (
+            <div className="relative z-10 flex flex-col items-center justify-center my-auto px-6">
+              <div className="relative">
+                {call.phase !== 'connected' && (
+                  <span className="absolute -inset-4 rounded-full border-2 border-[#25D366]/40 animate-ping" />
+                )}
+                <div className="ring-4 ring-[#00A884]/40 rounded-full">
+                  <Avatar src={call.peerAvatar} name={call.peerName} size="2xl" />
+                </div>
               </div>
             </div>
           )}
-        </div>
+        </>
       )}
 
       {/* Local PiP Self Video (Corner Overlay) */}

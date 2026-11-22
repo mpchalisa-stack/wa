@@ -480,12 +480,16 @@ export async function disableStandbyMode(): Promise<void> {
 
 export interface NotificationClickData {
   kind: 'message' | 'call';
+  action?: 'ANSWER_CALL' | 'OPEN_CHAT';
   url?: string;
   chatId?: string;
   fromId?: string;
   fromName?: string;
+  callerId?: string;
+  callerName?: string;
   callId?: string;
   callType?: 'audio' | 'video';
+  isVideo?: boolean;
 }
 
 export function buildNotificationUrl(options: {
@@ -497,18 +501,28 @@ export function buildNotificationUrl(options: {
 }): string {
   const senderId = options.senderId?.trim();
   if (!senderId) return '/';
-  let url = `/?targetId=${encodeURIComponent(senderId)}&action=${encodeURIComponent(options.eventType)}`;
-  if (options.callType) {
-    url += `&callType=${encodeURIComponent(options.callType)}`;
+  if (options.eventType === 'call') {
+    const callerName = options.fromName?.trim() || `ID: ${senderId}`;
+    let url = `/?incomingCall=${encodeURIComponent(senderId)}&callerName=${encodeURIComponent(callerName)}`;
+    if (options.callType) {
+      url += `&callType=${encodeURIComponent(options.callType)}`;
+    }
+    if (options.callId) {
+      url += `&callId=${encodeURIComponent(options.callId)}`;
+    }
+    return url;
   }
-  if (options.callId) {
-    url += `&callId=${encodeURIComponent(options.callId)}`;
-  }
+
+  let url = `/?targetId=${encodeURIComponent(senderId)}&action=chat`;
   if (options.fromName) {
     url += `&name=${encodeURIComponent(options.fromName)}`;
   }
   return url;
 }
+
+type ExtendedNotificationOptions = NotificationOptions & {
+  renotify?: boolean;
+};
 
 export function showIncomingWebNotification(options: {
   title: string;
@@ -531,14 +545,21 @@ export function showIncomingWebNotification(options: {
 
   if (!shouldNotify) return;
 
-  const notifTitle = options.isCall ? 'Panggilan Masuk - WattappsAU' : options.title;
-  const notifBody = options.isCall
-    ? options.body || 'Ketuk untuk menjawab panggilan...'
-    : options.body;
+  const isCall = Boolean(options.isCall || options.data?.kind === 'call');
+  const senderId =
+    options.data?.callerId || options.data?.chatId || options.data?.fromId || '';
+  const callerName =
+    options.data?.callerName ||
+    options.data?.fromName ||
+    (senderId ? `ID: ${senderId}` : 'Penelepon');
 
-  const senderId = options.data?.chatId || options.data?.fromId || '';
-  const eventType: 'call' | 'chat' =
-    options.isCall || options.data?.kind === 'call' ? 'call' : 'chat';
+  const notifTitle = isCall ? `Panggilan Masuk — ${callerName}` : options.title;
+  const notifBody = isCall
+    ? options.body || `ID: ${senderId} • Ketuk untuk menjawab`
+    : options.body;
+  const notifTag = isCall ? 'wattappsau-call' : options.tag;
+
+  const eventType: 'call' | 'chat' = isCall ? 'call' : 'chat';
   const targetUrl =
     options.data?.url ||
     buildNotificationUrl({
@@ -546,25 +567,31 @@ export function showIncomingWebNotification(options: {
       eventType,
       callType: options.data?.callType,
       callId: options.data?.callId,
-      fromName: options.data?.fromName,
+      fromName: callerName,
     });
 
   const enrichedData: NotificationClickData = {
-    ...(options.data || { kind: eventType === 'call' ? 'call' : 'message' }),
+    ...(options.data || { kind: isCall ? 'call' : 'message' }),
+    action: isCall ? 'ANSWER_CALL' : 'OPEN_CHAT',
+    callerId: senderId,
+    callerName,
     url: targetUrl,
+  };
+
+  const notifOptions: ExtendedNotificationOptions = {
+    body: notifBody,
+    icon: '/icon-512.png',
+    badge: '/icon-512.png',
+    tag: notifTag,
+    renotify: isCall,
+    requireInteraction: isCall,
+    silent: false,
+    data: enrichedData,
   };
 
   const showWindowNotificationFallback = () => {
     try {
-      const notif = new Notification(notifTitle, {
-        body: notifBody,
-        icon: '/icon-512.png',
-        badge: '/icon-512.png',
-        tag: options.tag,
-        requireInteraction: Boolean(options.isCall),
-        silent: false,
-        data: enrichedData,
-      });
+      const notif = new Notification(notifTitle, notifOptions);
 
       notif.onclick = () => {
         try {
@@ -580,33 +607,17 @@ export function showIncomingWebNotification(options: {
     }
   };
 
-  // Utamakan Service Worker showNotification dengan data: { url: '/?targetId=...&action=...' }
-  // agar event notificationclick di sw.js selalu memfokuskan/membuka aplikasi di Android & PWA
+  // Utamakan Service Worker reg.showNotification agar event notificationclick di sw.js
+  // selalu memfokuskan jendela dan mengirim TRIGGER_INCOMING_CALL_UI
   if ('serviceWorker' in navigator) {
     navigator.serviceWorker
       .getRegistration()
       .then((reg) => {
         if (reg && reg.active) {
-          return reg.showNotification(notifTitle, {
-            body: notifBody,
-            icon: '/icon-512.png',
-            badge: '/icon-512.png',
-            tag: options.tag,
-            requireInteraction: Boolean(options.isCall),
-            silent: false,
-            data: enrichedData,
-          });
+          return reg.showNotification(notifTitle, notifOptions);
         }
         return navigator.serviceWorker.ready.then((readyReg) =>
-          readyReg.showNotification(notifTitle, {
-            body: notifBody,
-            icon: '/icon-512.png',
-            badge: '/icon-512.png',
-            tag: options.tag,
-            requireInteraction: Boolean(options.isCall),
-            silent: false,
-            data: enrichedData,
-          })
+          readyReg.showNotification(notifTitle, notifOptions)
         );
       })
       .catch(() => {

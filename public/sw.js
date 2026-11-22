@@ -1,7 +1,7 @@
 self.addEventListener('install', () => self.skipWaiting());
 self.addEventListener('activate', (e) => e.waitUntil(clients.claim()));
 
-const CACHE_NAME = 'wattappsau-pwa-cache-v5';
+const CACHE_NAME = 'wattappsau-pwa-cache-v6';
 const CORE_ASSETS = [
   '/',
   '/index.html',
@@ -80,15 +80,24 @@ self.addEventListener('fetch', (event) => {
 });
 
 function buildNotificationTargetUrl(senderId, eventType, extra) {
-  const action = eventType === 'call' ? 'call' : 'chat';
   if (!senderId) return '/';
-  let url = '/?targetId=' + encodeURIComponent(senderId) + '&action=' + encodeURIComponent(action);
-  if (extra && extra.callType) {
-    url += '&callType=' + encodeURIComponent(extra.callType);
+  if (eventType === 'call') {
+    const callerName = (extra && (extra.callerName || extra.fromName)) || ('ID: ' + senderId);
+    let callUrl =
+      '/?incomingCall=' +
+      encodeURIComponent(senderId) +
+      '&callerName=' +
+      encodeURIComponent(callerName);
+    if (extra && extra.callType) {
+      callUrl += '&callType=' + encodeURIComponent(extra.callType);
+    }
+    if (extra && extra.callId) {
+      callUrl += '&callId=' + encodeURIComponent(extra.callId);
+    }
+    return callUrl;
   }
-  if (extra && extra.callId) {
-    url += '&callId=' + encodeURIComponent(extra.callId);
-  }
+
+  let url = '/?targetId=' + encodeURIComponent(senderId) + '&action=chat';
   if (extra && extra.fromName) {
     url += '&name=' + encodeURIComponent(extra.fromName);
   }
@@ -99,25 +108,45 @@ self.addEventListener('message', (event) => {
   const msg = event.data;
   if (!msg || msg.type !== 'SHOW_NOTIFICATION') return;
 
-  const senderId = msg.senderId || (msg.data && (msg.data.chatId || msg.data.fromId)) || '';
-  const eventType = msg.eventType === 'call' || msg.isCall ? 'call' : 'chat';
+  const senderId =
+    msg.senderId ||
+    (msg.data && (msg.data.callerId || msg.data.chatId || msg.data.fromId)) ||
+    '';
+  const eventType =
+    msg.eventType === 'call' ||
+    msg.isCall ||
+    (msg.data && msg.data.action === 'ANSWER_CALL')
+      ? 'call'
+      : 'chat';
+  const callerName =
+    (msg.data && (msg.data.callerName || msg.data.fromName)) ||
+    (senderId ? 'ID: ' + senderId : 'WattappsAU');
   const targetUrl =
     (msg.data && msg.data.url) || buildNotificationTargetUrl(senderId, eventType, msg.data);
 
   event.waitUntil(
-    self.registration.showNotification(msg.title || 'WattappsAU', {
-      body: msg.body || '',
-      icon: '/icon-512.png',
-      badge: '/icon-512.png',
-      tag: msg.tag,
-      requireInteraction: eventType === 'call',
-      silent: false,
-      data: Object.assign({}, msg.data || {}, {
-        url: targetUrl,
-        senderId,
-        eventType,
-      }),
-    })
+    self.registration.showNotification(
+      msg.title || (eventType === 'call' ? 'Panggilan Masuk — ' + callerName : 'WattappsAU'),
+      {
+        body:
+          msg.body ||
+          (eventType === 'call' ? 'ID: ' + senderId + ' • Ketuk untuk menjawab' : ''),
+        icon: '/icon-512.png',
+        badge: '/icon-512.png',
+        tag: eventType === 'call' ? 'wattappsau-call' : msg.tag,
+        renotify: eventType === 'call',
+        requireInteraction: eventType === 'call',
+        silent: false,
+        data: Object.assign({}, msg.data || {}, {
+          action: eventType === 'call' ? 'ANSWER_CALL' : 'OPEN_CHAT',
+          callerId: senderId,
+          callerName,
+          url: targetUrl,
+          senderId,
+          eventType,
+        }),
+      }
+    )
   );
 });
 
@@ -129,20 +158,35 @@ self.addEventListener('push', (event) => {
     payload = { body: event.data ? event.data.text() : '' };
   }
 
-  const senderId = payload.senderId || payload.fromId || '';
-  const eventType = payload.eventType === 'call' || payload.type === 'INCOMING_CALL' ? 'call' : 'chat';
+  const senderId = payload.callerId || payload.senderId || payload.fromId || '';
+  const eventType =
+    payload.eventType === 'call' ||
+    payload.type === 'INCOMING_CALL' ||
+    payload.action === 'ANSWER_CALL'
+      ? 'call'
+      : 'chat';
+  const callerName =
+    payload.callerName || payload.fromName || (senderId ? 'ID: ' + senderId : 'Penelepon');
   const targetUrl = buildNotificationTargetUrl(senderId, eventType, payload);
 
   event.waitUntil(
     self.registration.showNotification(
-      payload.title || (eventType === 'call' ? 'Panggilan Masuk - WattappsAU' : 'WattappsAU'),
+      payload.title || (eventType === 'call' ? 'Panggilan Masuk — ' + callerName : 'WattappsAU'),
       {
-        body: payload.body || (eventType === 'call' ? 'Ketuk untuk menjawab panggilan...' : 'Pesan baru masuk'),
+        body:
+          payload.body ||
+          (eventType === 'call'
+            ? 'ID: ' + senderId + ' • Ketuk untuk menjawab'
+            : 'Pesan baru masuk'),
         icon: '/icon-512.png',
         badge: '/icon-512.png',
-        tag: payload.tag || ('push-' + eventType + '-' + senderId),
+        tag: eventType === 'call' ? 'wattappsau-call' : payload.tag || 'push-chat-' + senderId,
+        renotify: eventType === 'call',
         requireInteraction: eventType === 'call',
         data: Object.assign({}, payload, {
+          action: eventType === 'call' ? 'ANSWER_CALL' : 'OPEN_CHAT',
+          callerId: senderId,
+          callerName,
           url: targetUrl,
           senderId,
           eventType,
@@ -154,16 +198,45 @@ self.addEventListener('push', (event) => {
 
 self.addEventListener('notificationclick', (event) => {
   event.notification.close();
-  const targetUrl = (event.notification.data && event.notification.data.url) || '/';
+  const data = event.notification.data || {};
+  const isCallNotification =
+    data.action === 'ANSWER_CALL' || data.eventType === 'call' || data.kind === 'call';
+
+  const callerId = data.callerId || data.senderId || data.fromId || '';
+  const callerName =
+    data.callerName || data.fromName || (callerId ? 'ID: ' + callerId : 'Penelepon');
+
+  const callOpenUrl =
+    '/?incomingCall=' +
+    encodeURIComponent(callerId) +
+    '&callerName=' +
+    encodeURIComponent(callerName) +
+    (data.callType ? '&callType=' + encodeURIComponent(data.callType) : '') +
+    (data.callId ? '&callId=' + encodeURIComponent(data.callId) : '');
+
+  const targetUrl = isCallNotification ? callOpenUrl : data.url || '/';
+
   event.waitUntil(
     clients.matchAll({ type: 'window', includeUncontrolled: true }).then((windowClients) => {
       for (const client of windowClients) {
         if ('focus' in client) {
-          client.postMessage({
-            type: 'OPEN_TARGET',
-            url: targetUrl,
-            data: event.notification.data,
-          });
+          if (isCallNotification) {
+            client.postMessage({
+              type: 'TRIGGER_INCOMING_CALL_UI',
+              callerId,
+              callerName,
+              callId: data.callId,
+              callType: data.callType,
+              isVideo: Boolean(data.isVideo || data.callType === 'video'),
+              data,
+            });
+          } else {
+            client.postMessage({
+              type: 'OPEN_TARGET',
+              url: targetUrl,
+              data,
+            });
+          }
           return client.focus();
         }
       }

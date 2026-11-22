@@ -140,12 +140,12 @@ export interface PeerManagerCallbacks {
 }
 
 export function toFullPeerId(sixDigitId: string): string {
-  const clean = sixDigitId.replace(/^WA6-/, '');
+  const clean = sixDigitId.replace(/^(WA6-|WattappsAU-)/i, '');
   return `${PEER_PREFIX}${clean}`;
 }
 
 export function fromFullPeerId(fullId: string): string {
-  return fullId.replace(/^WA6-/, '');
+  return fullId.replace(/^(WA6-|WattappsAU-)/i, '');
 }
 
 function getDataChannel(conn?: DataConnection | null): RTCDataChannel | undefined {
