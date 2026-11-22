@@ -67,6 +67,7 @@ import {
   stopRingtone,
 } from './lib/audio';
 import {
+  NotificationClickData,
   disableStandbyMode,
   enableStandbyMode,
   isKeepAliveActuallyPlaying,
@@ -106,6 +107,28 @@ interface ActiveCallRuntime {
   connectedAt: number | null;
   facingMode: 'user' | 'environment';
 }
+
+interface PendingIncomingCall {
+  callId: string;
+  peerId: string;
+  peerName: string;
+  peerAvatar: string;
+  callType: CallType;
+  receivedAt: number;
+}
+
+interface AwaitingMediaCallAnswer {
+  callId: string;
+  peerId: string;
+  peerName: string;
+  peerAvatar: string;
+  callType: CallType;
+  localStream: MediaStream;
+  timeoutId: number;
+}
+
+const PENDING_CALL_TTL_MS = 45000;
+const APP_WAKE_SYNC_COOLDOWN_MS = 3000;
 
 export default function App() {
   const [profile, setProfile] = useState<UserProfile | null>(() => getSavedProfile());
@@ -170,6 +193,9 @@ export default function App() {
   const pendingLastAttemptRef = useRef<Map<string, number>>(new Map());
   const activeChatIdRef = useRef<string | null>(activeChatId);
   const callRuntimeRef = useRef<ActiveCallRuntime | null>(null);
+  const pendingCallRef = useRef<PendingIncomingCall | null>(null);
+  const awaitingMediaCallAnswerRef = useRef<AwaitingMediaCallAnswer | null>(null);
+  const lastAppWakeSyncRef = useRef<number>(0);
   const callTimerRef = useRef<number | null>(null);
   const wakeRingtoneTimerRef = useRef<number | null>(null);
   const typingClearTimersRef = useRef<Record<string, number>>({});
@@ -362,7 +388,7 @@ export default function App() {
     );
   }, []);
 
-  // Clean up any active call & record call history
+  // Clean up any active or pending call & record call history
   const finalizeCall = useCallback(
     (statusOverride?: 'answered' | 'missed' | 'rejected') => {
       if (wakeRingtoneTimerRef.current !== null) {
@@ -375,6 +401,16 @@ export default function App() {
         callTimerRef.current = null;
       }
 
+      const pendingWait = awaitingMediaCallAnswerRef.current;
+      if (pendingWait) {
+        window.clearTimeout(pendingWait.timeoutId);
+        pendingWait.localStream.getTracks().forEach((t) => t.stop());
+        awaitingMediaCallAnswerRef.current = null;
+      }
+
+      const pendingCall = pendingCallRef.current;
+      pendingCallRef.current = null;
+
       const rt = callRuntimeRef.current;
       callRuntimeRef.current = null;
       setActiveCallUI(null);
@@ -382,7 +418,24 @@ export default function App() {
       // Lanjutkan kembali silent keep-alive jika Mode Siaga masih aktif setelah panggilan selesai
       resumeKeepAliveAfterCall();
 
-      if (!rt) return;
+      if (!rt) {
+        if (pendingCall && statusOverride) {
+          const record: CallRecord = {
+            id: pendingCall.callId,
+            peerId: pendingCall.peerId,
+            peerName: pendingCall.peerName,
+            peerAvatar: pendingCall.peerAvatar,
+            callType: pendingCall.callType,
+            direction: 'incoming',
+            status: statusOverride,
+            timestamp: pendingCall.receivedAt,
+            duration: 0,
+          };
+          setCalls((prev) => (prev.some((c) => c.id === record.id) ? prev : [record, ...prev]));
+          void dbSaveCall(record);
+        }
+        return;
+      }
 
       try {
         rt.mediaCall.close();
@@ -414,6 +467,84 @@ export default function App() {
       void dbSaveCall(record);
     },
     []
+  );
+
+  // Tampilkan pop-up panggilan masuk untuk pendingCall (misal saat kembali dari latar belakang / klik notifikasi)
+  const presentPendingCallModal = useCallback((pending: PendingIncomingCall) => {
+    if (callRuntimeRef.current) return;
+    if (Date.now() - pending.receivedAt > PENDING_CALL_TTL_MS) {
+      if (pendingCallRef.current?.callId === pending.callId) {
+        pendingCallRef.current = null;
+      }
+      return;
+    }
+
+    setShowMainMenu(false);
+    setShowProfileDrawer(false);
+    setShowShareAppModal(false);
+    setLightboxMedia(null);
+
+    setActiveCallUI((prev) => {
+      if (prev && prev.callId === pending.callId) return prev;
+      return {
+        callId: pending.callId,
+        peerId: pending.peerId,
+        peerName: pending.peerName,
+        peerAvatar: pending.peerAvatar,
+        callType: pending.callType,
+        phase: 'incoming',
+        duration: 0,
+        isMuted: false,
+        isCameraOff: pending.callType !== 'video',
+        isSpeakerOn: true,
+        localStream: null,
+        remoteStream: null,
+      };
+    });
+  }, []);
+
+  // Pasang listener stream/close/error pada panggilan keluar (dipakai saat awal memanggil & saat re-dial setelah lawan bangun)
+  const bindOutgoingMediaCall = useCallback(
+    (callId: string, mediaCall: MediaConnection) => {
+      mediaCall.on('stream', (remoteStream) => {
+        if (callRuntimeRef.current?.callId !== callId) return;
+        stopRingtone();
+        if (!callRuntimeRef.current.connectedAt) {
+          callRuntimeRef.current.connectedAt = Date.now();
+          if (callTimerRef.current !== null) {
+            window.clearInterval(callTimerRef.current);
+          }
+          callTimerRef.current = window.setInterval(() => {
+            if (!callRuntimeRef.current?.connectedAt) return;
+            const secs = Math.floor((Date.now() - callRuntimeRef.current.connectedAt) / 1000);
+            setActiveCallUI((prev) => (prev ? { ...prev, duration: secs } : null));
+          }, 1000);
+        }
+        setActiveCallUI((prev) =>
+          prev ? { ...prev, phase: 'connected', remoteStream } : null
+        );
+      });
+
+      mediaCall.on('close', () => {
+        if (
+          callRuntimeRef.current?.callId === callId &&
+          callRuntimeRef.current.mediaCall === mediaCall
+        ) {
+          finalizeCall();
+        }
+      });
+
+      mediaCall.on('error', () => {
+        if (
+          callRuntimeRef.current?.callId === callId &&
+          callRuntimeRef.current.mediaCall === mediaCall
+        ) {
+          showToast('Panggilan tidak dapat tersambung.');
+          finalizeCall('missed');
+        }
+      });
+    },
+    [finalizeCall, showToast]
   );
 
   // Incoming PeerJS DataChannel packet handler
@@ -514,6 +645,12 @@ export default function App() {
                 title: senderTitle,
                 body: incomingMsg.text || 'Pesan baru masuk',
                 tag: `msg-${incomingMsg.id}`,
+                data: {
+                  kind: 'message',
+                  chatId: localChatId,
+                  fromId,
+                  fromName: senderTitle,
+                },
                 onClick: () => {
                   setActiveTab('chats');
                   setActiveChatId(localChatId);
@@ -646,51 +783,111 @@ export default function App() {
         }
 
         case 'CALL_REQUEST': {
-          // Mulai nada dering 440Hz+480Hz + notifikasi mengambang segera saat sinyal panggilan masuk tiba
-          if (!callRuntimeRef.current) {
+          // Simpan sebagai pendingCall, tampilkan pop-up panggilan masuk & mulai nada dering 440Hz+480Hz
+          if (!callRuntimeRef.current && pendingCallRef.current?.callId !== packet.callId) {
             pauseKeepAliveForCall();
             startIncomingRingtone();
-            const callerName =
-              contactsRef.current.find((c) => c.id === fromId)?.name ||
-              packet.fromName ||
-              `ID ${fromId}`;
+            const existingContact = contactsRef.current.find((c) => c.id === fromId);
+            const callerName = existingContact?.name || packet.fromName || `ID ${fromId}`;
+            const callerAvatar = existingContact?.avatar || packet.fromAvatar || '';
+            const pending: PendingIncomingCall = {
+              callId: packet.callId,
+              peerId: fromId,
+              peerName: callerName,
+              peerAvatar: callerAvatar,
+              callType: packet.callType,
+              receivedAt: Date.now(),
+            };
+            pendingCallRef.current = pending;
+            presentPendingCallModal(pending);
             showIncomingWebNotification({
               title: 'Panggilan Masuk - WattappsAU',
               body: `${callerName} menelepon · Ketuk untuk menjawab panggilan...`,
               tag: `call-${packet.callId}`,
               isCall: true,
+              data: {
+                kind: 'call',
+                fromId,
+                fromName: callerName,
+                callId: packet.callId,
+                callType: packet.callType,
+              },
+              onClick: () => {
+                presentPendingCallModal(pending);
+              },
             });
             if (wakeRingtoneTimerRef.current !== null) {
               window.clearTimeout(wakeRingtoneTimerRef.current);
             }
             wakeRingtoneTimerRef.current = window.setTimeout(() => {
               wakeRingtoneTimerRef.current = null;
-              if (!callRuntimeRef.current) {
-                stopRingtone();
-                resumeKeepAliveAfterCall();
+              if (!callRuntimeRef.current && pendingCallRef.current?.callId === packet.callId) {
+                finalizeCall('missed');
               }
-            }, 25000);
+            }, 30000);
           }
           break;
         }
 
         case 'CALL_SIGNAL': {
           const rt = callRuntimeRef.current;
-          if (packet.action === 'reject' && rt && rt.peerId === fromId) {
-            showToast(`${rt.peerName} menolak panggilan`);
-            finalizeCall('rejected');
-          } else if (packet.action === 'end' && rt && rt.peerId === fromId) {
-            showToast('Panggilan berakhir');
-            finalizeCall();
+          const pending = pendingCallRef.current;
+          if (packet.action === 'reject') {
+            if (rt && rt.peerId === fromId) {
+              showToast(`${rt.peerName} menolak panggilan`);
+              finalizeCall('rejected');
+            } else if (pending && pending.peerId === fromId) {
+              finalizeCall('rejected');
+            }
+          } else if (packet.action === 'end') {
+            if (rt && rt.peerId === fromId) {
+              showToast('Panggilan berakhir');
+              finalizeCall();
+            } else if (pending && pending.peerId === fromId) {
+              finalizeCall('missed');
+            }
           } else if (packet.action === 'busy' && rt && rt.peerId === fromId) {
             showToast(`${rt.peerName} sedang dalam panggilan lain`);
             finalizeCall('missed');
+          } else if (
+            (packet.action === 'ringing' || packet.action === 'accept') &&
+            rt &&
+            rt.direction === 'outgoing' &&
+            !rt.connectedAt &&
+            rt.peerId === fromId &&
+            rt.localStream
+          ) {
+            // Penerima baru bangun dari latar belakang / zombie socket: kirim ulang MediaConnection segar
+            const freshCall = peerManagerRef.current?.startMediaCall(fromId, rt.localStream, {
+              callId: rt.callId,
+              callType: rt.callType,
+              callerName: me.name,
+              callerAvatar: me.avatar,
+            });
+            if (freshCall) {
+              const oldCall = rt.mediaCall;
+              rt.mediaCall = freshCall;
+              try {
+                oldCall.close();
+              } catch {
+                // ignore
+              }
+              bindOutgoingMediaCall(rt.callId, freshCall);
+            }
           }
           break;
         }
       }
     },
-    [upsertContact, finalizeCall, showToast, markMessageConfirmedBlueTick, removePendingEntry]
+    [
+      upsertContact,
+      finalizeCall,
+      presentPendingCallModal,
+      bindOutgoingMediaCall,
+      showToast,
+      markMessageConfirmedBlueTick,
+      removePendingEntry,
+    ]
   );
 
   // Incoming WebRTC Media Call handler
@@ -722,6 +919,7 @@ export default function App() {
 
       // Hentikan otomatis Silent Audio Keep-Alive agar tidak bentrok dengan audio mikrofon/speaker panggilan
       pauseKeepAliveForCall();
+      pendingCallRef.current = null;
 
       const meta = (mediaCall.metadata || {}) as {
         callId?: string;
@@ -736,6 +934,78 @@ export default function App() {
       const callType: CallType = meta.callType === 'video' ? 'video' : 'audio';
       const callId = meta.callId || generateUid('call');
 
+      // Jika pengguna sudah menekan "Terima" pada pop-up pendingCall saat kembali dari latar belakang, langsung jawab!
+      const awaitingAnswer = awaitingMediaCallAnswerRef.current;
+      if (awaitingAnswer && awaitingAnswer.peerId === callerId) {
+        window.clearTimeout(awaitingAnswer.timeoutId);
+        awaitingMediaCallAnswerRef.current = null;
+        stopRingtone();
+
+        callRuntimeRef.current = {
+          callId,
+          peerId: callerId,
+          peerName: callerName,
+          peerAvatar: callerAvatar,
+          callType,
+          direction: 'incoming',
+          mediaCall,
+          localStream: awaitingAnswer.localStream,
+          startedAt: Date.now(),
+          connectedAt: Date.now(),
+          facingMode: 'user',
+        };
+
+        mediaCall.answer(awaitingAnswer.localStream);
+
+        setActiveCallUI({
+          callId,
+          peerId: callerId,
+          peerName: callerName,
+          peerAvatar: callerAvatar,
+          callType,
+          phase: 'connected',
+          duration: 0,
+          isMuted: false,
+          isCameraOff: callType !== 'video',
+          isSpeakerOn: true,
+          localStream: awaitingAnswer.localStream,
+          remoteStream: null,
+        });
+
+        if (callTimerRef.current !== null) {
+          window.clearInterval(callTimerRef.current);
+        }
+        callTimerRef.current = window.setInterval(() => {
+          if (!callRuntimeRef.current?.connectedAt) return;
+          const secs = Math.floor((Date.now() - callRuntimeRef.current.connectedAt) / 1000);
+          setActiveCallUI((prev) => (prev ? { ...prev, duration: secs } : null));
+        }, 1000);
+
+        mediaCall.on('stream', (remoteStream) => {
+          if (callRuntimeRef.current?.callId !== callId) return;
+          setActiveCallUI((prev) => (prev ? { ...prev, remoteStream } : null));
+        });
+
+        mediaCall.on('close', () => {
+          if (
+            callRuntimeRef.current?.callId === callId &&
+            callRuntimeRef.current.mediaCall === mediaCall
+          ) {
+            finalizeCall();
+          }
+        });
+
+        mediaCall.on('error', () => {
+          if (
+            callRuntimeRef.current?.callId === callId &&
+            callRuntimeRef.current.mediaCall === mediaCall
+          ) {
+            finalizeCall();
+          }
+        });
+        return;
+      }
+
       callRuntimeRef.current = {
         callId,
         peerId: callerId,
@@ -749,6 +1019,11 @@ export default function App() {
         connectedAt: null,
         facingMode: 'user',
       };
+
+      setShowMainMenu(false);
+      setShowProfileDrawer(false);
+      setShowShareAppModal(false);
+      setLightboxMedia(null);
 
       setActiveCallUI({
         callId,
@@ -771,16 +1046,29 @@ export default function App() {
         body: `${callerName} (${callType === 'video' ? 'Video' : 'Suara'}) · Ketuk untuk menjawab panggilan...`,
         tag: `call-${callId}`,
         isCall: true,
+        data: {
+          kind: 'call',
+          fromId: callerId,
+          fromName: callerName,
+          callId,
+          callType,
+        },
       });
 
       mediaCall.on('close', () => {
-        if (callRuntimeRef.current?.callId === callId) {
+        if (
+          callRuntimeRef.current?.callId === callId &&
+          callRuntimeRef.current.mediaCall === mediaCall
+        ) {
           finalizeCall();
         }
       });
 
       mediaCall.on('error', () => {
-        if (callRuntimeRef.current?.callId === callId) {
+        if (
+          callRuntimeRef.current?.callId === callId &&
+          callRuntimeRef.current.mediaCall === mediaCall
+        ) {
           finalizeCall();
         }
       });
@@ -929,13 +1217,20 @@ export default function App() {
             : savedMsg.type === 'voice'
             ? 'Pesan suara'
             : savedMsg.fileName || 'Dokumen';
+        const senderTitle =
+          meta.isGroup && meta.groupMeta
+            ? `${meta.groupMeta.name} · ${meta.senderName}`
+            : meta.senderName || `ID ${fromId}`;
         void showIncomingWebNotification({
-          title:
-            meta.isGroup && meta.groupMeta
-              ? `${meta.groupMeta.name} · ${meta.senderName}`
-              : meta.senderName || `ID ${fromId}`,
+          title: senderTitle,
           body: savedMsg.text ? `${mediaLabel}: ${savedMsg.text}` : `Mengirim ${mediaLabel}`,
           tag: `msg-${savedMsg.id}`,
+          data: {
+            kind: 'message',
+            chatId: localChatId,
+            fromId,
+            fromName: senderTitle,
+          },
           onClick: () => {
             setActiveTab('chats');
             setActiveChatId(localChatId);
@@ -1162,28 +1457,53 @@ export default function App() {
         (signal.fromId ? `ID ${signal.fromId}` : 'Kontak WattappsAU');
 
       if (signal.type === 'INCOMING_CALL') {
-        if (!callRuntimeRef.current) {
+        const callId = signal.callId || `ntfy-call-${signal.ts}`;
+        if (
+          !callRuntimeRef.current &&
+          pendingCallRef.current?.callId !== callId &&
+          signal.fromId
+        ) {
           pauseKeepAliveForCall();
           startIncomingRingtone();
+          const existingContact = contactsRef.current.find((c) => c.id === signal.fromId);
+          const pending: PendingIncomingCall = {
+            callId,
+            peerId: signal.fromId,
+            peerName: senderLabel,
+            peerAvatar: existingContact?.avatar || '',
+            callType: signal.callType === 'video' ? 'video' : 'audio',
+            receivedAt: Date.now(),
+          };
+          pendingCallRef.current = pending;
+          presentPendingCallModal(pending);
           showIncomingWebNotification({
             title: 'Panggilan Masuk - WattappsAU',
             body: `${senderLabel} menelepon · Ketuk untuk menjawab panggilan...`,
-            tag: `call-${signal.callId || signal.ts}`,
+            tag: `call-${callId}`,
             isCall: true,
+            data: {
+              kind: 'call',
+              fromId: signal.fromId,
+              fromName: senderLabel,
+              callId,
+              callType: pending.callType,
+            },
+            onClick: () => {
+              presentPendingCallModal(pending);
+            },
           });
           if (wakeRingtoneTimerRef.current !== null) {
             window.clearTimeout(wakeRingtoneTimerRef.current);
           }
           wakeRingtoneTimerRef.current = window.setTimeout(() => {
             wakeRingtoneTimerRef.current = null;
-            if (!callRuntimeRef.current) {
-              stopRingtone();
-              resumeKeepAliveAfterCall();
+            if (!callRuntimeRef.current && pendingCallRef.current?.callId === callId) {
+              finalizeCall('missed');
             }
-          }, 25000);
+          }, 30000);
         }
         if (signal.fromId) {
-          peerManagerRef.current?.ensureConnection(signal.fromId, false);
+          peerManagerRef.current?.ensureConnection(signal.fromId, true);
         }
       } else if (signal.type === 'NEW_MSG') {
         const isViewing = Boolean(signal.fromId && activeChatIdRef.current === signal.fromId);
@@ -1193,6 +1513,12 @@ export default function App() {
             title: senderLabel,
             body: 'Pesan baru masuk · Ketuk untuk membuka WattappsAU',
             tag: `ntfy-msg-${signal.fromId || signal.ts}`,
+            data: {
+              kind: 'message',
+              chatId: signal.fromId,
+              fromId: signal.fromId,
+              fromName: senderLabel,
+            },
             onClick: () => {
               if (signal.fromId) {
                 setActiveTab('chats');
@@ -1211,7 +1537,163 @@ export default function App() {
     return () => {
       unsubscribe();
     };
-  }, [profile?.id]);
+  }, [profile?.id, finalizeCall, presentPendingCallModal]);
+
+  // Pemulihan koneksi otomatis (anti zombie socket) saat aplikasi kembali dari latar belakang (visibilitychange & focus)
+  const wakeAndSyncPeer = useCallback(async () => {
+    const me = profileRef.current;
+    const manager = peerManagerRef.current;
+    if (!me || !manager) return;
+
+    const now = Date.now();
+    if (now - lastAppWakeSyncRef.current < APP_WAKE_SYNC_COOLDOWN_MS) {
+      return;
+    }
+    lastAppWakeSyncRef.current = now;
+
+    // Kumpulkan kontak prioritas: ruang chat aktif, penerima pesan tertunda, penelpon pendingCall, & kontak 1:1
+    const priorityIds = new Set<string>();
+    const currentChat = activeChatIdRef.current;
+    if (currentChat) {
+      const chatContact = contactsRef.current.find((c) => c.id === currentChat);
+      if (chatContact?.isGroup && chatContact.members) {
+        chatContact.members.forEach((mId) => {
+          if (mId !== me.id) priorityIds.add(mId);
+        });
+      } else {
+        priorityIds.add(currentChat);
+      }
+    }
+    pendingMessagesRef.current.forEach((p) => {
+      if (p.recipientId && p.recipientId !== me.id) {
+        priorityIds.add(p.recipientId);
+      }
+    });
+    if (pendingCallRef.current?.peerId) {
+      priorityIds.add(pendingCallRef.current.peerId);
+    }
+    contactsRef.current
+      .filter((c) => !c.isGroup)
+      .forEach((c) => priorityIds.add(c.id));
+
+    await manager.wakeAndSyncPeer(Array.from(priorityIds));
+
+    // (c) Segera tarik/kirim antrean pesan tertunda untuk semua peer yang sudah online
+    const pendingRecipients = new Set(
+      pendingMessagesRef.current.map((item) => item.recipientId)
+    );
+    pendingRecipients.forEach((recipientId) => {
+      if (peerManagerRef.current?.isPeerOnline(recipientId)) {
+        void flushPendingForPeer(recipientId);
+      }
+    });
+
+    // Tampilkan pop-up panggilan masuk jika ada permintaan panggilan yang masih menunggu (pendingCall)
+    const pendingCall = pendingCallRef.current;
+    if (pendingCall && !callRuntimeRef.current) {
+      if (Date.now() - pendingCall.receivedAt <= PENDING_CALL_TTL_MS) {
+        presentPendingCallModal(pendingCall);
+        peerManagerRef.current?.sendPacket(pendingCall.peerId, {
+          kind: 'CALL_SIGNAL',
+          action: 'ringing',
+          callId: pendingCall.callId,
+          callType: pendingCall.callType,
+          fromId: me.id,
+          fromName: me.name,
+          fromAvatar: me.avatar,
+        });
+      } else {
+        pendingCallRef.current = null;
+      }
+    }
+  }, [flushPendingForPeer, presentPendingCallModal]);
+
+  // Dengarkan visibilitychange & window.focus untuk otomatis memulihkan PeerJS + zombie socket
+  useEffect(() => {
+    if (!profile) return;
+
+    const handleVisibilityChange = () => {
+      if (document.visibilityState === 'visible') {
+        void wakeAndSyncPeer();
+      }
+    };
+
+    const handleWindowFocus = () => {
+      void wakeAndSyncPeer();
+    };
+
+    document.addEventListener('visibilitychange', handleVisibilityChange);
+    window.addEventListener('focus', handleWindowFocus);
+
+    return () => {
+      document.removeEventListener('visibilitychange', handleVisibilityChange);
+      window.removeEventListener('focus', handleWindowFocus);
+    };
+  }, [profile?.id, wakeAndSyncPeer]);
+
+  // Dengarkan pesan NOTIFICATION_CLICKED dari Service Worker (public/sw.js) untuk buka ruang chat / modal panggilan
+  useEffect(() => {
+    if (typeof navigator === 'undefined' || !('serviceWorker' in navigator)) return;
+
+    const handleSwMessage = (event: MessageEvent) => {
+      const payload = event.data as
+        | { type?: string; data?: NotificationClickData }
+        | undefined;
+      if (!payload || payload.type !== 'NOTIFICATION_CLICKED') return;
+
+      const data = payload.data;
+
+      setShowMainMenu(false);
+      setShowProfileDrawer(false);
+      setShowShareAppModal(false);
+      setLightboxMedia(null);
+
+      if (data?.kind === 'call') {
+        if (!callRuntimeRef.current) {
+          if (pendingCallRef.current) {
+            presentPendingCallModal(pendingCallRef.current);
+          } else if (data.fromId) {
+            const existingContact = contactsRef.current.find((c) => c.id === data.fromId);
+            const pending: PendingIncomingCall = {
+              callId: data.callId || generateUid('call'),
+              peerId: data.fromId,
+              peerName: existingContact?.name || data.fromName || `ID ${data.fromId}`,
+              peerAvatar: existingContact?.avatar || '',
+              callType: data.callType === 'video' ? 'video' : 'audio',
+              receivedAt: Date.now(),
+            };
+            pendingCallRef.current = pending;
+            presentPendingCallModal(pending);
+          }
+        }
+        void wakeAndSyncPeer();
+        return;
+      }
+
+      const targetChatId = data?.chatId || data?.fromId;
+      if (targetChatId) {
+        if (data?.fromId && !contactsRef.current.some((c) => c.id === targetChatId)) {
+          upsertContact({
+            id: targetChatId,
+            name: data.fromName || `Teman ${targetChatId}`,
+            bio: 'Ada',
+            avatar: '',
+            addedAt: Date.now(),
+          });
+        }
+        setActiveTab('chats');
+        setActiveChatId(targetChatId);
+        activeChatIdRef.current = targetChatId;
+      }
+
+      void wakeAndSyncPeer();
+    };
+
+    navigator.serviceWorker.addEventListener('message', handleSwMessage);
+    return () => {
+      navigator.serviceWorker.removeEventListener('message', handleSwMessage);
+    };
+  }, [wakeAndSyncPeer, presentPendingCallModal, upsertContact]);
 
   // Whenever user opens a chat room, clear unread badge & send READ_ACK
   useEffect(() => {
@@ -1685,16 +2167,17 @@ export default function App() {
     // Hentikan otomatis Silent Audio Keep-Alive sebelum mengakses mikrofon/speaker panggilan
     pauseKeepAliveForCall();
 
-    // Jika lawan sedang Offline / koneksi DataChannel belum terbuka, kirim sinyal bangun prioritas urgent via ntfy.sh
+    // Kirim sinyal bangun prioritas via ntfy.sh (menjamin lawan bangun walau socket lama sedang tidur/zombie)
+    void sendNtfyWakeSignal({
+      targetId: peerId,
+      type: 'INCOMING_CALL',
+      fromId: profile.id,
+      fromName: profile.name,
+      callType,
+      callId,
+    });
+
     if (!manager.isPeerOnline(peerId)) {
-      void sendNtfyWakeSignal({
-        targetId: peerId,
-        type: 'INCOMING_CALL',
-        fromId: profile.id,
-        fromName: profile.name,
-        callType,
-        callId,
-      });
       showToast(`Sinyal bangun panggilan dikirim ke ${peerName} via ntfy`);
     } else {
       // Kirim paket CALL_REQUEST langsung lewat DataChannel agar dering 440Hz+480Hz lawan segera berbunyi
@@ -1758,35 +2241,7 @@ export default function App() {
       });
 
       startOutgoingRingback();
-
-      mediaCall.on('stream', (remoteStream) => {
-        if (callRuntimeRef.current?.callId !== callId) return;
-        stopRingtone();
-        if (!callRuntimeRef.current.connectedAt) {
-          callRuntimeRef.current.connectedAt = Date.now();
-          callTimerRef.current = window.setInterval(() => {
-            if (!callRuntimeRef.current?.connectedAt) return;
-            const secs = Math.floor((Date.now() - callRuntimeRef.current.connectedAt) / 1000);
-            setActiveCallUI((prev) => (prev ? { ...prev, duration: secs } : null));
-          }, 1000);
-        }
-        setActiveCallUI((prev) =>
-          prev ? { ...prev, phase: 'connected', remoteStream } : null
-        );
-      });
-
-      mediaCall.on('close', () => {
-        if (callRuntimeRef.current?.callId === callId) {
-          finalizeCall();
-        }
-      });
-
-      mediaCall.on('error', () => {
-        if (callRuntimeRef.current?.callId === callId) {
-          showToast('Panggilan tidak dapat tersambung.');
-          finalizeCall('missed');
-        }
-      });
+      bindOutgoingMediaCall(callId, mediaCall);
     } catch {
       resumeKeepAliveAfterCall();
       showToast(
@@ -1797,51 +2252,115 @@ export default function App() {
     }
   };
 
-  // Accept Incoming Call
+  // Accept Incoming Call (termasuk pendingCall yang baru muncul saat kembali dari latar belakang)
   const handleAcceptCall = async () => {
     const rt = callRuntimeRef.current;
-    if (!rt) return;
+    const pending = pendingCallRef.current;
+    const me = profileRef.current;
+    if (!rt && !pending) return;
+
     stopRingtone();
+    if (wakeRingtoneTimerRef.current !== null) {
+      window.clearTimeout(wakeRingtoneTimerRef.current);
+      wakeRingtoneTimerRef.current = null;
+    }
 
-    try {
-      const localStream = await navigator.mediaDevices.getUserMedia({
-        audio: true,
-        video: rt.callType === 'video' ? { facingMode: 'user' } : false,
-      });
+    // Kasus 1: MediaConnection sudah masuk secara normal
+    if (rt) {
+      try {
+        const localStream = await navigator.mediaDevices.getUserMedia({
+          audio: true,
+          video: rt.callType === 'video' ? { facingMode: 'user' } : false,
+        });
 
-      rt.localStream = localStream;
-      rt.connectedAt = Date.now();
-      rt.mediaCall.answer(localStream);
+        rt.localStream = localStream;
+        rt.connectedAt = Date.now();
+        rt.mediaCall.answer(localStream);
 
-      setActiveCallUI((prev) =>
-        prev ? { ...prev, phase: 'connected', localStream } : null
-      );
+        setActiveCallUI((prev) =>
+          prev ? { ...prev, phase: 'connected', localStream } : null
+        );
 
-      callTimerRef.current = window.setInterval(() => {
-        if (!callRuntimeRef.current?.connectedAt) return;
-        const secs = Math.floor((Date.now() - callRuntimeRef.current.connectedAt) / 1000);
-        setActiveCallUI((prev) => (prev ? { ...prev, duration: secs } : null));
-      }, 1000);
+        if (callTimerRef.current !== null) {
+          window.clearInterval(callTimerRef.current);
+        }
+        callTimerRef.current = window.setInterval(() => {
+          if (!callRuntimeRef.current?.connectedAt) return;
+          const secs = Math.floor((Date.now() - callRuntimeRef.current.connectedAt) / 1000);
+          setActiveCallUI((prev) => (prev ? { ...prev, duration: secs } : null));
+        }, 1000);
 
-      rt.mediaCall.on('stream', (remoteStream) => {
-        if (callRuntimeRef.current?.callId !== rt.callId) return;
-        setActiveCallUI((prev) => (prev ? { ...prev, remoteStream } : null));
-      });
-    } catch {
-      showToast('Gagal mengakses mikrofon/kamera.');
-      handleRejectCall();
+        rt.mediaCall.on('stream', (remoteStream) => {
+          if (callRuntimeRef.current?.callId !== rt.callId) return;
+          setActiveCallUI((prev) => (prev ? { ...prev, remoteStream } : null));
+        });
+      } catch {
+        showToast('Gagal mengakses mikrofon/kamera.');
+        handleRejectCall();
+      }
+      return;
+    }
+
+    // Kasus 2: Pengguna mengetuk Terima pada pop-up pendingCall sebelum MediaConnection baru tiba dari penelpon
+    if (pending && me) {
+      try {
+        const localStream = await navigator.mediaDevices.getUserMedia({
+          audio: true,
+          video: pending.callType === 'video' ? { facingMode: 'user' } : false,
+        });
+
+        const timeoutId = window.setTimeout(() => {
+          if (awaitingMediaCallAnswerRef.current?.callId === pending.callId) {
+            showToast('Panggilan sudah berakhir atau tidak dapat tersambung.');
+            finalizeCall('missed');
+          }
+        }, 15000);
+
+        awaitingMediaCallAnswerRef.current = {
+          callId: pending.callId,
+          peerId: pending.peerId,
+          peerName: pending.peerName,
+          peerAvatar: pending.peerAvatar,
+          callType: pending.callType,
+          localStream,
+          timeoutId,
+        };
+
+        setActiveCallUI((prev) =>
+          prev ? { ...prev, phase: 'outgoing', localStream } : null
+        );
+
+        peerManagerRef.current?.ensureConnection(pending.peerId, true);
+        peerManagerRef.current?.sendPacket(pending.peerId, {
+          kind: 'CALL_SIGNAL',
+          action: 'accept',
+          callId: pending.callId,
+          callType: pending.callType,
+          fromId: me.id,
+          fromName: me.name,
+          fromAvatar: me.avatar,
+        });
+      } catch {
+        showToast('Gagal mengakses mikrofon/kamera.');
+        handleRejectCall();
+      }
     }
   };
 
   const handleRejectCall = () => {
     const rt = callRuntimeRef.current;
+    const pending = pendingCallRef.current;
     const me = profileRef.current;
-    if (rt && me) {
-      peerManagerRef.current?.sendPacket(rt.peerId, {
+    const targetPeerId = rt?.peerId || pending?.peerId;
+    const targetCallId = rt?.callId || pending?.callId;
+    const targetCallType = rt?.callType || pending?.callType || 'audio';
+
+    if (targetPeerId && targetCallId && me) {
+      peerManagerRef.current?.sendPacket(targetPeerId, {
         kind: 'CALL_SIGNAL',
         action: 'reject',
-        callId: rt.callId,
-        callType: rt.callType,
+        callId: targetCallId,
+        callType: targetCallType,
         fromId: me.id,
         fromName: me.name,
         fromAvatar: me.avatar,
@@ -1852,13 +2371,18 @@ export default function App() {
 
   const handleEndCall = () => {
     const rt = callRuntimeRef.current;
+    const pending = pendingCallRef.current || awaitingMediaCallAnswerRef.current;
     const me = profileRef.current;
-    if (rt && me) {
-      peerManagerRef.current?.sendPacket(rt.peerId, {
+    const targetPeerId = rt?.peerId || pending?.peerId;
+    const targetCallId = rt?.callId || pending?.callId;
+    const targetCallType = rt?.callType || pending?.callType || 'audio';
+
+    if (targetPeerId && targetCallId && me) {
+      peerManagerRef.current?.sendPacket(targetPeerId, {
         kind: 'CALL_SIGNAL',
         action: 'end',
-        callId: rt.callId,
-        callType: rt.callType,
+        callId: targetCallId,
+        callType: targetCallType,
         fromId: me.id,
         fromName: me.name,
         fromAvatar: me.avatar,

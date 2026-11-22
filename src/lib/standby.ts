@@ -373,11 +373,21 @@ export async function disableStandbyMode(): Promise<void> {
   await releaseScreenWakeLock();
 }
 
+export interface NotificationClickData {
+  kind: 'message' | 'call';
+  chatId?: string;
+  fromId?: string;
+  fromName?: string;
+  callId?: string;
+  callType?: 'audio' | 'video';
+}
+
 export function showIncomingWebNotification(options: {
   title: string;
   body: string;
   tag: string;
   isCall?: boolean;
+  data?: NotificationClickData;
   onClick?: () => void;
 }): void {
   triggerAlertVibration(options.isCall ? [1000, 300, 1000] : [500, 200, 500]);
@@ -398,38 +408,56 @@ export function showIncomingWebNotification(options: {
     ? options.body || 'Ketuk untuk menjawab panggilan...'
     : options.body;
 
-  try {
-    const notif = new Notification(notifTitle, {
-      body: notifBody,
-      icon: '/icon-512.png',
-      badge: '/icon-512.png',
-      tag: options.tag,
-      requireInteraction: Boolean(options.isCall),
-      silent: false,
-    });
+  const showWindowNotificationFallback = () => {
+    try {
+      const notif = new Notification(notifTitle, {
+        body: notifBody,
+        icon: '/icon-512.png',
+        badge: '/icon-512.png',
+        tag: options.tag,
+        requireInteraction: Boolean(options.isCall),
+        silent: false,
+        data: options.data,
+      });
 
-    notif.onclick = () => {
-      try {
-        window.focus();
-      } catch {
-        // ignore
-      }
-      options.onClick?.();
-      notif.close();
-    };
-  } catch {
-    if ('serviceWorker' in navigator) {
-      navigator.serviceWorker.ready
-        .then((reg) => {
-          void reg.showNotification(notifTitle, {
+      notif.onclick = () => {
+        try {
+          window.focus();
+        } catch {
+          // ignore
+        }
+        options.onClick?.();
+        notif.close();
+      };
+    } catch {
+      // ignore if browser only supports ServiceWorkerRegistration.showNotification
+    }
+  };
+
+  // Utamakan Service Worker showNotification agar event notificationclick di sw.js selalu berjalan di Android & PWA
+  if ('serviceWorker' in navigator) {
+    navigator.serviceWorker
+      .getRegistration()
+      .then((reg) => {
+        if (reg && reg.active) {
+          return reg.showNotification(notifTitle, {
             body: notifBody,
             icon: '/icon-512.png',
             badge: '/icon-512.png',
             tag: options.tag,
             requireInteraction: Boolean(options.isCall),
+            silent: false,
+            data: options.data,
           });
-        })
-        .catch(() => {});
-    }
+        }
+        showWindowNotificationFallback();
+        return undefined;
+      })
+      .catch(() => {
+        showWindowNotificationFallback();
+      });
+    return;
   }
+
+  showWindowNotificationFallback();
 }

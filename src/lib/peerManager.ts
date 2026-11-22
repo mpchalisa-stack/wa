@@ -38,6 +38,12 @@ const RECONNECT_COOLDOWN_MS = 15000;
 /** Interval heartbeat PING ringan sekali tiap 20 detik HANYA pada koneksi yang sudah terbuka */
 const HEARTBEAT_INTERVAL_MS = 20000;
 
+/** Jeda anti-spam minimal 3 detik saat menjalankan wakeAndSyncPeer() pada visibilitychange / focus */
+const WAKE_SYNC_COOLDOWN_MS = 3000;
+
+/** Timeout tunggu balasan PONG (2 detik) untuk mendeteksi zombie socket saat kembali dari latar belakang */
+const ZOMBIE_PING_TIMEOUT_MS = 2000;
+
 /**
  * Konfigurasi ICE Servers untuk WebRTC (DataChannel & Panggilan Suara/Video).
  * Menggunakan server STUN publik Google secara default.
@@ -259,6 +265,7 @@ export class WA6PeerManager {
   private callbacks: PeerManagerCallbacks;
   private connections = new Map<string, DataConnection>();
   private openWaiters = new Map<string, Array<(conn: DataConnection) => void>>();
+  private pongWaiters = new Map<string, Array<() => void>>();
   private pendingQueues = new Map<string, PeerPacket[]>();
   private pendingFileTransfers = new Map<string, SendFileChunkedOptions[]>();
   private activeFileSendChain = new Map<string, Promise<void>>();
@@ -266,6 +273,8 @@ export class WA6PeerManager {
   private completedReceivedFiles = new Map<string, string>(); // fileId -> messageId
   private awaitingFileAcks = new Map<string, PendingAckTransfer>();
   private lastConnectAttempt = new Map<string, number>();
+  private lastWakeSyncAt = 0;
+  private wakeSyncInFlight = false;
   private heartbeatTimer: number | null = null;
   private reconnectTimer: number | null = null;
   private destroyed = false;
@@ -273,27 +282,182 @@ export class WA6PeerManager {
   constructor(profile: UserProfile, callbacks: PeerManagerCallbacks) {
     this.profile = profile;
     this.callbacks = callbacks;
+  }
 
-    if (typeof document !== 'undefined') {
-      document.addEventListener('visibilitychange', this.handleVisibilityChange);
+  private resolvePongWaiters(peerSixId: string): void {
+    const waiters = this.pongWaiters.get(peerSixId);
+    if (!waiters || waiters.length === 0) return;
+    this.pongWaiters.delete(peerSixId);
+    waiters.forEach((fn) => fn());
+  }
+
+  private waitForPong(peerSixId: string, timeoutMs = ZOMBIE_PING_TIMEOUT_MS): Promise<boolean> {
+    return new Promise<boolean>((resolve) => {
+      let settled = false;
+      const done = (received: boolean) => {
+        if (settled) return;
+        settled = true;
+        window.clearTimeout(timer);
+        const list = this.pongWaiters.get(peerSixId);
+        if (list) {
+          const filtered = list.filter((fn) => fn !== onPong);
+          if (filtered.length > 0) {
+            this.pongWaiters.set(peerSixId, filtered);
+          } else {
+            this.pongWaiters.delete(peerSixId);
+          }
+        }
+        resolve(received);
+      };
+
+      const onPong = () => done(true);
+      const list = this.pongWaiters.get(peerSixId) || [];
+      list.push(onPong);
+      this.pongWaiters.set(peerSixId, list);
+
+      const timer = window.setTimeout(() => done(false), timeoutMs);
+    });
+  }
+
+  private forceReconnectPeer(targetSixDigitId: string, staleConn?: DataConnection): DataConnection | null {
+    if (this.destroyed || !this.peer || this.peer.destroyed || !this.peer.open) {
+      return null;
+    }
+    if (targetSixDigitId === this.profile.id) return null;
+
+    const current = staleConn || this.connections.get(targetSixDigitId);
+    if (current) {
+      try {
+        current.close();
+      } catch {
+        // ignore
+      }
+      if (this.connections.get(targetSixDigitId) === current) {
+        this.connections.delete(targetSixDigitId);
+      }
+    }
+
+    this.callbacks.onPeerPresence(targetSixDigitId, false);
+    this.lastConnectAttempt.set(targetSixDigitId, Date.now());
+
+    try {
+      const freshConn = this.peer.connect(toFullPeerId(targetSixDigitId), {
+        reliable: true,
+      });
+      this.attachConnection(freshConn);
+      return freshConn;
+    } catch {
+      return null;
     }
   }
 
-  private handleVisibilityChange = (): void => {
-    if (this.destroyed) return;
-    if (document.visibilityState === 'visible') {
-      // Saat kembali dari file picker / kamera Android, segera pulihkan broker PeerJS bila sempat terputus
-      if (this.peer && !this.peer.destroyed && this.peer.disconnected) {
+  /**
+   * Pemulihan koneksi otomatis saat aplikasi kembali aktif dari latar belakang (visibilitychange / focus):
+   * - Anti-spam minimal 3 detik.
+   * - Cek status PeerJS (reconnect jika disconnected, buat new Peer baru jika destroyed).
+   * - Uji seluruh koneksi kontak aktif dengan PING; jika tidak ada PONG dalam 2 detik, tutup paksa zombie socket
+   *   dan buat peer.connect(...) baru agar jalur chat dan panggilan langsung segar kembali.
+   */
+  public async wakeAndSyncPeer(priorityContactIds: string[] = []): Promise<boolean> {
+    if (this.destroyed) return false;
+    const now = Date.now();
+    if (this.wakeSyncInFlight || now - this.lastWakeSyncAt < WAKE_SYNC_COOLDOWN_MS) {
+      return false;
+    }
+
+    this.wakeSyncInFlight = true;
+    this.lastWakeSyncAt = now;
+
+    try {
+      // (a) Pulihkan signaling PeerJS terlebih dahulu
+      if (!this.peer || this.peer.destroyed) {
+        this.connect();
+        await this.waitForPeerOpen(4000);
+      } else if (this.peer.disconnected) {
         try {
           this.peer.reconnect();
         } catch {
           this.connect();
         }
-      } else if (!this.peer || this.peer.destroyed) {
-        this.connect();
+        const reopened = await this.waitForPeerOpen(4000);
+        if (!reopened && !this.destroyed) {
+          // Jika socket signaling lama tersangkut total, buat instance new Peer baru
+          this.connect();
+          await this.waitForPeerOpen(4000);
+        }
+      } else if (!this.peer.open) {
+        await this.waitForPeerOpen(3000);
       }
+
+      if (this.destroyed || !this.peer || this.peer.destroyed || !this.peer.open) {
+        return false;
+      }
+
+      // (b) Uji seluruh koneksi kontak aktif dengan PING (timeout PONG 2 detik)
+      const activeEntries = Array.from(this.connections.entries());
+      const probedIds = new Set<string>();
+
+      await Promise.all(
+        activeEntries.map(async ([peerSixId, conn]) => {
+          probedIds.add(peerSixId);
+          if (this.destroyed) return;
+
+          if (!isConnectionLive(conn)) {
+            this.forceReconnectPeer(peerSixId, conn);
+            return;
+          }
+
+          const pongPromise = this.waitForPong(peerSixId, ZOMBIE_PING_TIMEOUT_MS);
+          let pingSent = false;
+          try {
+            conn.send({
+              kind: 'PING',
+              fromId: this.profile.id,
+              ts: Date.now(),
+            } satisfies PeerPacket);
+            pingSent = true;
+          } catch {
+            pingSent = false;
+          }
+
+          if (!pingSent) {
+            this.forceReconnectPeer(peerSixId, conn);
+            return;
+          }
+
+          const gotPong = await pongPromise;
+          if (this.destroyed) return;
+
+          if (gotPong) {
+            this.callbacks.onPeerPresence(peerSixId, true);
+            this.callbacks.onPeerReady?.(peerSixId);
+          } else {
+            // Tidak ada balasan PONG dalam 2 detik -> zombie socket! Tutup paksa & buat koneksi baru
+            const latestConn = this.connections.get(peerSixId);
+            if (!latestConn || latestConn === conn) {
+              this.forceReconnectPeer(peerSixId, conn);
+            }
+          }
+        })
+      );
+
+      // Sambungkan juga kontak prioritas (chat aktif, outbox tertunda, pendingCall, atau kontak 1:1) yang belum ada koneksi
+      const uniquePriority = Array.from(new Set(priorityContactIds)).filter(
+        (id) => id && id !== this.profile.id && !probedIds.has(id)
+      );
+      for (const peerSixId of uniquePriority) {
+        if (this.destroyed) break;
+        const current = this.connections.get(peerSixId);
+        if (!current || !isConnectionLive(current)) {
+          this.ensureConnection(peerSixId, true);
+        }
+      }
+
+      return true;
+    } finally {
+      this.wakeSyncInFlight = false;
     }
-  };
+  }
 
   public updateProfile(profile: UserProfile): void {
     this.profile = profile;
@@ -1113,6 +1277,7 @@ export class WA6PeerManager {
         }
 
         if (pkt.kind === 'PONG') {
+          this.resolvePongWaiters(peerSixId);
           this.callbacks.onPeerReady?.(peerSixId);
           return;
         }
@@ -1403,6 +1568,7 @@ export class WA6PeerManager {
     });
     this.awaitingFileAcks.clear();
     this.openWaiters.clear();
+    this.pongWaiters.clear();
     this.connections.forEach((conn) => {
       try {
         conn.close();
@@ -1424,9 +1590,6 @@ export class WA6PeerManager {
 
   public destroy(): void {
     this.destroyed = true;
-    if (typeof document !== 'undefined') {
-      document.removeEventListener('visibilitychange', this.handleVisibilityChange);
-    }
     this.cleanupPeer();
   }
 }
