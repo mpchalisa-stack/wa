@@ -7,10 +7,11 @@ import {
   Moon,
   MoreVertical,
   QrCode,
-  Radio,
   RefreshCw,
   Search,
   Share2,
+  Shield,
+  ShieldCheck,
   Sun,
   Trash2,
   User,
@@ -114,7 +115,7 @@ export default function App() {
   const [statuses, setStatuses] = useState<StatusItem[]>([]);
   const [calls, setCalls] = useState<CallRecord[]>([]);
   const [pendingMessages, setPendingMessages] = useState<PendingOutboxMessage[]>([]);
-  const [standbyMode, setStandbyMode] = useState(false);
+  const [standbyMode, setStandbyMode] = useState(true);
   const [unreadCounts, setUnreadCounts] = useState<Record<string, number>>(() =>
     getSavedUnreadCounts()
   );
@@ -243,6 +244,14 @@ export default function App() {
       active = false;
     };
   }, []);
+
+  // Aktifkan Mode Siaga secara default saat aplikasi pertama kali aktif dengan profil
+  useEffect(() => {
+    if (!profile) return;
+    if (standbyModeRef.current) {
+      void enableStandbyMode();
+    }
+  }, [profile?.id]);
 
   // Release Wake Lock & silent audio on unmount
   useEffect(() => {
@@ -2009,16 +2018,23 @@ export default function App() {
               />
             </div>
           ) : (
-            <div className="h-[58px] px-4 flex items-center justify-between gap-2">
+            <div className="min-h-[60px] py-1.5 px-3 flex items-center justify-between gap-1.5">
               {/* Brand & PeerJS Live Status Indicator */}
-              <div className="flex items-center gap-2 min-w-0">
+              <div className="flex items-center gap-2 min-w-0 flex-1">
                 <button
                   type="button"
                   onClick={() => setShowProfileDrawer(true)}
-                  className="inline-flex items-center gap-2 text-lg font-bold tracking-tight whitespace-nowrap hover:opacity-90 cursor-pointer shrink-0"
+                  className="inline-flex items-center gap-2 text-lg font-bold tracking-tight hover:opacity-90 cursor-pointer min-w-0"
                 >
-                  <AppLogo size={32} className="shadow-xs ring-1 ring-white/25" />
-                  <span>WattappsAU</span>
+                  <AppLogo size={32} className="shadow-xs ring-1 ring-white/25 shrink-0" />
+                  <span className="flex flex-col items-start text-left min-w-0 leading-none">
+                    <span className="text-[16px] font-bold tracking-tight leading-tight">
+                      WattappsAU
+                    </span>
+                    <span className="text-[6.5px] font-medium tracking-[0.01em] text-white/80 leading-[1.15] whitespace-normal">
+                      Wireless Air Tactical Application System Angkatan Udara
+                    </span>
+                  </span>
                 </button>
                 <button
                   type="button"
@@ -2031,7 +2047,7 @@ export default function App() {
                     }
                   }}
                   title={peerError || `ID Anda: ${profile.id}`}
-                  className="inline-flex items-center gap-1.5 text-[11.5px] font-medium text-white/90 hover:text-white transition-colors whitespace-nowrap cursor-pointer"
+                  className="inline-flex items-center gap-1 text-[11px] font-medium text-white/90 hover:text-white transition-colors whitespace-nowrap cursor-pointer shrink-0"
                 >
                   <span
                     className={`w-2 h-2 rounded-full shrink-0 ${
@@ -2060,20 +2076,24 @@ export default function App() {
                 <button
                   type="button"
                   onClick={() => void handleToggleStandby()}
-                  className={`h-8 px-2.5 mr-0.5 rounded-full inline-flex items-center gap-1.5 text-[11.5px] font-semibold transition-all cursor-pointer border ${
+                  className={`h-8 px-2 mr-0.5 rounded-full inline-flex items-center gap-1 text-[11px] font-semibold transition-all cursor-pointer border ${
                     standbyMode
                       ? 'bg-[#25D366]/20 border-[#25D366]/70 text-[#D9FDD3] shadow-[0_0_12px_rgba(37,211,102,0.35)]'
                       : 'bg-white/10 border-white/15 text-white/90 hover:bg-white/20'
                   }`}
                   title={
                     standbyMode
-                      ? 'Mode Siaga / Anti-Sleep AKTIF (ketuk untuk matikan)'
-                      : 'Aktifkan Mode Siaga / Anti-Sleep agar koneksi P2P tetap hidup'
+                      ? 'Mode Siaga Latar Belakang AKTIF (ketuk untuk matikan)'
+                      : 'Aktifkan Mode Siaga Latar Belakang agar koneksi P2P tetap hidup saat layar terkunci'
                   }
-                  aria-label="Mode Siaga Anti-Sleep"
+                  aria-label="Mode Siaga Latar Belakang"
                   aria-pressed={standbyMode}
                 >
-                  <Radio className={`w-3.5 h-3.5 shrink-0 ${standbyMode ? 'text-[#25D366] animate-pulse' : ''}`} />
+                  {standbyMode ? (
+                    <ShieldCheck className="w-3.5 h-3.5 shrink-0 text-[#25D366] animate-pulse" />
+                  ) : (
+                    <Shield className="w-3.5 h-3.5 shrink-0" />
+                  )}
                   <span>Siaga</span>
                 </button>
 
@@ -2124,14 +2144,12 @@ export default function App() {
                           className="w-full flex items-center justify-between gap-2 px-4 py-3 text-left text-sm hover:bg-[#F5F6F6] dark:hover:bg-[#182229] transition-colors cursor-pointer"
                         >
                           <span className="flex items-center gap-3 min-w-0">
-                            <Radio
-                              className={`w-4 h-4 shrink-0 ${
-                                standbyMode
-                                  ? 'text-[#00A884] animate-pulse'
-                                  : 'text-[#008069] dark:text-[#00A884]'
-                              }`}
-                            />
-                            <span className="truncate">Mode Siaga / Anti-Sleep</span>
+                            {standbyMode ? (
+                              <ShieldCheck className="w-4 h-4 shrink-0 text-[#00A884] animate-pulse" />
+                            ) : (
+                              <Shield className="w-4 h-4 shrink-0 text-[#008069] dark:text-[#00A884]" />
+                            )}
+                            <span className="truncate">Mode Siaga Latar Belakang</span>
                           </span>
                           <span
                             className={`text-[10.5px] font-bold px-1.5 py-0.5 rounded-md shrink-0 ${

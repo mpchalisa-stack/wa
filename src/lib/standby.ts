@@ -1,13 +1,21 @@
-import { getSharedAudioContext, triggerAlertVibration } from './audio';
+import { triggerAlertVibration } from './audio';
 
 /**
- * Menghasilkan WAV PCM 16-bit mono 1 detik yang hampir hening (tanpa dependensi file eksternal)
- * untuk diputar melingkar pada elemen <audio> dengan volume 0.001 saat Mode Siaga aktif.
+ * Generator Audio Hening (Silent Audio Loop):
+ * Menghasilkan file audio WAV sunyi (8000Hz, mono, 16-bit PCM, 1 detik berisi byte nol/hening)
+ * dalam bentuk Blob URL agar dapat diputar loop pada elemen <audio loop playsInline> volume 0.01.
  */
-function createSilentLoopWavDataUrl(): string {
+let cachedSilentWavBlobUrl: string | null = null;
+
+export function createSilentWavBlobUrl(): string {
+  if (cachedSilentWavBlobUrl) return cachedSilentWavBlobUrl;
+
   const sampleRate = 8000;
+  const numChannels = 1;
+  const bitsPerSample = 16;
   const numSamples = sampleRate; // 1 detik
-  const buffer = new ArrayBuffer(44 + numSamples * 2);
+  const dataByteLength = numSamples * numChannels * (bitsPerSample / 8); // 16000 bytes bernilai nol (hening)
+  const buffer = new ArrayBuffer(44 + dataByteLength);
   const view = new DataView(buffer);
 
   const writeStr = (offset: number, str: string) => {
@@ -17,29 +25,23 @@ function createSilentLoopWavDataUrl(): string {
   };
 
   writeStr(0, 'RIFF');
-  view.setUint32(4, 36 + numSamples * 2, true);
+  view.setUint32(4, 36 + dataByteLength, true);
   writeStr(8, 'WAVE');
   writeStr(12, 'fmt ');
-  view.setUint32(16, 16, true);
-  view.setUint16(20, 1, true);
-  view.setUint16(22, 1, true);
-  view.setUint32(24, sampleRate, true);
-  view.setUint32(28, sampleRate * 2, true);
-  view.setUint16(32, 2, true);
-  view.setUint16(34, 16, true);
+  view.setUint32(16, 16, true); // PCM header size
+  view.setUint16(20, 1, true); // AudioFormat = 1 (PCM)
+  view.setUint16(22, numChannels, true); // Mono
+  view.setUint32(24, sampleRate, true); // 8000 Hz
+  view.setUint32(28, sampleRate * numChannels * (bitsPerSample / 8), true); // ByteRate
+  view.setUint16(32, numChannels * (bitsPerSample / 8), true); // BlockAlign
+  view.setUint16(34, bitsPerSample, true); // 16-bit
   writeStr(36, 'data');
-  view.setUint32(40, numSamples * 2, true);
+  view.setUint32(40, dataByteLength, true);
+  // Byte data 44..(44+dataByteLength) otomatis terisi nol (0x00 = hening total) oleh ArrayBuffer
 
-  for (let i = 0; i < numSamples; i++) {
-    view.setInt16(44 + i * 2, i % 2 === 0 ? 1 : -1, true);
-  }
-
-  let binary = '';
-  const bytes = new Uint8Array(buffer);
-  for (let i = 0; i < bytes.length; i++) {
-    binary += String.fromCharCode(bytes[i]);
-  }
-  return `data:audio/wav;base64,${btoa(binary)}`;
+  const blob = new Blob([buffer], { type: 'audio/wav' });
+  cachedSilentWavBlobUrl = URL.createObjectURL(blob);
+  return cachedSilentWavBlobUrl;
 }
 
 interface WakeLockSentinelLike {
@@ -59,9 +61,8 @@ let isPausedForCall = false;
 let resumeTimer: number | null = null;
 let wakeLockSentinel: WakeLockSentinelLike | null = null;
 let keepAliveAudioEl: HTMLAudioElement | null = null;
-let keepAliveOsc: OscillatorNode | null = null;
-let keepAliveGain: GainNode | null = null;
 let visibilityListenerAttached = false;
+let pendingGestureUnlockAttached = false;
 
 async function requestScreenWakeLock(): Promise<boolean> {
   try {
@@ -96,117 +97,112 @@ async function releaseScreenWakeLock(): Promise<void> {
   }
 }
 
-function startSilentAudioKeepAlive(): boolean {
-  // Jangan pernah menyalakan silent keep-alive saat sedang ada panggilan aktif atau Mode Siaga mati
-  if (!isStandbyActive || isPausedForCall) return false;
-  let started = false;
-
-  // 1. Silent Web Audio API Oscillator (volume 0.001) agar AudioContext tetap hidup
+function registerStandbyMediaSession(state: 'playing' | 'paused' | 'none'): void {
   try {
-    const ctx = getSharedAudioContext();
-    if (ctx && !keepAliveOsc) {
-      const osc = ctx.createOscillator();
-      const gain = ctx.createGain();
-      osc.type = 'sine';
-      osc.frequency.setValueAtTime(20, ctx.currentTime);
-      gain.gain.setValueAtTime(0.001, ctx.currentTime);
-      osc.connect(gain);
-      gain.connect(ctx.destination);
-      osc.start();
-      keepAliveOsc = osc;
-      keepAliveGain = gain;
-      started = true;
+    if (typeof navigator === 'undefined' || !('mediaSession' in navigator)) return;
+    if (state === 'none') {
+      navigator.mediaSession.playbackState = 'none';
+      return;
     }
-  } catch {
-    // ignore
-  }
-
-  // 2. Looping HTML5 <audio> volume 0.001
-  try {
-    if (!keepAliveAudioEl) {
-      const audio = document.createElement('audio');
-      audio.src = createSilentLoopWavDataUrl();
-      audio.loop = true;
-      audio.volume = 0.001;
-      audio.setAttribute('playsinline', 'true');
-      keepAliveAudioEl = audio;
-    }
-    keepAliveAudioEl.volume = 0.001;
-    const playPromise = keepAliveAudioEl.play();
-    if (playPromise && typeof playPromise.then === 'function') {
-      playPromise.catch(() => {});
-    }
-    started = true;
-
-    if ('mediaSession' in navigator && typeof MediaMetadata !== 'undefined') {
+    if (typeof MediaMetadata !== 'undefined') {
       navigator.mediaSession.metadata = new MediaMetadata({
         title: 'WattappsAU — Mode Siaga Aktif',
-        artist: 'Koneksi P2P Diskomlekau',
+        artist: 'Saluran Taktis P2P Terenkripsi',
+        album: 'Diskomlekau',
         artwork: [{ src: '/icon-512.png', sizes: '512x512', type: 'image/png' }],
       });
-      navigator.mediaSession.playbackState = 'playing';
     }
+    navigator.mediaSession.playbackState = state;
   } catch {
-    // ignore
+    // ignore on unsupported browsers
   }
-
-  return started;
 }
 
-function stopSilentAudioKeepAlive(): void {
-  if (keepAliveOsc) {
-    try {
-      keepAliveOsc.stop();
-      keepAliveOsc.disconnect();
-    } catch {
-      // ignore
-    }
-    keepAliveOsc = null;
+function ensureKeepAliveAudioElement(): HTMLAudioElement {
+  if (!keepAliveAudioEl) {
+    const audio = document.createElement('audio');
+    audio.src = createSilentWavBlobUrl();
+    audio.loop = true;
+    audio.setAttribute('playsinline', 'true');
+    audio.setAttribute('webkit-playsinline', 'true');
+    audio.preload = 'auto';
+    audio.volume = 0.01;
+    keepAliveAudioEl = audio;
   }
-  if (keepAliveGain) {
-    try {
-      keepAliveGain.disconnect();
-    } catch {
-      // ignore
+  keepAliveAudioEl.loop = true;
+  keepAliveAudioEl.volume = 0.01;
+  return keepAliveAudioEl;
+}
+
+const handleGestureAutoplayResume = () => {
+  disarmPendingGestureUnlock();
+  if (!isStandbyActive || isPausedForCall) return;
+  void startSilentAudioKeepAlive();
+  void requestScreenWakeLock();
+};
+
+function armPendingGestureUnlock(): void {
+  if (pendingGestureUnlockAttached || typeof window === 'undefined') return;
+  pendingGestureUnlockAttached = true;
+  window.addEventListener('pointerdown', handleGestureAutoplayResume, { passive: true });
+  window.addEventListener('touchstart', handleGestureAutoplayResume, { passive: true });
+  window.addEventListener('keydown', handleGestureAutoplayResume, { passive: true });
+}
+
+function disarmPendingGestureUnlock(): void {
+  if (!pendingGestureUnlockAttached || typeof window === 'undefined') return;
+  pendingGestureUnlockAttached = false;
+  window.removeEventListener('pointerdown', handleGestureAutoplayResume);
+  window.removeEventListener('touchstart', handleGestureAutoplayResume);
+  window.removeEventListener('keydown', handleGestureAutoplayResume);
+}
+
+async function startSilentAudioKeepAlive(): Promise<boolean> {
+  // Jangan pernah menyalakan silent keep-alive saat panggilan aktif atau Mode Siaga mati
+  if (!isStandbyActive || isPausedForCall) return false;
+  if (typeof document === 'undefined') return false;
+
+  try {
+    const audio = ensureKeepAliveAudioElement();
+    const playPromise = audio.play();
+    if (playPromise && typeof playPromise.then === 'function') {
+      await playPromise;
     }
-    keepAliveGain = null;
+    disarmPendingGestureUnlock();
+    registerStandbyMediaSession('playing');
+    return true;
+  } catch {
+    // Jika browser memblokir autoplay sebelum interaksi pertama (default Mode Siaga saat baru dibuka),
+    // tunggu sentuhan/klik pertama di layar untuk otomatis menyalakan audio loop & Media Session
+    armPendingGestureUnlock();
+    return false;
   }
+}
+
+function stopSilentAudioKeepAlive(playbackState: 'paused' | 'none' = 'none'): void {
   if (keepAliveAudioEl) {
     try {
       keepAliveAudioEl.pause();
-      keepAliveAudioEl.currentTime = 0;
     } catch {
       // ignore
     }
   }
-  try {
-    if ('mediaSession' in navigator) {
-      navigator.mediaSession.playbackState = 'none';
-    }
-  } catch {
-    // ignore
-  }
+  registerStandbyMediaSession(playbackState);
 }
 
 const handleStandbyVisibilityChange = () => {
   if (!isStandbyActive) return;
   if (document.visibilityState === 'visible') {
     void requestScreenWakeLock();
-    if (!isPausedForCall) {
-      const ctx = getSharedAudioContext();
-      if (ctx && ctx.state === 'suspended') {
-        void ctx.resume();
-      }
-      if (keepAliveAudioEl && keepAliveAudioEl.paused) {
-        keepAliveAudioEl.play().catch(() => {});
-      }
+    if (!isPausedForCall && keepAliveAudioEl && keepAliveAudioEl.paused) {
+      void startSilentAudioKeepAlive();
     }
   }
 };
 
 /**
- * Hentikan otomatis Silent Audio Keep-Alive saat panggilan masuk/keluar dimulai
- * agar tidak membentrokkan AudioContext mikrofon & speaker pada perangkat Android (Poco X8 Pro, Galaxy Tab S8, dll).
+ * Transisi Otomatis Saat Panggilan Masuk / Keluar (Anti-Bentrok Audio):
+ * Jeda sementara (audio.pause()) silent audio loop agar mikrofon & speaker panggilan tidak bentrok.
  */
 export function pauseKeepAliveForCall(): void {
   if (resumeTimer !== null) {
@@ -214,11 +210,12 @@ export function pauseKeepAliveForCall(): void {
     resumeTimer = null;
   }
   isPausedForCall = true;
-  stopSilentAudioKeepAlive();
+  stopSilentAudioKeepAlive('paused');
 }
 
 /**
- * Lanjutkan Silent Audio Keep-Alive setelah panggilan berakhir jika Mode Siaga masih menyala.
+ * Setelah panggilan selesai (call.on('close')), jika Mode Siaga masih aktif,
+ * otomatis jalankan kembali audio.play() dan Media Session agar HP kembali siaga saat layar dikunci.
  */
 export function resumeKeepAliveAfterCall(): void {
   isPausedForCall = false;
@@ -229,9 +226,10 @@ export function resumeKeepAliveAfterCall(): void {
   resumeTimer = window.setTimeout(() => {
     resumeTimer = null;
     if (isStandbyActive && !isPausedForCall) {
-      startSilentAudioKeepAlive();
+      void startSilentAudioKeepAlive();
+      void requestScreenWakeLock();
     }
-  }, 700);
+  }, 600);
 }
 
 export async function requestNotificationPermission(): Promise<NotificationPermission | 'unsupported'> {
@@ -267,8 +265,8 @@ export async function enableStandbyMode(): Promise<{
     visibilityListenerAttached = true;
   }
 
-  const audioKeepAliveActive = !isPausedForCall ? startSilentAudioKeepAlive() : false;
-  const [wakeLockActive, notificationPermission] = await Promise.all([
+  const [audioKeepAliveActive, wakeLockActive, notificationPermission] = await Promise.all([
+    !isPausedForCall ? startSilentAudioKeepAlive() : Promise.resolve(false),
     requestScreenWakeLock(),
     requestNotificationPermission(),
   ]);
@@ -278,6 +276,7 @@ export async function enableStandbyMode(): Promise<{
 
 export async function disableStandbyMode(): Promise<void> {
   isStandbyActive = false;
+  disarmPendingGestureUnlock();
   if (resumeTimer !== null) {
     window.clearTimeout(resumeTimer);
     resumeTimer = null;
@@ -286,7 +285,7 @@ export async function disableStandbyMode(): Promise<void> {
     document.removeEventListener('visibilitychange', handleStandbyVisibilityChange);
     visibilityListenerAttached = false;
   }
-  stopSilentAudioKeepAlive();
+  stopSilentAudioKeepAlive('none');
   await releaseScreenWakeLock();
 }
 
@@ -302,7 +301,6 @@ export function showIncomingWebNotification(options: {
   if (typeof window === 'undefined' || !('Notification' in window)) return;
   if (Notification.permission !== 'granted') return;
 
-  // Untuk panggilan masuk, selalu tampilkan banner mengambang; untuk pesan, tampilkan jika tab tidak fokus/latar belakang atau Mode Siaga aktif
   const shouldNotify =
     options.isCall ||
     isStandbyActive ||
@@ -336,7 +334,6 @@ export function showIncomingWebNotification(options: {
       notif.close();
     };
   } catch {
-    // Fallback melalui ServiceWorkerRegistration untuk Android PWA
     if ('serviceWorker' in navigator) {
       navigator.serviceWorker.ready
         .then((reg) => {
