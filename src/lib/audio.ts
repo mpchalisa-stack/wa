@@ -119,67 +119,67 @@ function playMarimbaNote(
   harmonic.stop(startTime + duration + 0.02);
 }
 
-function playTelephoneBurst(ctx: AudioContext, startTime: number, duration: number, gainPeak = 0.42) {
-  // Osilator ganda nyaring 480Hz + 620Hz (nada dering taktis) + harmonisa ringan agar tembus speaker HP
+function playTelephoneBurst(ctx: AudioContext, startTime: number, duration: number, gainPeak = 0.34) {
+  // Osilator ganda 440Hz + 480Hz pola dering telepon klasik + sedikit harmonisa agar nyaring di speaker HP
+  const osc440 = ctx.createOscillator();
   const osc480 = ctx.createOscillator();
-  const osc620 = ctx.createOscillator();
   const oscHarmonic = ctx.createOscillator();
   const masterGain = ctx.createGain();
   const harmonicGain = ctx.createGain();
 
+  osc440.type = 'sine';
   osc480.type = 'sine';
-  osc620.type = 'sine';
   oscHarmonic.type = 'triangle';
 
+  osc440.frequency.setValueAtTime(440, startTime);
   osc480.frequency.setValueAtTime(480, startTime);
-  osc620.frequency.setValueAtTime(620, startTime);
-  oscHarmonic.frequency.setValueAtTime(1100, startTime);
+  oscHarmonic.frequency.setValueAtTime(920, startTime);
 
   harmonicGain.gain.setValueAtTime(0.18, startTime);
 
   masterGain.gain.setValueAtTime(0.0001, startTime);
-  masterGain.gain.linearRampToValueAtTime(gainPeak, startTime + 0.02);
+  masterGain.gain.linearRampToValueAtTime(gainPeak, startTime + 0.025);
   masterGain.gain.setValueAtTime(gainPeak, startTime + Math.max(0.05, duration - 0.03));
   masterGain.gain.linearRampToValueAtTime(0.0001, startTime + duration);
 
+  osc440.connect(masterGain);
   osc480.connect(masterGain);
-  osc620.connect(masterGain);
   oscHarmonic.connect(harmonicGain);
   harmonicGain.connect(masterGain);
   masterGain.connect(ctx.destination);
 
+  osc440.start(startTime);
   osc480.start(startTime);
-  osc620.start(startTime);
   oscHarmonic.start(startTime);
 
   const stopAt = startTime + duration + 0.03;
+  osc440.stop(stopAt);
   osc480.stop(stopAt);
-  osc620.stop(stopAt);
   oscHarmonic.stop(stopAt);
 }
 
 /**
  * Nada dering panggilan masuk nyaring:
- * Osilator ganda 480Hz + 620Hz berulang via AudioContext + getaran [1000, 400, 1000, 400, 1000] ms
- * sampai panggilan diangkat atau ditolak.
+ * Osilator ganda 440Hz + 480Hz pola dering telepon berulang + getaran [800, 400, 800] ms
+ * hingga panggilan diangkat atau ditolak.
  */
 export function startIncomingRingtone(): void {
   stopRingtone();
   const playPattern = () => {
-    triggerAlertVibration([1000, 400, 1000, 400, 1000]);
+    triggerAlertVibration([800, 400, 800]);
     const ctx = getSharedAudioContext();
     if (!ctx) return;
     if (ctx.state === 'suspended') {
       void ctx.resume();
     }
     const now = ctx.currentTime;
-    // Pola dering ganda nyaring: ring 0.48s - jeda 0.18s - ring 0.58s
-    playTelephoneBurst(ctx, now, 0.48, 0.42);
-    playTelephoneBurst(ctx, now + 0.66, 0.58, 0.42);
+    // Pola dering ganda khas telepon: ring 0.45s - jeda 0.18s - ring 0.55s
+    playTelephoneBurst(ctx, now, 0.45, 0.34);
+    playTelephoneBurst(ctx, now + 0.63, 0.55, 0.34);
   };
 
   playPattern();
-  ringtoneTimer = window.setInterval(playPattern, 2400);
+  ringtoneTimer = window.setInterval(playPattern, 2600);
 }
 
 export function startOutgoingRingback(): void {

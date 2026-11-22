@@ -106,7 +106,7 @@ function registerStandbyMediaSession(state: 'playing' | 'paused' | 'none'): void
     }
     if (typeof MediaMetadata !== 'undefined') {
       navigator.mediaSession.metadata = new MediaMetadata({
-        title: 'WattappsAU — Siaga Panggilan',
+        title: 'WattappsAU — Mode Siaga Aktif',
         artist: 'Saluran Taktis P2P Terenkripsi',
         album: 'Diskomlekau',
         artwork: [{ src: '/icon-512.png', sizes: '512x512', type: 'image/png' }],
@@ -126,11 +126,11 @@ function ensureKeepAliveAudioElement(): HTMLAudioElement {
     audio.setAttribute('playsinline', 'true');
     audio.setAttribute('webkit-playsinline', 'true');
     audio.preload = 'auto';
-    audio.volume = 0.05;
+    audio.volume = 0.01;
     keepAliveAudioEl = audio;
   }
   keepAliveAudioEl.loop = true;
-  keepAliveAudioEl.volume = 0.05;
+  keepAliveAudioEl.volume = 0.01;
   return keepAliveAudioEl;
 }
 
@@ -201,29 +201,6 @@ const handleStandbyVisibilityChange = () => {
 };
 
 /**
- * Pastikan Service Worker (/sw.js) terdaftar & siap agar registration.showNotification()
- * bekerja penuh di Android Lock Screen PWA (bukan new Notification()).
- */
-export async function ensureServiceWorkerRegistered(): Promise<ServiceWorkerRegistration | null> {
-  if (typeof navigator === 'undefined' || !('serviceWorker' in navigator)) {
-    return null;
-  }
-  try {
-    const existing = await navigator.serviceWorker.getRegistration('/sw.js');
-    if (!existing) {
-      await navigator.serviceWorker.register('/sw.js');
-    }
-    return await navigator.serviceWorker.ready;
-  } catch {
-    try {
-      return await navigator.serviceWorker.ready;
-    } catch {
-      return null;
-    }
-  }
-}
-
-/**
  * Transisi Otomatis Saat Panggilan Masuk / Keluar (Anti-Bentrok Audio):
  * Jeda sementara (audio.pause()) silent audio loop agar mikrofon & speaker panggilan tidak bentrok.
  */
@@ -256,7 +233,6 @@ export function resumeKeepAliveAfterCall(): void {
 }
 
 export async function requestNotificationPermission(): Promise<NotificationPermission | 'unsupported'> {
-  void ensureServiceWorkerRegistered();
   if (typeof window === 'undefined' || !('Notification' in window)) {
     return 'unsupported';
   }
@@ -313,56 +289,6 @@ export async function disableStandbyMode(): Promise<void> {
   await releaseScreenWakeLock();
 }
 
-type ExtendedNotificationOptions = NotificationOptions & {
-  renotify?: boolean;
-  vibrate?: number[];
-};
-
-/**
- * Notifikasi Panggilan Masuk Lock Screen Android via Service Worker (registration.showNotification).
- * Tidak menggunakan new Notification() agar bekerja normal pada Chrome Android PWA saat layar terkunci.
- */
-export async function showIncomingCallLockScreenNotification(callerName: string): Promise<void> {
-  triggerAlertVibration([1000, 400, 1000, 400, 1000]);
-
-  if (typeof window === 'undefined' || !('Notification' in window)) return;
-  if (Notification.permission !== 'granted') return;
-
-  const title = 'Panggilan Taktis Masuk — WattappsAU';
-  const options: ExtendedNotificationOptions = {
-    body: `Dari: ${callerName} (Ketuk untuk mengangkat)`,
-    icon: '/icon-512.png',
-    badge: '/icon-512.png',
-    tag: 'incoming-call',
-    renotify: true,
-    requireInteraction: true,
-    vibrate: [1000, 400, 1000, 400, 1000],
-  };
-
-  if ('serviceWorker' in navigator) {
-    const reg = await ensureServiceWorkerRegistered();
-    if (reg) {
-      try {
-        await reg.showNotification(title, options);
-        return;
-      } catch {
-        // fallback below if SW showNotification throws in restricted preview
-      }
-    }
-  }
-}
-
-export async function dismissIncomingCallNotification(): Promise<void> {
-  if (typeof navigator === 'undefined' || !('serviceWorker' in navigator)) return;
-  try {
-    const reg = await navigator.serviceWorker.ready;
-    const active = await reg.getNotifications({ tag: 'incoming-call' });
-    active.forEach((n) => n.close());
-  } catch {
-    // ignore
-  }
-}
-
 export function showIncomingWebNotification(options: {
   title: string;
   body: string;
@@ -370,7 +296,7 @@ export function showIncomingWebNotification(options: {
   isCall?: boolean;
   onClick?: () => void;
 }): void {
-  triggerAlertVibration(options.isCall ? [1000, 400, 1000, 400, 1000] : [500, 200, 500]);
+  triggerAlertVibration(options.isCall ? [800, 400, 800] : [500, 200, 500]);
 
   if (typeof window === 'undefined' || !('Notification' in window)) return;
   if (Notification.permission !== 'granted') return;
@@ -383,27 +309,43 @@ export function showIncomingWebNotification(options: {
 
   if (!shouldNotify) return;
 
-  if (options.isCall) {
-    void showIncomingCallLockScreenNotification(options.title);
-    return;
-  }
+  const notifTitle = options.isCall ? 'Panggilan Masuk - WattappsAU' : options.title;
+  const notifBody = options.isCall
+    ? options.body || 'Ketuk untuk menjawab panggilan...'
+    : options.body;
 
-  const swOptions: ExtendedNotificationOptions = {
-    body: options.body,
-    icon: '/icon-512.png',
-    badge: '/icon-512.png',
-    tag: options.tag,
-    renotify: true,
-    requireInteraction: false,
-    vibrate: [500, 200, 500],
-  };
-
-  if ('serviceWorker' in navigator) {
-    void ensureServiceWorkerRegistered().then((reg) => {
-      if (reg) {
-        return reg.showNotification(options.title, swOptions).catch(() => {});
-      }
-      return undefined;
+  try {
+    const notif = new Notification(notifTitle, {
+      body: notifBody,
+      icon: '/icon-512.png',
+      badge: '/icon-512.png',
+      tag: options.tag,
+      requireInteraction: Boolean(options.isCall),
+      silent: false,
     });
+
+    notif.onclick = () => {
+      try {
+        window.focus();
+      } catch {
+        // ignore
+      }
+      options.onClick?.();
+      notif.close();
+    };
+  } catch {
+    if ('serviceWorker' in navigator) {
+      navigator.serviceWorker.ready
+        .then((reg) => {
+          void reg.showNotification(notifTitle, {
+            body: notifBody,
+            icon: '/icon-512.png',
+            badge: '/icon-512.png',
+            tag: options.tag,
+            requireInteraction: Boolean(options.isCall),
+          });
+        })
+        .catch(() => {});
+    }
   }
 }

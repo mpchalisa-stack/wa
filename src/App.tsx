@@ -68,12 +68,10 @@ import {
 } from './lib/audio';
 import {
   disableStandbyMode,
-  dismissIncomingCallNotification,
   enableStandbyMode,
   pauseKeepAliveForCall,
   requestNotificationPermission,
   resumeKeepAliveAfterCall,
-  showIncomingCallLockScreenNotification,
   showIncomingWebNotification,
 } from './lib/standby';
 import { sendNtfyWakeSignal, subscribeNtfySignal } from './lib/ntfy';
@@ -365,7 +363,6 @@ export default function App() {
         wakeRingtoneTimerRef.current = null;
       }
       stopRingtone();
-      void dismissIncomingCallNotification();
       if (callTimerRef.current !== null) {
         window.clearInterval(callTimerRef.current);
         callTimerRef.current = null;
@@ -641,9 +638,8 @@ export default function App() {
           break;
         }
 
-        case 'CALL_INVITE':
         case 'CALL_REQUEST': {
-          // Jeda silent audio keep-alive, bunyikan dering nyaring 480Hz+620Hz, & tampilkan SW Lock Screen notification
+          // Mulai nada dering 440Hz+480Hz + notifikasi mengambang segera saat sinyal panggilan masuk tiba
           if (!callRuntimeRef.current) {
             pauseKeepAliveForCall();
             startIncomingRingtone();
@@ -651,7 +647,12 @@ export default function App() {
               contactsRef.current.find((c) => c.id === fromId)?.name ||
               packet.fromName ||
               `ID ${fromId}`;
-            void showIncomingCallLockScreenNotification(callerName);
+            showIncomingWebNotification({
+              title: 'Panggilan Masuk - WattappsAU',
+              body: `${callerName} menelepon · Ketuk untuk menjawab panggilan...`,
+              tag: `call-${packet.callId}`,
+              isCall: true,
+            });
             if (wakeRingtoneTimerRef.current !== null) {
               window.clearTimeout(wakeRingtoneTimerRef.current);
             }
@@ -659,7 +660,6 @@ export default function App() {
               wakeRingtoneTimerRef.current = null;
               if (!callRuntimeRef.current) {
                 stopRingtone();
-                void dismissIncomingCallNotification();
                 resumeKeepAliveAfterCall();
               }
             }, 25000);
@@ -759,7 +759,12 @@ export default function App() {
       });
 
       startIncomingRingtone();
-      void showIncomingCallLockScreenNotification(callerName);
+      showIncomingWebNotification({
+        title: 'Panggilan Masuk - WattappsAU',
+        body: `${callerName} (${callType === 'video' ? 'Video' : 'Suara'}) · Ketuk untuk menjawab panggilan...`,
+        tag: `call-${callId}`,
+        isCall: true,
+      });
 
       mediaCall.on('close', () => {
         if (callRuntimeRef.current?.callId === callId) {
@@ -1153,7 +1158,12 @@ export default function App() {
         if (!callRuntimeRef.current) {
           pauseKeepAliveForCall();
           startIncomingRingtone();
-          void showIncomingCallLockScreenNotification(senderLabel);
+          showIncomingWebNotification({
+            title: 'Panggilan Masuk - WattappsAU',
+            body: `${senderLabel} menelepon · Ketuk untuk menjawab panggilan...`,
+            tag: `call-${signal.callId || signal.ts}`,
+            isCall: true,
+          });
           if (wakeRingtoneTimerRef.current !== null) {
             window.clearTimeout(wakeRingtoneTimerRef.current);
           }
@@ -1161,7 +1171,6 @@ export default function App() {
             wakeRingtoneTimerRef.current = null;
             if (!callRuntimeRef.current) {
               stopRingtone();
-              void dismissIncomingCallNotification();
               resumeKeepAliveAfterCall();
             }
           }, 25000);
@@ -1681,9 +1690,9 @@ export default function App() {
       });
       showToast(`Sinyal bangun panggilan dikirim ke ${peerName} via ntfy`);
     } else {
-      // Kirim paket CALL_INVITE langsung lewat DataChannel agar notifikasi Lock Screen & dering 480Hz+620Hz lawan segera aktif
+      // Kirim paket CALL_REQUEST langsung lewat DataChannel agar dering 440Hz+480Hz lawan segera berbunyi
       manager.sendPacket(peerId, {
-        kind: 'CALL_INVITE',
+        kind: 'CALL_REQUEST',
         callId,
         callType,
         fromId: profile.id,
@@ -1786,7 +1795,6 @@ export default function App() {
     const rt = callRuntimeRef.current;
     if (!rt) return;
     stopRingtone();
-    void dismissIncomingCallNotification();
 
     try {
       const localStream = await navigator.mediaDevices.getUserMedia({
@@ -2073,7 +2081,11 @@ export default function App() {
                       ? 'bg-[#25D366]/20 border-[#25D366]/70 text-[#D9FDD3] shadow-[0_0_12px_rgba(37,211,102,0.35)]'
                       : 'bg-white/10 border-white/15 text-white/90 hover:bg-white/20'
                   }`}
-                  title="Tekan tombol Home (jangan tutup/swipe aplikasi) dan biarkan Mode Siaga menyala agar telepon tetap masuk saat layar mati."
+                  title={
+                    standbyMode
+                      ? 'Mode Siaga Latar Belakang AKTIF (ketuk untuk matikan)'
+                      : 'Aktifkan Mode Siaga Latar Belakang agar koneksi P2P tetap hidup saat layar terkunci'
+                  }
                   aria-label="Mode Siaga Latar Belakang"
                   aria-pressed={standbyMode}
                 >
@@ -2225,27 +2237,6 @@ export default function App() {
                   )}
                 </div>
               </div>
-            </div>
-          )}
-
-          {/* Glowing Green Lock-Screen Standby Indicator */}
-          {standbyMode && !searchOpen && (
-            <div
-              className="px-3 py-1 bg-[#072B23]/65 dark:bg-[#0D211C]/90 border-y border-[#25D366]/30 flex items-center justify-between gap-2"
-              title="Tekan tombol Home (jangan tutup/swipe aplikasi) dan biarkan Mode Siaga menyala agar telepon tetap masuk saat layar mati."
-            >
-              <div className="flex items-center gap-2 min-w-0">
-                <span className="relative flex h-2 w-2 shrink-0">
-                  <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-[#25D366] opacity-80" />
-                  <span className="relative inline-flex rounded-full h-2 w-2 bg-[#25D366] shadow-[0_0_8px_#25D366]" />
-                </span>
-                <span className="text-[10.5px] font-bold tracking-wide text-[#7CFCB0] drop-shadow-[0_0_6px_rgba(37,211,102,0.45)] truncate">
-                  SIAGA AKTIF (Lock-Screen Ready)
-                </span>
-              </div>
-              <span className="text-[9.5px] text-white/70 hidden sm:inline shrink-0">
-                Tekan Home · Jangan tutup app
-              </span>
             </div>
           )}
 
