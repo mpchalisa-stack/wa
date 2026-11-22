@@ -110,3 +110,21 @@
     transition-duration: 0.01ms !important;
   }
 }
+
+@keyframes wa-ring-shake {
+  0%, 100% { transform: rotate(0deg) scale(1); }
+  10%, 30%, 50% { transform: rotate(-14deg) scale(1.06); }
+  20%, 40%, 60% { transform: rotate(14deg) scale(1.06); }
+  70% { transform: rotate(0deg) scale(1); }
+}
+
+@keyframes wa-radar-pulse {
+  0% { transform: scale(0.95); opacity: 0.75; }
+  70% { transform: scale(1.65); opacity: 0; }
+  100% { transform: scale(1.65); opacity: 0; }
+}
+
+@keyframes wa-text-pulse {
+  0%, 100% { opacity: 1; transform: translateY(0px); }
+  50% { opacity: 0.7; transform: translateY(-2px); }
+}
