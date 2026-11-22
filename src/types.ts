@@ -43,6 +43,7 @@ export interface ChatMessage {
   senderName: string;
   type: MessageType;
   text?: string;
+  mediaId?: string; // Reference key in IndexedDB `media` store
   mediaData?: string; // Base64 Data URL for image, video, document, or voice
   fileName?: string;
   fileSize?: number;
@@ -50,6 +51,8 @@ export interface ChatMessage {
   duration?: number; // Seconds for voice note
   timestamp: number;
   status: MessageStatus;
+  transferProgress?: number; // 0-100 while chunking/sending until Centang 2 (delivered/read)
+  transferWaitingPeer?: boolean; // True when target peer is offline and transfer is queued
   replyTo?: ReplyPreview;
   deleted?: boolean;
   isGroup?: boolean;
@@ -87,6 +90,65 @@ export interface CallRecord {
   duration: number; // Seconds
 }
 
+export interface GroupMeta {
+  id: string;
+  name: string;
+  avatar: string;
+  members: string[];
+  memberNames: Record<string, string>;
+  adminId: string;
+}
+
+export interface ChunkMessageMeta {
+  id: string;
+  chatId: string;
+  senderId: string;
+  senderName: string;
+  msgType: 'image' | 'video' | 'document' | 'voice';
+  text?: string;
+  duration?: number;
+  timestamp: number;
+  replyTo?: ReplyPreview;
+  isGroup?: boolean;
+  groupMeta?: GroupMeta;
+}
+
+export interface ChunkStatusMeta {
+  id: string;
+  userId: string;
+  userName: string;
+  userAvatar: string;
+  caption?: string;
+  timestamp: number;
+  expiresAt: number;
+}
+
+/**
+ * Paket JSON Chunking WebRTC (<= 16 KB / 16384 bytes per FILE_CHUNK)
+ * untuk seluruh pengiriman gambar, foto kamera, video, dokumen, voice note, dan foto status.
+ */
+export type FileChunkPacket =
+  | {
+      type: 'FILE_START';
+      fileId: string;
+      fileName: string;
+      fileType: string;
+      fileSize: number;
+      totalChunks: number;
+      messageMeta?: ChunkMessageMeta;
+      statusMeta?: ChunkStatusMeta;
+    }
+  | {
+      type: 'FILE_CHUNK';
+      fileId: string;
+      chunkIndex: number;
+      data: string;
+    }
+  | {
+      type: 'FILE_END';
+      fileId: string;
+    };
+
 export type PeerPacket =
   | {
       kind: 'HELLO';
@@ -95,14 +157,7 @@ export type PeerPacket =
   | {
       kind: 'MESSAGE';
       message: ChatMessage;
-      groupMeta?: {
-        id: string;
-        name: string;
-        avatar: string;
-        members: string[];
-        memberNames: Record<string, string>;
-        adminId: string;
-      };
+      groupMeta?: GroupMeta;
     }
   | {
       kind: 'DELIVERY_ACK';
@@ -146,3 +201,5 @@ export type PeerPacket =
       fromName: string;
       fromAvatar: string;
     };
+
+export type WirePacket = PeerPacket | FileChunkPacket;

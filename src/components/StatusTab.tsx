@@ -146,7 +146,7 @@ export const StatusTab: React.FC<StatusTabProps> = ({
     if (!file) return;
     e.target.value = '';
     try {
-      const dataUrl = await compressImageFile(file, 1080, 0.84);
+      const dataUrl = await compressImageFile(file, 1024, 0.7);
       onPostImageStatus(dataUrl, '');
     } catch {
       // ignore

@@ -1,20 +1,32 @@
 import { CallRecord, ChatMessage, Contact, StatusItem, ThemeMode, UserProfile } from '../types';
+import { dataUrlToBlob, fileToDataUrl } from './media';
 
 const DB_NAME = 'WA6LocalDatabase';
-const DB_VERSION = 1;
+const DB_VERSION = 2;
 
 const STORES = {
   contacts: 'contacts',
   messages: 'messages',
+  media: 'media', // Dedicated IndexedDB store for binary Blobs (images, videos, documents, voice notes)
   statuses: 'statuses',
   calls: 'calls',
 } as const;
+
+interface StoredMediaRecord {
+  id: string;
+  chatId: string;
+  blob: Blob;
+  mimeType: string;
+  fileName?: string;
+  fileSize?: number;
+  createdAt: number;
+}
 
 const PROFILE_KEY = 'wa6_user_profile_v1';
 const THEME_KEY = 'wa6_theme_mode_v1';
 const UNREAD_KEY = 'wa6_unread_counts_v1';
 
-// Profile & Theme helpers in localStorage
+// Lightweight preferences only in localStorage (NEVER store chat messages or media in localStorage)
 export function getSavedProfile(): UserProfile | null {
   try {
     const raw = localStorage.getItem(PROFILE_KEY);
@@ -75,7 +87,7 @@ export function saveUnreadCounts(counts: Record<string, number>): void {
   }
 }
 
-// IndexedDB for contacts, chat history (including base64 media/VN), statuses, and calls
+// IndexedDB for contacts, chat history, binary media Blobs, statuses, and calls
 function openDB(): Promise<IDBDatabase> {
   return new Promise((resolve, reject) => {
     const request = indexedDB.open(DB_NAME, DB_VERSION);
@@ -88,6 +100,10 @@ function openDB(): Promise<IDBDatabase> {
         const msgStore = db.createObjectStore(STORES.messages, { keyPath: 'id' });
         msgStore.createIndex('chatId', 'chatId', { unique: false });
         msgStore.createIndex('timestamp', 'timestamp', { unique: false });
+      }
+      if (!db.objectStoreNames.contains(STORES.media)) {
+        const mediaStore = db.createObjectStore(STORES.media, { keyPath: 'id' });
+        mediaStore.createIndex('chatId', 'chatId', { unique: false });
       }
       if (!db.objectStoreNames.contains(STORES.statuses)) {
         db.createObjectStore(STORES.statuses, { keyPath: 'id' });
@@ -145,6 +161,64 @@ async function deleteFromStore(storeName: string, key: string): Promise<void> {
   }
 }
 
+/**
+ * Menyimpan pesan chat ke IndexedDB.
+ * Jika pesan memiliki gambar/video/dokumen/voice note, payload biner disimpan sebagai Blob
+ * di object store `media` terpisah agar IndexedDB hemat memori & bebas batas 5 MB localStorage.
+ */
+export async function dbSaveMessage(msg: ChatMessage): Promise<void> {
+  try {
+    const db = await openDB();
+    let recordToStore: ChatMessage = { ...msg };
+    // Jangan simpan progres sementara ke storage permanen jika sudah terkirim/diterima
+    if (recordToStore.status === 'delivered' || recordToStore.status === 'read') {
+      delete recordToStore.transferProgress;
+      delete recordToStore.transferWaitingPeer;
+    }
+
+    let mediaRecord: StoredMediaRecord | null = null;
+    if (recordToStore.mediaData && !recordToStore.deleted) {
+      const mediaId = recordToStore.mediaId || `media-${recordToStore.id}`;
+      try {
+        const blob = dataUrlToBlob(recordToStore.mediaData);
+        mediaRecord = {
+          id: mediaId,
+          chatId: recordToStore.chatId,
+          blob,
+          mimeType: recordToStore.mimeType || blob.type,
+          fileName: recordToStore.fileName,
+          fileSize: recordToStore.fileSize || blob.size,
+          createdAt: recordToStore.timestamp,
+        };
+        // Simpan referensi mediaId pada pesan dan kosongkan base64 duplikat di store messages
+        recordToStore = { ...recordToStore, mediaId, mediaData: undefined };
+      } catch {
+        // Fallback tetap simpan di IndexedDB messages store jika bukan data URL standar
+      }
+    }
+
+    await new Promise<void>((resolve, reject) => {
+      const storeNames = mediaRecord ? [STORES.messages, STORES.media] : [STORES.messages];
+      const tx = db.transaction(storeNames, 'readwrite');
+      tx.objectStore(STORES.messages).put(recordToStore);
+      if (mediaRecord) {
+        tx.objectStore(STORES.media).put(mediaRecord);
+      }
+      if (recordToStore.deleted && recordToStore.mediaId) {
+        try {
+          db.transaction(STORES.media, 'readwrite').objectStore(STORES.media).delete(recordToStore.mediaId);
+        } catch {
+          // ignore
+        }
+      }
+      tx.oncomplete = () => resolve();
+      tx.onerror = () => reject(tx.error);
+    });
+  } catch (err) {
+    console.error('IndexedDB save message error:', err);
+  }
+}
+
 export async function loadAllLocalData(): Promise<{
   contacts: Contact[];
   messages: ChatMessage[];
@@ -152,12 +226,36 @@ export async function loadAllLocalData(): Promise<{
   calls: CallRecord[];
 }> {
   const now = Date.now();
-  const [contacts, messages, rawStatuses, calls] = await Promise.all([
+  const [contacts, rawMessages, mediaRecords, rawStatuses, calls] = await Promise.all([
     getAllFromStore<Contact>(STORES.contacts),
     getAllFromStore<ChatMessage>(STORES.messages),
+    getAllFromStore<StoredMediaRecord>(STORES.media),
     getAllFromStore<StatusItem>(STORES.statuses),
     getAllFromStore<CallRecord>(STORES.calls),
   ]);
+
+  // Rehydrate media Blobs from IndexedDB `media` store back into DataURLs for UI & download
+  const mediaMap = new Map<string, StoredMediaRecord>();
+  for (const m of mediaRecords) {
+    mediaMap.set(m.id, m);
+  }
+
+  const messages: ChatMessage[] = await Promise.all(
+    rawMessages.map(async (msg) => {
+      if (msg.mediaId && !msg.mediaData && !msg.deleted) {
+        const mediaRec = mediaMap.get(msg.mediaId);
+        if (mediaRec?.blob) {
+          try {
+            const dataUrl = await fileToDataUrl(mediaRec.blob);
+            return { ...msg, mediaData: dataUrl };
+          } catch {
+            return msg;
+          }
+        }
+      }
+      return msg;
+    })
+  );
 
   // Filter out expired statuses (>24 hours) and delete them from IndexedDB
   const validStatuses: StatusItem[] = [];
@@ -178,7 +276,6 @@ export async function loadAllLocalData(): Promise<{
 
 export const dbSaveContact = (contact: Contact) => putInStore(STORES.contacts, contact);
 export const dbDeleteContact = (id: string) => deleteFromStore(STORES.contacts, id);
-export const dbSaveMessage = (msg: ChatMessage) => putInStore(STORES.messages, msg);
 export const dbSaveStatus = (status: StatusItem) => putInStore(STORES.statuses, status);
 export const dbDeleteStatus = (id: string) => deleteFromStore(STORES.statuses, id);
 export const dbSaveCall = (call: CallRecord) => putInStore(STORES.calls, call);
@@ -187,22 +284,32 @@ export async function dbDeleteMessagesForChat(chatId: string): Promise<void> {
   try {
     const db = await openDB();
     await new Promise<void>((resolve, reject) => {
-      const tx = db.transaction(STORES.messages, 'readwrite');
-      const store = tx.objectStore(STORES.messages);
-      const idx = store.index('chatId');
-      const req = idx.openCursor(IDBKeyRange.only(chatId));
-      req.onsuccess = () => {
-        const cursor = req.result;
+      const tx = db.transaction([STORES.messages, STORES.media], 'readwrite');
+      const msgIdx = tx.objectStore(STORES.messages).index('chatId');
+      const msgReq = msgIdx.openCursor(IDBKeyRange.only(chatId));
+      msgReq.onsuccess = () => {
+        const cursor = msgReq.result;
         if (cursor) {
           cursor.delete();
           cursor.continue();
         }
       };
+
+      const mediaIdx = tx.objectStore(STORES.media).index('chatId');
+      const mediaReq = mediaIdx.openCursor(IDBKeyRange.only(chatId));
+      mediaReq.onsuccess = () => {
+        const cursor = mediaReq.result;
+        if (cursor) {
+          cursor.delete();
+          cursor.continue();
+        }
+      };
+
       tx.oncomplete = () => resolve();
       tx.onerror = () => reject(tx.error);
     });
   } catch (err) {
-    console.error('Failed to clear chat messages:', err);
+    console.error('Failed to clear chat messages & media:', err);
   }
 }
 
@@ -227,11 +334,12 @@ export async function resetAllLocalData(): Promise<void> {
     const db = await openDB();
     await new Promise<void>((resolve, reject) => {
       const tx = db.transaction(
-        [STORES.contacts, STORES.messages, STORES.statuses, STORES.calls],
+        [STORES.contacts, STORES.messages, STORES.media, STORES.statuses, STORES.calls],
         'readwrite'
       );
       tx.objectStore(STORES.contacts).clear();
       tx.objectStore(STORES.messages).clear();
+      tx.objectStore(STORES.media).clear();
       tx.objectStore(STORES.statuses).clear();
       tx.objectStore(STORES.calls).clear();
       tx.oncomplete = () => resolve();

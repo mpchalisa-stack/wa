@@ -47,14 +47,18 @@ import {
   saveUnreadCounts,
   saveUserProfile,
 } from './lib/db';
-import { WA6PeerManager, fromFullPeerId } from './lib/peerManager';
+import {
+  ReassembledFileTransfer,
+  WA6PeerManager,
+  fromFullPeerId,
+} from './lib/peerManager';
 import {
   playMessagePop,
   startIncomingRingtone,
   startOutgoingRingback,
   stopRingtone,
 } from './lib/audio';
-import { formatSixDigitId, generateUid } from './lib/media';
+import { estimateDataUrlBytes, formatSixDigitId, generateUid } from './lib/media';
 import { OnboardingScreen } from './components/OnboardingScreen';
 import { ChatList } from './components/ChatList';
 import { ChatRoom } from './components/ChatRoom';
@@ -405,7 +409,12 @@ export default function App() {
           setMessages((prev) =>
             prev.map((m) => {
               if (m.id === packet.messageId && m.status !== 'read') {
-                const updated: ChatMessage = { ...m, status: 'delivered' };
+                const updated: ChatMessage = {
+                  ...m,
+                  status: 'delivered',
+                  transferProgress: undefined,
+                  transferWaitingPeer: undefined,
+                };
                 void dbSaveMessage(updated);
                 return updated;
               }
@@ -420,7 +429,12 @@ export default function App() {
           setMessages((prev) =>
             prev.map((m) => {
               if (idSet.has(m.id) && m.status !== 'read') {
-                const updated: ChatMessage = { ...m, status: 'read' };
+                const updated: ChatMessage = {
+                  ...m,
+                  status: 'read',
+                  transferProgress: undefined,
+                  transferWaitingPeer: undefined,
+                };
                 void dbSaveMessage(updated);
                 return updated;
               }
@@ -591,6 +605,128 @@ export default function App() {
     [finalizeCall]
   );
 
+  // Reassembled chunked file/image/video/voice/status handler on receiver side
+  const handleFileReceived = useCallback(
+    (fromId: string, transfer: ReassembledFileTransfer) => {
+      const me = profileRef.current;
+      if (!me) return;
+
+      // 1. Jika paket chunk adalah foto Status 24 jam
+      if (transfer.statusMeta) {
+        const sm = transfer.statusMeta;
+        if (sm.expiresAt <= Date.now()) return;
+        const incomingStatus: StatusItem = {
+          id: sm.id,
+          userId: sm.userId,
+          userName: sm.userName,
+          userAvatar: sm.userAvatar,
+          type: 'image',
+          mediaData: transfer.dataUrl,
+          caption: sm.caption,
+          timestamp: sm.timestamp,
+          expiresAt: sm.expiresAt,
+          viewed: false,
+        };
+        setStatuses((prev) => {
+          if (prev.some((item) => item.id === incomingStatus.id)) return prev;
+          void dbSaveStatus(incomingStatus);
+          return [incomingStatus, ...prev];
+        });
+        return;
+      }
+
+      // 2. Jika paket chunk adalah pesan chat (gambar, kamera, video, dokumen, voice note)
+      const meta = transfer.messageMeta;
+      if (!meta) return;
+
+      const localChatId = meta.isGroup ? meta.chatId : fromId;
+
+      if (meta.isGroup && meta.groupMeta) {
+        const existingGroup = contactsRef.current.find((c) => c.id === localChatId);
+        if (!existingGroup) {
+          upsertContact({
+            id: meta.groupMeta.id,
+            name: meta.groupMeta.name,
+            bio: 'Grup P2P WA6',
+            avatar: meta.groupMeta.avatar,
+            addedAt: Date.now(),
+            isGroup: true,
+            members: meta.groupMeta.members,
+            memberNames: meta.groupMeta.memberNames,
+            adminId: meta.groupMeta.adminId,
+          });
+        }
+      } else {
+        const existingContact = contactsRef.current.find((c) => c.id === fromId);
+        if (!existingContact) {
+          upsertContact({
+            id: fromId,
+            name: meta.senderName || `Teman ${fromId}`,
+            bio: 'Ada',
+            avatar: '',
+            addedAt: Date.now(),
+          });
+        }
+      }
+
+      if (messagesRef.current.some((m) => m.id === meta.id)) {
+        return;
+      }
+
+      const isViewingChat = activeChatIdRef.current === localChatId;
+      const savedMsg: ChatMessage = {
+        id: meta.id,
+        chatId: localChatId,
+        senderId: meta.senderId,
+        senderName: meta.senderName,
+        type: meta.msgType,
+        text: meta.text,
+        mediaData: transfer.dataUrl,
+        fileName: transfer.fileName,
+        fileSize: transfer.fileSize,
+        mimeType: transfer.fileType,
+        duration: meta.duration,
+        timestamp: meta.timestamp,
+        status: isViewingChat ? 'read' : 'delivered',
+        replyTo: meta.replyTo,
+        isGroup: meta.isGroup,
+      };
+
+      setMessages((prev) => {
+        if (prev.some((m) => m.id === savedMsg.id)) return prev;
+        return [...prev, savedMsg];
+      });
+      // Simpan ke IndexedDB (media Blob tersimpan di object store `media`)
+      void dbSaveMessage(savedMsg);
+
+      // Kirim DELIVERY_ACK (mengaktifkan Centang 2 di pengirim)
+      peerManagerRef.current?.sendPacket(fromId, {
+        kind: 'DELIVERY_ACK',
+        messageId: savedMsg.id,
+        chatId: savedMsg.isGroup ? localChatId : me.id,
+        fromId: me.id,
+      });
+
+      if (isViewingChat) {
+        // Kirim READ_ACK (Centang 2 biru) & putar nada notifikasi lembut
+        peerManagerRef.current?.sendPacket(fromId, {
+          kind: 'READ_ACK',
+          chatId: savedMsg.isGroup ? localChatId : me.id,
+          messageIds: [savedMsg.id],
+          fromId: me.id,
+        });
+        playMessagePop(true);
+      } else {
+        setUnreadCounts((prev) => ({
+          ...prev,
+          [localChatId]: (prev[localChatId] || 0) + 1,
+        }));
+        playMessagePop(true);
+      }
+    },
+    [upsertContact]
+  );
+
   // Initialize PeerJS whenever profile is ready
   useEffect(() => {
     if (!profile) return;
@@ -607,6 +743,7 @@ export default function App() {
         }
       },
       onPacket: handleIncomingPacket,
+      onFileReceived: handleFileReceived,
       onPeerPresence: (sixId, isOnline) => {
         setOnlinePeers((prev) => {
           if (prev[sixId] === isOnline) return prev;
@@ -770,15 +907,22 @@ export default function App() {
       const target = contactsRef.current.find((c) => c.id === chatId);
       if (!me || !target) return;
 
+      const isMediaMessage = payload.type !== 'text' && Boolean(payload.mediaData);
+      const computedSize =
+        payload.fileSize ||
+        (payload.mediaData ? estimateDataUrlBytes(payload.mediaData) : undefined);
+
       const msg: ChatMessage = {
         id: generateUid('msg'),
         chatId,
         senderId: me.id,
         senderName: me.name,
         timestamp: Date.now(),
-        status: 'sent',
+        status: isMediaMessage ? 'sending' : 'sent',
+        transferProgress: isMediaMessage ? 0 : undefined,
         isGroup: Boolean(target.isGroup),
         ...payload,
+        fileSize: computedSize,
       };
 
       setMessages((prev) => [...prev, msg]);
@@ -788,18 +932,110 @@ export default function App() {
       const manager = peerManagerRef.current;
       if (!manager) return;
 
-      if (target.isGroup && target.members) {
+      const groupMeta =
+        target.isGroup && target.members
+          ? {
+              id: target.id,
+              name: target.name,
+              avatar: target.avatar,
+              members: target.members,
+              memberNames: target.memberNames || {},
+              adminId: target.adminId || me.id,
+            }
+          : undefined;
+
+      // Untuk semua gambar, kamera, video, dokumen, & voice note: WAJIB pecah menjadi chunks <= 16 KB
+      if (isMediaMessage && msg.mediaData && msg.type !== 'text') {
+        const recipients =
+          target.isGroup && target.members
+            ? target.members.filter((mId) => mId !== me.id)
+            : [target.id];
+
+        if (recipients.length === 0) return;
+
+        const peerProgress = new Map<string, number>();
+        recipients.forEach((r) => peerProgress.set(r, 0));
+
+        const updateAggregateProgress = (peerId: string, pct: number) => {
+          peerProgress.set(peerId, pct);
+          let total = 0;
+          peerProgress.forEach((v) => {
+            total += v;
+          });
+          const avg = Math.round(total / recipients.length);
+          setMessages((prev) =>
+            prev.map((m) =>
+              m.id === msg.id && m.status !== 'delivered' && m.status !== 'read'
+                ? {
+                    ...m,
+                    transferProgress: avg,
+                    transferWaitingPeer: false,
+                    status: avg >= 100 ? 'sent' : 'sending',
+                  }
+                : m
+            )
+          );
+        };
+
+        recipients.forEach((recipientId) => {
+          manager.sendFileChunked(recipientId, {
+            fileId: `${msg.id}-${recipientId}`,
+            fileName: msg.fileName || `${msg.type}-${msg.timestamp}`,
+            fileType: msg.mimeType || 'application/octet-stream',
+            fileSize: msg.fileSize || estimateDataUrlBytes(msg.mediaData!),
+            dataUrl: msg.mediaData!,
+            messageMeta: {
+              id: msg.id,
+              chatId: msg.chatId,
+              senderId: msg.senderId,
+              senderName: msg.senderName,
+              msgType: msg.type as 'image' | 'video' | 'document' | 'voice',
+              text: msg.text,
+              duration: msg.duration,
+              timestamp: msg.timestamp,
+              replyTo: msg.replyTo,
+              isGroup: msg.isGroup,
+              groupMeta,
+            },
+            onQueued: () => {
+              setMessages((prev) =>
+                prev.map((m) =>
+                  m.id === msg.id && m.status !== 'delivered' && m.status !== 'read'
+                    ? { ...m, transferWaitingPeer: true }
+                    : m
+                )
+              );
+            },
+            onProgress: (pct) => updateAggregateProgress(recipientId, pct),
+            onComplete: () => {
+              updateAggregateProgress(recipientId, 100);
+              setMessages((prev) =>
+                prev.map((m) => {
+                  if (m.id === msg.id && m.status === 'sending') {
+                    const updated: ChatMessage = {
+                      ...m,
+                      status: 'sent',
+                      transferProgress: 100,
+                      transferWaitingPeer: false,
+                    };
+                    void dbSaveMessage(updated);
+                    return updated;
+                  }
+                  return m;
+                })
+              );
+            },
+          });
+        });
+        return;
+      }
+
+      // Pesan teks ringan langsung lewat DataChannel JSON
+      if (target.isGroup && target.members && groupMeta) {
         const packet: PeerPacket = {
           kind: 'MESSAGE',
           message: msg,
-          groupMeta: {
-            id: target.id,
-            name: target.name,
-            avatar: target.avatar,
-            members: target.members,
-            memberNames: target.memberNames || {},
-            adminId: target.adminId || me.id,
-          },
+          groupMeta,
         };
         target.members.forEach((mId) => {
           if (mId !== me.id) {
@@ -901,17 +1137,36 @@ export default function App() {
     showToast('Kontak dihapus');
   };
 
-  // Status Posting (24-hour TTL + P2P broadcast to connected contacts)
+  // Status Posting (24-hour TTL + P2P broadcast to connected contacts; photo statuses chunked <= 16 KB)
   const broadcastStatus = (status: StatusItem) => {
     setStatuses((prev) => [status, ...prev]);
     void dbSaveStatus(status);
     contacts
       .filter((c) => !c.isGroup)
       .forEach((c) => {
-        peerManagerRef.current?.sendPacket(c.id, {
-          kind: 'STATUS_UPDATE',
-          status,
-        });
+        if (status.type === 'image' && status.mediaData) {
+          peerManagerRef.current?.sendFileChunked(c.id, {
+            fileId: `${status.id}-${c.id}`,
+            fileName: `status-${status.timestamp}.jpg`,
+            fileType: 'image/jpeg',
+            fileSize: estimateDataUrlBytes(status.mediaData),
+            dataUrl: status.mediaData,
+            statusMeta: {
+              id: status.id,
+              userId: status.userId,
+              userName: status.userName,
+              userAvatar: status.userAvatar,
+              caption: status.caption,
+              timestamp: status.timestamp,
+              expiresAt: status.expiresAt,
+            },
+          });
+        } else {
+          peerManagerRef.current?.sendPacket(c.id, {
+            kind: 'STATUS_UPDATE',
+            status,
+          });
+        }
       });
     showToast('Pembaruan status dipublikasikan (24 jam)');
   };
@@ -1696,13 +1951,14 @@ export default function App() {
       {cameraPurpose && (
         <CameraModal
           title={cameraPurpose === 'status' ? 'Foto untuk Status 24 Jam' : 'Kirim Foto ke Obrolan'}
-          onCapture={(dataUrl, caption) => {
+          onCapture={(dataUrl, caption, byteSize) => {
             if (cameraPurpose === 'chat' && activeContact) {
               dispatchMessage(activeContact.id, {
                 type: 'image',
                 mediaData: dataUrl,
                 text: caption || undefined,
                 fileName: `kamera-${Date.now()}.jpg`,
+                fileSize: byteSize,
                 mimeType: 'image/jpeg',
               });
             } else {

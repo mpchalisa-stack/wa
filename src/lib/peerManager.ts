@@ -1,7 +1,23 @@
 import Peer, { DataConnection, MediaConnection } from 'peerjs';
-import { PeerConnectionState, PeerPacket, UserProfile } from '../types';
+import {
+  ChunkMessageMeta,
+  ChunkStatusMeta,
+  FileChunkPacket,
+  PeerConnectionState,
+  PeerPacket,
+  UserProfile,
+} from '../types';
+import { dataUrlToBlob, fileToDataUrl } from './media';
 
 export const PEER_PREFIX = 'WA6-';
+
+/**
+ * Ukuran maksimum per potongan paket DataChannel WebRTC: 16 KB (16384 bytes).
+ * Mencegah DataChannel macet/putus saat mengirim gambar, kamera, audio, atau dokumen.
+ */
+export const FILE_CHUNK_SIZE = 16384;
+
+const MAX_BUFFERED_AMOUNT = 64 * 1024; // 64 KB backpressure threshold
 
 /**
  * Konfigurasi ICE Servers untuk WebRTC (DataChannel & Panggilan Suara/Video).
@@ -29,9 +45,49 @@ export const ICE_SERVERS: RTCIceServer[] = [
   */
 ];
 
+export interface ReassembledFileTransfer {
+  fileId: string;
+  fileName: string;
+  fileType: string;
+  fileSize: number;
+  dataUrl: string;
+  blob: Blob;
+  messageMeta?: ChunkMessageMeta;
+  statusMeta?: ChunkStatusMeta;
+}
+
+export interface SendFileChunkedOptions {
+  fileId: string;
+  fileName: string;
+  fileType: string;
+  fileSize: number;
+  dataUrl: string;
+  messageMeta?: ChunkMessageMeta;
+  statusMeta?: ChunkStatusMeta;
+  onProgress?: (percent: number) => void;
+  onQueued?: () => void;
+  onComplete?: () => void;
+  onError?: () => void;
+}
+
+interface IncomingFileBuffer {
+  fileId: string;
+  fromId: string;
+  fileName: string;
+  fileType: string;
+  fileSize: number;
+  totalChunks: number;
+  chunks: Array<string | undefined>;
+  receivedCount: number;
+  messageMeta?: ChunkMessageMeta;
+  statusMeta?: ChunkStatusMeta;
+  startedAt: number;
+}
+
 export interface PeerManagerCallbacks {
   onStatusChange: (state: PeerConnectionState, errorMessage?: string) => void;
   onPacket: (fromSixDigitId: string, packet: PeerPacket) => void;
+  onFileReceived: (fromSixDigitId: string, file: ReassembledFileTransfer) => void;
   onPeerPresence: (sixDigitId: string, isOnline: boolean) => void;
   onIncomingMediaCall: (call: MediaConnection) => void;
 }
@@ -45,12 +101,58 @@ export function fromFullPeerId(fullId: string): string {
   return fullId.replace(/^WA6-/, '');
 }
 
+function waitForDataChannelDrain(conn: DataConnection): Promise<void> {
+  return new Promise((resolve) => {
+    const dc = (conn as unknown as { dataChannel?: RTCDataChannel }).dataChannel;
+    if (!dc || dc.readyState !== 'open' || dc.bufferedAmount <= MAX_BUFFERED_AMOUNT) {
+      resolve();
+      return;
+    }
+
+    let settled = false;
+    const done = () => {
+      if (settled) return;
+      settled = true;
+      dc.removeEventListener('bufferedamountlow', onLow);
+      window.clearTimeout(fallbackTimer);
+      resolve();
+    };
+
+    const onLow = () => done();
+
+    try {
+      dc.bufferedAmountLowThreshold = Math.floor(MAX_BUFFERED_AMOUNT / 2);
+      dc.addEventListener('bufferedamountlow', onLow);
+    } catch {
+      // Fallback to timer polling below
+    }
+
+    const poll = () => {
+      if (settled) return;
+      if (!conn.open || dc.readyState !== 'open' || dc.bufferedAmount <= MAX_BUFFERED_AMOUNT / 2) {
+        done();
+      } else {
+        window.setTimeout(poll, 20);
+      }
+    };
+
+    const fallbackTimer = window.setTimeout(poll, 25);
+  });
+}
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => window.setTimeout(resolve, ms));
+}
+
 export class WA6PeerManager {
   private peer: Peer | null = null;
   private profile: UserProfile;
   private callbacks: PeerManagerCallbacks;
   private connections = new Map<string, DataConnection>();
   private pendingQueues = new Map<string, PeerPacket[]>();
+  private pendingFileTransfers = new Map<string, SendFileChunkedOptions[]>();
+  private activeFileSendChain = new Map<string, Promise<void>>();
+  private incomingFileBuffers = new Map<string, IncomingFileBuffer>();
   private reconnectTimer: number | null = null;
   private destroyed = false;
 
@@ -61,7 +163,6 @@ export class WA6PeerManager {
 
   public updateProfile(profile: UserProfile): void {
     this.profile = profile;
-    // Notify all currently connected peers of updated profile info
     const hello: PeerPacket = {
       kind: 'HELLO',
       profile: {
@@ -125,7 +226,6 @@ export class WA6PeerManager {
       if (this.destroyed) return;
       const errType = (err as { type?: string }).type || '';
       if (errType === 'peer-unavailable') {
-        // Target peer is simply offline; do not mark our own broker connection as failed
         const match = err.message?.match(/WA6-(\d{6})/);
         if (match && match[1]) {
           this.callbacks.onPeerPresence(match[1], false);
@@ -164,13 +264,82 @@ export class WA6PeerManager {
     }, 3500);
   }
 
+  private handleFileChunkPacket(fromSixDigitId: string, packet: FileChunkPacket): void {
+    if (packet.type === 'FILE_START') {
+      const total = Math.max(1, packet.totalChunks);
+      this.incomingFileBuffers.set(packet.fileId, {
+        fileId: packet.fileId,
+        fromId: fromSixDigitId,
+        fileName: packet.fileName,
+        fileType: packet.fileType,
+        fileSize: packet.fileSize,
+        totalChunks: total,
+        chunks: new Array<string | undefined>(total),
+        receivedCount: 0,
+        messageMeta: packet.messageMeta,
+        statusMeta: packet.statusMeta,
+        startedAt: Date.now(),
+      });
+      return;
+    }
+
+    if (packet.type === 'FILE_CHUNK') {
+      const buf = this.incomingFileBuffers.get(packet.fileId);
+      if (!buf) return;
+      if (packet.chunkIndex >= 0 && packet.chunkIndex < buf.totalChunks) {
+        if (buf.chunks[packet.chunkIndex] === undefined) {
+          buf.receivedCount += 1;
+        }
+        buf.chunks[packet.chunkIndex] = packet.data;
+      }
+      return;
+    }
+
+    if (packet.type === 'FILE_END') {
+      const buf = this.incomingFileBuffers.get(packet.fileId);
+      if (!buf) return;
+      this.incomingFileBuffers.delete(packet.fileId);
+
+      // Pastikan seluruh chunk sudah terkumpul lengkap
+      if (buf.receivedCount < buf.totalChunks) {
+        console.warn(
+          `Incomplete chunk transfer for ${packet.fileId}: ${buf.receivedCount}/${buf.totalChunks}`
+        );
+        return;
+      }
+
+      const combinedRaw = buf.chunks.join('');
+      let blob: Blob;
+      try {
+        blob = dataUrlToBlob(combinedRaw);
+      } catch {
+        blob = new Blob([combinedRaw], { type: buf.fileType || 'application/octet-stream' });
+      }
+
+      // Gunakan DataURL utuh (atau hasil konversi Blob agar valid)
+      const finalize = async () => {
+        const finalDataUrl = combinedRaw.startsWith('data:')
+          ? combinedRaw
+          : await fileToDataUrl(blob);
+
+        this.callbacks.onFileReceived(fromSixDigitId, {
+          fileId: buf.fileId,
+          fileName: buf.fileName,
+          fileType: buf.fileType,
+          fileSize: buf.fileSize || blob.size,
+          dataUrl: finalDataUrl,
+          blob,
+          messageMeta: buf.messageMeta,
+          statusMeta: buf.statusMeta,
+        });
+      };
+
+      void finalize();
+    }
+  }
+
   private attachConnection(conn: DataConnection): void {
     const peerSixId = fromFullPeerId(conn.peer);
-
-    const existing = this.connections.get(peerSixId);
-    if (existing && existing !== conn && existing.open) {
-      // Keep the already-open connection unless this one opens and replaces it
-    }
     this.connections.set(peerSixId, conn);
 
     const onOpen = () => {
@@ -190,7 +359,7 @@ export class WA6PeerManager {
         // ignore
       }
 
-      // Flush pending packets queued for this peer
+      // Flush queued regular packets
       const queued = this.pendingQueues.get(peerSixId);
       if (queued && queued.length > 0) {
         this.pendingQueues.delete(peerSixId);
@@ -202,6 +371,15 @@ export class WA6PeerManager {
           }
         }
       }
+
+      // Flush queued chunked file transfers sequentially
+      const queuedFiles = this.pendingFileTransfers.get(peerSixId);
+      if (queuedFiles && queuedFiles.length > 0) {
+        this.pendingFileTransfers.delete(peerSixId);
+        for (const transfer of queuedFiles) {
+          this.enqueueChunkedSend(peerSixId, transfer);
+        }
+      }
     };
 
     if (conn.open) {
@@ -211,7 +389,20 @@ export class WA6PeerManager {
     }
 
     conn.on('data', (data) => {
-      if (data && typeof data === 'object' && 'kind' in data) {
+      if (!data || typeof data !== 'object') return;
+
+      // Handle WebRTC chunked file transfer packets (FILE_START / FILE_CHUNK / FILE_END)
+      if ('type' in data) {
+        const t = (data as { type?: string }).type;
+        if (t === 'FILE_START' || t === 'FILE_CHUNK' || t === 'FILE_END') {
+          this.callbacks.onPeerPresence(peerSixId, true);
+          this.handleFileChunkPacket(peerSixId, data as FileChunkPacket);
+          return;
+        }
+      }
+
+      // Handle regular signaling & text packets
+      if ('kind' in data) {
         this.callbacks.onPeerPresence(peerSixId, true);
         this.callbacks.onPacket(peerSixId, data as PeerPacket);
       }
@@ -266,10 +457,8 @@ export class WA6PeerManager {
       }
     }
 
-    // Queue non-ephemeral packets (skip typing indicators when offline)
     if (packet.kind !== 'TYPING') {
       const queue = this.pendingQueues.get(targetSixDigitId) || [];
-      // Cap queue size per peer to prevent unbounded memory growth
       if (queue.length < 40) {
         queue.push(packet);
         this.pendingQueues.set(targetSixDigitId, queue);
@@ -278,6 +467,126 @@ export class WA6PeerManager {
 
     this.ensureConnection(targetSixDigitId);
     return false;
+  }
+
+  /**
+   * Mengirim gambar, foto kamera, video, dokumen, atau voice note dengan memecah data
+   * menjadi potongan-potongan kecil (chunks) maksimal 16 KB (16384 bytes) per paket.
+   */
+  public sendFileChunked(targetSixDigitId: string, options: SendFileChunkedOptions): boolean {
+    if (targetSixDigitId === this.profile.id) return false;
+    const existing = this.connections.get(targetSixDigitId);
+
+    if (existing && existing.open) {
+      this.enqueueChunkedSend(targetSixDigitId, options);
+      return true;
+    }
+
+    // Peer belum online: simpan di antrean transfer file dan sambungkan otomatis
+    const queue = this.pendingFileTransfers.get(targetSixDigitId) || [];
+    if (queue.length < 15) {
+      queue.push(options);
+      this.pendingFileTransfers.set(targetSixDigitId, queue);
+    }
+    options.onQueued?.();
+    this.ensureConnection(targetSixDigitId);
+    return false;
+  }
+
+  private enqueueChunkedSend(targetSixDigitId: string, options: SendFileChunkedOptions): void {
+    const prevChain = this.activeFileSendChain.get(targetSixDigitId) ?? Promise.resolve();
+    const nextChain = prevChain
+      .catch(() => {})
+      .then(() => this.streamChunksOverConnection(targetSixDigitId, options));
+    this.activeFileSendChain.set(targetSixDigitId, nextChain);
+  }
+
+  private async streamChunksOverConnection(
+    targetSixDigitId: string,
+    options: SendFileChunkedOptions
+  ): Promise<void> {
+    const conn = this.connections.get(targetSixDigitId);
+    if (!conn || !conn.open) {
+      // Koneksi putus sebelum mulai: masukkan kembali ke antrean
+      const queue = this.pendingFileTransfers.get(targetSixDigitId) || [];
+      queue.push(options);
+      this.pendingFileTransfers.set(targetSixDigitId, queue);
+      options.onQueued?.();
+      this.ensureConnection(targetSixDigitId);
+      return;
+    }
+
+    const payload = options.dataUrl;
+    const totalChunks = Math.max(1, Math.ceil(payload.length / FILE_CHUNK_SIZE));
+
+    try {
+      // 1. Paket awal: FILE_START
+      const startPacket: FileChunkPacket = {
+        type: 'FILE_START',
+        fileId: options.fileId,
+        fileName: options.fileName,
+        fileType: options.fileType,
+        fileSize: options.fileSize,
+        totalChunks,
+        messageMeta: options.messageMeta,
+        statusMeta: options.statusMeta,
+      };
+      conn.send(startPacket);
+      options.onProgress?.(1);
+
+      // 2. Paket potongan: FILE_CHUNK (<= 16384 bytes per paket)
+      let lastReportedPct = 1;
+      for (let chunkIndex = 0; chunkIndex < totalChunks; chunkIndex++) {
+        if (this.destroyed || !conn.open) {
+          throw new Error('DataChannel terputus saat mengirim potongan file');
+        }
+
+        await waitForDataChannelDrain(conn);
+
+        const start = chunkIndex * FILE_CHUNK_SIZE;
+        const data = payload.slice(start, start + FILE_CHUNK_SIZE);
+
+        const chunkPacket: FileChunkPacket = {
+          type: 'FILE_CHUNK',
+          fileId: options.fileId,
+          chunkIndex,
+          data,
+        };
+        conn.send(chunkPacket);
+
+        const pct = Math.min(99, Math.max(1, Math.round(((chunkIndex + 1) / totalChunks) * 100)));
+        if (pct !== lastReportedPct) {
+          lastReportedPct = pct;
+          options.onProgress?.(pct);
+        }
+
+        // Yield sejenak setiap 4 chunk agar UI progres tetap responsif & buffer WebRTC stabil
+        if (chunkIndex % 4 === 3) {
+          await sleep(4);
+        }
+      }
+
+      // 3. Paket selesai: FILE_END
+      await waitForDataChannelDrain(conn);
+      const endPacket: FileChunkPacket = {
+        type: 'FILE_END',
+        fileId: options.fileId,
+      };
+      conn.send(endPacket);
+      options.onProgress?.(100);
+      options.onComplete?.();
+    } catch (err) {
+      console.error('Chunked transfer interrupted:', err);
+      options.onError?.();
+      // Coba sambungkan ulang dan antrekan ulang bila peer tidak sengaja terputus
+      if (!this.destroyed) {
+        const queue = this.pendingFileTransfers.get(targetSixDigitId) || [];
+        queue.push(options);
+        this.pendingFileTransfers.set(targetSixDigitId, queue);
+        options.onQueued?.();
+        this.ensureConnection(targetSixDigitId);
+      }
+    }
   }
 
   public startMediaCall(
@@ -312,6 +621,7 @@ export class WA6PeerManager {
       }
     });
     this.connections.clear();
+    this.incomingFileBuffers.clear();
     if (this.peer) {
       try {
         this.peer.destroy();

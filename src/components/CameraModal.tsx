@@ -1,9 +1,10 @@
 import React, { useEffect, useRef, useState } from 'react';
 import { Camera, RefreshCw, RotateCcw, SendHorizontal, X } from 'lucide-react';
+import { compressCanvasToJpeg } from '../lib/media';
 
 interface CameraModalProps {
   title?: string;
-  onCapture: (dataUrl: string, caption: string) => void;
+  onCapture: (dataUrl: string, caption: string, byteSize: number) => void;
   onClose: () => void;
 }
 
@@ -14,6 +15,7 @@ export const CameraModal: React.FC<CameraModalProps> = ({
 }) => {
   const [facingMode, setFacingMode] = useState<'user' | 'environment'>('environment');
   const [capturedUrl, setCapturedUrl] = useState<string | null>(null);
+  const [capturedSize, setCapturedSize] = useState<number>(0);
   const [caption, setCaption] = useState('');
   const [error, setError] = useState('');
 
@@ -69,12 +71,18 @@ export const CameraModal: React.FC<CameraModalProps> = ({
     const video = videoRef.current;
     if (!video || !video.videoWidth) return;
     const canvas = document.createElement('canvas');
-    const maxW = 1080;
+    // Resolusi maksimal lebar/tinggi 1024px (proporsional)
+    const maxDim = 1024;
     let w = video.videoWidth;
     let h = video.videoHeight;
-    if (w > maxW) {
-      h = Math.round((h * maxW) / w);
-      w = maxW;
+    if (w > maxDim || h > maxDim) {
+      if (w >= h) {
+        h = Math.round((h * maxDim) / w);
+        w = maxDim;
+      } else {
+        w = Math.round((w * maxDim) / h);
+        h = maxDim;
+      }
     }
     canvas.width = w;
     canvas.height = h;
@@ -85,12 +93,15 @@ export const CameraModal: React.FC<CameraModalProps> = ({
       ctx.scale(-1, 1);
     }
     ctx.drawImage(video, 0, 0, w, h);
-    setCapturedUrl(canvas.toDataURL('image/jpeg', 0.85));
+    // Kompresi otomatis image/jpeg kualitas 0.7 (dijamin < 250 KB)
+    const { dataUrl, byteSize } = compressCanvasToJpeg(canvas, 0.7, 245 * 1024);
+    setCapturedUrl(dataUrl);
+    setCapturedSize(byteSize);
   };
 
   const handleSend = () => {
     if (!capturedUrl) return;
-    onCapture(capturedUrl, caption.trim());
+    onCapture(capturedUrl, caption.trim(), capturedSize);
   };
 
   return (

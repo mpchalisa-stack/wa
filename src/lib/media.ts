@@ -140,6 +140,26 @@ export function getSenderColor(senderId: string): string {
   return GROUP_SENDER_COLORS[Math.abs(hash) % GROUP_SENDER_COLORS.length];
 }
 
+export function estimateDataUrlBytes(dataUrl: string): number {
+  const commaIdx = dataUrl.indexOf(',');
+  const base64Part = commaIdx >= 0 ? dataUrl.slice(commaIdx + 1) : dataUrl;
+  const padding = base64Part.endsWith('==') ? 2 : base64Part.endsWith('=') ? 1 : 0;
+  return Math.max(0, Math.floor((base64Part.length * 3) / 4) - padding);
+}
+
+export function dataUrlToBlob(dataUrl: string): Blob {
+  const [header, base64] = dataUrl.split(',');
+  const mimeMatch = header.match(/data:([^;]+);base64/i);
+  const mimeType = mimeMatch ? mimeMatch[1] : 'application/octet-stream';
+  const binary = atob(base64 || '');
+  const len = binary.length;
+  const bytes = new Uint8Array(len);
+  for (let i = 0; i < len; i++) {
+    bytes[i] = binary.charCodeAt(i);
+  }
+  return new Blob([bytes], { type: mimeType });
+}
+
 export function fileToDataUrl(file: Blob): Promise<string> {
   return new Promise((resolve, reject) => {
     const reader = new FileReader();
@@ -149,10 +169,55 @@ export function fileToDataUrl(file: Blob): Promise<string> {
   });
 }
 
+/**
+ * Kompresi canvas ke format image/jpeg kualitas awal 0.7 dengan jaminan ukuran akhir di bawah maxBytes (default 250 KB).
+ */
+export function compressCanvasToJpeg(
+  sourceCanvas: HTMLCanvasElement,
+  initialQuality = 0.7,
+  maxBytes = 245 * 1024
+): { dataUrl: string; byteSize: number } {
+  let quality = initialQuality;
+  let canvas = sourceCanvas;
+  let dataUrl = canvas.toDataURL('image/jpeg', quality);
+  let byteSize = estimateDataUrlBytes(dataUrl);
+
+  // Turunkan kualitas secara bertahap bila ukuran masih >= 250 KB
+  while (byteSize > maxBytes && quality > 0.35) {
+    quality = Math.max(0.35, Number((quality - 0.1).toFixed(2)));
+    dataUrl = canvas.toDataURL('image/jpeg', quality);
+    byteSize = estimateDataUrlBytes(dataUrl);
+  }
+
+  // Jika gambar sangat kompleks dan masih > maxBytes, perkecil dimensi proporsional
+  let attempts = 0;
+  while (byteSize > maxBytes && attempts < 3 && canvas.width > 480 && canvas.height > 480) {
+    attempts++;
+    const nextCanvas = document.createElement('canvas');
+    nextCanvas.width = Math.round(canvas.width * 0.8);
+    nextCanvas.height = Math.round(canvas.height * 0.8);
+    const ctx = nextCanvas.getContext('2d');
+    if (!ctx) break;
+    ctx.drawImage(canvas, 0, 0, nextCanvas.width, nextCanvas.height);
+    canvas = nextCanvas;
+    dataUrl = canvas.toDataURL('image/jpeg', quality);
+    byteSize = estimateDataUrlBytes(dataUrl);
+  }
+
+  return { dataUrl, byteSize };
+}
+
+/**
+ * Kompresi otomatis gambar dari Galeri menggunakan HTML5 <canvas>:
+ * - Maksimal lebar/tinggi 1024px (proporsional)
+ * - Format image/jpeg kualitas 0.7
+ * - Ukuran akhir dijamin di bawah 250 KB agar pengiriman WebRTC kilat
+ */
 export function compressImageFile(
   file: Blob,
-  maxWidth = 1080,
-  quality = 0.82
+  maxDimension = 1024,
+  quality = 0.7,
+  maxBytes = 245 * 1024
 ): Promise<string> {
   return new Promise((resolve, reject) => {
     const reader = new FileReader();
@@ -162,13 +227,13 @@ export function compressImageFile(
       img.onerror = () => reject(new Error('Gagal memproses gambar'));
       img.onload = () => {
         let { width, height } = img;
-        if (width > maxWidth || height > maxWidth) {
+        if (width > maxDimension || height > maxDimension) {
           if (width >= height) {
-            height = Math.round((height * maxWidth) / width);
-            width = maxWidth;
+            height = Math.round((height * maxDimension) / width);
+            width = maxDimension;
           } else {
-            width = Math.round((width * maxWidth) / height);
-            height = maxWidth;
+            width = Math.round((width * maxDimension) / height);
+            height = maxDimension;
           }
         }
         const canvas = document.createElement('canvas');
@@ -179,8 +244,13 @@ export function compressImageFile(
           resolve(String(reader.result));
           return;
         }
+        // Fill white background before drawing so transparent PNGs convert cleanly to JPEG
+        ctx.fillStyle = '#FFFFFF';
+        ctx.fillRect(0, 0, width, height);
         ctx.drawImage(img, 0, 0, width, height);
-        resolve(canvas.toDataURL('image/jpeg', quality));
+
+        const { dataUrl } = compressCanvasToJpeg(canvas, quality, maxBytes);
+        resolve(dataUrl);
       };
       img.src = String(reader.result);
     };
