@@ -92,6 +92,12 @@ import {
   encryptTextEnvelope,
 } from './lib/crypto';
 import { sendNtfyWakeSignal, subscribeNtfySignal } from './lib/ntfy';
+import {
+  sendFcmPushToUser,
+  syncAndroidFcmTokenToFirestore,
+  triggerAndroidBridgeIncomingCall,
+  triggerAndroidBridgeIncomingMessage,
+} from './lib/fcmPush';
 import { estimateDataUrlBytes, formatSixDigitId, generateUid } from './lib/media';
 import { OnboardingScreen } from './components/OnboardingScreen';
 import { ChatList } from './components/ChatList';
@@ -454,6 +460,13 @@ export default function App() {
     return () => {
       setStandbyExternalListener(null);
     };
+  }, [profile?.id, isExited]);
+
+  // Sinkronkan FCM Token dari AndroidBridge ke Firestore `device_tokens/{cleanUserId}`
+  // dengan pengecekan ulang setiap 5 detik selama 30 detik pertama setelah aplikasi dibuka
+  useEffect(() => {
+    if (!profile?.id || isExited) return;
+    return syncAndroidFcmTokenToFirestore(profile.id);
   }, [profile?.id, isExited]);
 
   // Release Wake Lock & silent audio on unmount
@@ -1072,14 +1085,16 @@ export default function App() {
                     ? `${packet.groupMeta.name} · ${incomingMsg.senderName}`
                     : senderContact?.name?.trim() || incomingMsg.senderName || `ID: ${fromId}`;
                 const senderAvatar = senderContact?.avatar || '';
+                const incomingMsgBody =
+                  savedMsg.type === 'image'
+                    ? savedMsg.text
+                      ? `📷 Foto: ${savedMsg.text}`
+                      : '📷 Foto'
+                    : savedMsg.text || 'Pesan baru masuk';
+                triggerAndroidBridgeIncomingMessage(senderTitle, incomingMsgBody);
                 void showIncomingWebNotification({
                   title: senderTitle,
-                  body:
-                    savedMsg.type === 'image'
-                      ? savedMsg.text
-                        ? `📷 Foto: ${savedMsg.text}`
-                        : '📷 Foto'
-                      : savedMsg.text || 'Pesan baru masuk',
+                  body: incomingMsgBody,
                   icon: senderAvatar || '/icon-512.png',
                   tag: `msg-${savedMsg.id}`,
                   data: {
@@ -1241,6 +1256,10 @@ export default function App() {
             };
             pendingCallRef.current = pending;
             presentPendingCallModal(pending);
+            triggerAndroidBridgeIncomingCall(
+              callerName,
+              isVideo ? 'Panggilan video masuk...' : 'Panggilan masuk...'
+            );
             showIncomingWebNotification({
               title: callerName,
               body: isVideo ? 'Panggilan video WattappsAU' : 'Panggilan suara WattappsAU',
@@ -1532,6 +1551,10 @@ export default function App() {
         }
       }, 30000);
 
+      triggerAndroidBridgeIncomingCall(
+        callerName,
+        isVideo ? 'Panggilan video masuk...' : 'Panggilan masuk...'
+      );
       showIncomingWebNotification({
         title: callerName,
         body: isVideo ? 'Panggilan video WattappsAU' : 'Panggilan suara WattappsAU',
@@ -1754,9 +1777,11 @@ export default function App() {
             ? `${meta.groupMeta.name} · ${meta.senderName}`
             : senderContact?.name?.trim() || meta.senderName || `ID: ${fromId}`;
         const senderAvatar = senderContact?.avatar || '';
+        const incomingFileBody = savedMsg.text ? `${mediaLabel}: ${savedMsg.text}` : mediaLabel;
+        triggerAndroidBridgeIncomingMessage(senderTitle, incomingFileBody);
         void showIncomingWebNotification({
           title: senderTitle,
-          body: savedMsg.text ? `${mediaLabel}: ${savedMsg.text}` : mediaLabel,
+          body: incomingFileBody,
           icon: senderAvatar || '/icon-512.png',
           tag: `msg-${savedMsg.id}`,
           data: {
@@ -2164,6 +2189,10 @@ export default function App() {
           };
           pendingCallRef.current = pending;
           presentPendingCallModal(pending);
+          triggerAndroidBridgeIncomingCall(
+            callerName,
+            isVideo ? 'Panggilan video masuk...' : 'Panggilan masuk...'
+          );
           showIncomingWebNotification({
             title: callerName,
             body: isVideo ? 'Panggilan video WattappsAU' : 'Panggilan suara WattappsAU',
@@ -2214,8 +2243,10 @@ export default function App() {
             ? contactsRef.current.find((c) => c.id === cleanSenderId)
             : undefined;
           const senderAvatar = senderContact?.avatar || '';
+          const ntfySenderTitle = senderContact?.name?.trim() || senderLabel;
+          triggerAndroidBridgeIncomingMessage(ntfySenderTitle, 'Pesan baru masuk');
           showIncomingWebNotification({
-            title: senderContact?.name?.trim() || senderLabel,
+            title: ntfySenderTitle,
             body: 'Pesan baru masuk',
             icon: senderAvatar || '/icon-512.png',
             tag: `ntfy-msg-${cleanSenderId || signal.ts}`,
@@ -2923,6 +2954,28 @@ export default function App() {
         void dbSavePendingMessage(entry);
       });
 
+      // Kirim FCM High-Priority Data Push ke setiap penerima lewat Firestore `device_tokens` + `/api/push`
+      const fcmMessageBody =
+        msg.text?.trim() ||
+        (msg.type === 'image'
+          ? '📷 Foto'
+          : msg.type === 'video'
+          ? '🎥 Video'
+          : msg.type === 'voice'
+          ? '🎤 Pesan suara'
+          : msg.type === 'document'
+          ? `📄 ${msg.fileName || 'Dokumen'}`
+          : 'Pesan baru masuk');
+
+      recipients.forEach((recipientId) => {
+        void sendFcmPushToUser({
+          targetUserId: recipientId,
+          type: 'message',
+          sender: me.name,
+          body: fcmMessageBody,
+        });
+      });
+
       if (!manager) return;
 
       // Untuk setiap penerima: kirim langsung (terenkripsi AES-256-GCM) jika Online, atau biarkan di antrean pendingMessages jika Offline
@@ -3186,6 +3239,14 @@ export default function App() {
 
     // Hentikan otomatis Silent Audio Keep-Alive sebelum mengakses mikrofon/speaker panggilan
     pauseKeepAliveForCall();
+
+    // Kirim FCM High-Priority Data Push agar perangkat tujuan berbunyi & menyalakan layar walau ditutup/terkunci
+    void sendFcmPushToUser({
+      targetUserId: peerId,
+      type: 'call',
+      sender: profile.name,
+      body: 'Panggilan masuk...',
+    });
 
     // Kirim sinyal bangun prioritas via ntfy.sh (menjamin lawan bangun walau socket lama sedang tidur/zombie)
     void sendNtfyWakeSignal({
