@@ -29,6 +29,7 @@ export interface ActiveCallUIState {
   isMuted: boolean;
   isCameraOff: boolean;
   isSpeakerOn: boolean;
+  iceState?: string;
   connectionMode?: 'connecting' | 'direct' | 'relay' | 'reconnecting_relay';
   localStream: MediaStream | null;
   remoteStream: MediaStream | null;
@@ -67,6 +68,7 @@ export const CallOverlay: React.FC<CallOverlayProps> = ({
   const [minimizedBanner, setMinimizedBanner] = useState(false);
   const [logoImgFailed, setLogoImgFailed] = useState(false);
   const [avatarImgFailed, setAvatarImgFailed] = useState(false);
+  const [micLevel, setMicLevel] = useState(0);
 
   // Reset animasi getar & paksa layar penuh setiap kali panggilan masuk baru / dipicu notifikasi
   useEffect(() => {
@@ -131,6 +133,81 @@ export const CallOverlay: React.FC<CallOverlayProps> = ({
       void localVideoRef.current.play().catch(() => {});
     }
   }, [call.localStream, call.isCameraOff]);
+
+  // Meteran level suara mikrofon lokal real-time (hanya AnalyserNode, TIDAK disambungkan ke speaker agar bebas gema)
+  useEffect(() => {
+    if (call.phase === 'incoming' || !call.localStream || call.isMuted) {
+      setMicLevel(0);
+      return;
+    }
+
+    const audioTracks = call.localStream.getAudioTracks();
+    if (audioTracks.length === 0 || !audioTracks.some((t) => t.readyState === 'live' && t.enabled)) {
+      setMicLevel(0);
+      return;
+    }
+
+    const AudioCtxCtor =
+      window.AudioContext ||
+      (window as unknown as { webkitAudioContext?: typeof AudioContext }).webkitAudioContext;
+    if (!AudioCtxCtor) return;
+
+    let ctx: AudioContext | null = null;
+    let source: MediaStreamAudioSourceNode | null = null;
+    let analyser: AnalyserNode | null = null;
+    let rafId = 0;
+    let disposed = false;
+
+    try {
+      ctx = new AudioCtxCtor();
+      if (ctx.state === 'suspended') {
+        void ctx.resume().catch(() => {});
+      }
+      source = ctx.createMediaStreamSource(call.localStream);
+      analyser = ctx.createAnalyser();
+      analyser.fftSize = 256;
+      analyser.smoothingTimeConstant = 0.72;
+      source.connect(analyser);
+
+      const dataArray = new Uint8Array(analyser.fftSize);
+      const tick = () => {
+        if (disposed || !analyser) return;
+        analyser.getByteTimeDomainData(dataArray);
+        let sumSquares = 0;
+        for (let i = 0; i < dataArray.length; i += 1) {
+          const centered = (dataArray[i] - 128) / 128;
+          sumSquares += centered * centered;
+        }
+        const rms = Math.sqrt(sumSquares / dataArray.length);
+        // Skala sensitivitas suara manusia ke 0..100
+        const normalized = Math.min(100, Math.round(rms * 380));
+        setMicLevel(normalized);
+        rafId = window.requestAnimationFrame(tick);
+      };
+      rafId = window.requestAnimationFrame(tick);
+    } catch {
+      setMicLevel(0);
+    }
+
+    return () => {
+      disposed = true;
+      if (rafId) window.cancelAnimationFrame(rafId);
+      try {
+        source?.disconnect();
+      } catch {
+        // ignore
+      }
+      try {
+        analyser?.disconnect();
+      } catch {
+        // ignore
+      }
+      if (ctx && ctx.state !== 'closed') {
+        void ctx.close().catch(() => {});
+      }
+      setMicLevel(0);
+    };
+  }, [call.localStream, call.isMuted, call.phase]);
 
   const isVideo = call.callType === 'video';
   const isIncomingRinging = call.phase === 'incoming' && !shakeStopped;
@@ -405,28 +482,67 @@ export const CallOverlay: React.FC<CallOverlayProps> = ({
                 ID: {formatSixDigitId(call.peerId)}
               </div>
             )}
-            {call.connectionMode && (
-              <div className="mt-2 inline-flex items-center gap-1.5 rounded-full bg-white/10 border border-white/15 px-3 py-1 text-[11px] font-medium tracking-wide text-slate-100">
+            {/* Panel Diagnostik Real-Time: Status ICE & Meteran Level Mikrofon Lokal */}
+            <div className="mt-2.5 flex flex-col items-center gap-2">
+              <div className="inline-flex items-center gap-2 rounded-full bg-white/10 border border-white/15 px-3 py-1 text-[11px] font-mono tracking-wide text-slate-100">
                 <span
                   className={`w-2 h-2 rounded-full ${
-                    call.connectionMode === 'relay'
-                      ? 'bg-amber-400'
-                      : call.connectionMode === 'direct'
+                    call.iceState === 'connected' || call.iceState === 'completed'
                       ? 'bg-emerald-400'
+                      : call.iceState === 'failed' || call.iceState === 'disconnected'
+                      ? 'bg-rose-400'
                       : 'bg-sky-400 animate-pulse'
                   }`}
                 />
-                <span>
-                  {call.connectionMode === 'relay'
-                    ? 'TURN Relay'
-                    : call.connectionMode === 'direct'
-                    ? 'Direct P2P'
-                    : call.connectionMode === 'reconnecting_relay'
-                    ? 'Beralih ke TURN Relay...'
-                    : 'Menghubungkan ICE...'}
+                <span>ICE: {call.iceState || 'checking'}</span>
+                {call.connectionMode === 'direct' && (
+                  <span className="text-emerald-300 font-sans font-medium">· P2P</span>
+                )}
+              </div>
+
+              <div
+                className="inline-flex items-center gap-2 rounded-full bg-black/35 border border-white/10 px-3 py-1.5 backdrop-blur-xs"
+                aria-label="Level suara mikrofon lokal"
+              >
+                {call.isMuted ? (
+                  <MicOff className="w-3.5 h-3.5 text-rose-400 shrink-0" />
+                ) : (
+                  <Mic
+                    className={`w-3.5 h-3.5 shrink-0 transition-colors ${
+                      micLevel > 8 ? 'text-emerald-400' : 'text-slate-300'
+                    }`}
+                  />
+                )}
+                <div className="flex items-end gap-[3px] h-3.5">
+                  {[12, 22, 34, 46, 58, 70, 82, 92].map((threshold, idx) => {
+                    const active = !call.isMuted && micLevel >= threshold;
+                    const barHeight = `${38 + idx * 8}%`;
+                    return (
+                      <span
+                        key={threshold}
+                        style={{ height: barHeight }}
+                        className={`w-1 rounded-full transition-colors duration-75 ${
+                          active
+                            ? idx >= 6
+                              ? 'bg-amber-400'
+                              : 'bg-emerald-400'
+                            : 'bg-white/20'
+                        }`}
+                      />
+                    );
+                  })}
+                </div>
+                <span className="text-[10px] font-medium text-slate-300 min-w-[46px] text-left">
+                  {call.isMuted
+                    ? 'Bisukan'
+                    : call.localStream
+                    ? micLevel > 8
+                      ? 'Aktif'
+                      : 'Siap'
+                    : 'No Mic'}
                 </span>
               </div>
-            )}
+            </div>
           </div>
 
           {!showRemoteVideo && (

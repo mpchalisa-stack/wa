@@ -3,6 +3,9 @@
 let ringtoneTimer: number | null = null;
 let idleReleaseTimer: number | null = null;
 let audioCtx: AudioContext | null = null;
+const activeRingtoneNodes = new Set<AudioNode>();
+const activeRingtoneOscillators = new Set<OscillatorNode>();
+let activeRingtoneAudioEl: HTMLAudioElement | null = null;
 
 function clearIdleReleaseTimer(): void {
   if (idleReleaseTimer !== null) {
@@ -181,6 +184,21 @@ function playTelephoneBurst(ctx: AudioContext, startTime: number, duration: numb
   osc480.start(startTime);
   oscHarmonic.start(startTime);
 
+  activeRingtoneOscillators.add(osc440);
+  activeRingtoneOscillators.add(osc480);
+  activeRingtoneOscillators.add(oscHarmonic);
+  activeRingtoneNodes.add(masterGain);
+  activeRingtoneNodes.add(harmonicGain);
+
+  const cleanup = () => {
+    activeRingtoneOscillators.delete(osc440);
+    activeRingtoneOscillators.delete(osc480);
+    activeRingtoneOscillators.delete(oscHarmonic);
+    activeRingtoneNodes.delete(masterGain);
+    activeRingtoneNodes.delete(harmonicGain);
+  };
+  osc440.onended = cleanup;
+
   const stopAt = startTime + duration + 0.03;
   osc440.stop(stopAt);
   osc480.stop(stopAt);
@@ -239,6 +257,14 @@ export function startOutgoingRingback(): void {
 
     osc1.start(now);
     osc2.start(now);
+    activeRingtoneOscillators.add(osc1);
+    activeRingtoneOscillators.add(osc2);
+    activeRingtoneNodes.add(gain);
+    osc1.onended = () => {
+      activeRingtoneOscillators.delete(osc1);
+      activeRingtoneOscillators.delete(osc2);
+      activeRingtoneNodes.delete(gain);
+    };
     osc1.stop(now + 1.1);
     osc2.stop(now + 1.1);
   };
@@ -252,8 +278,43 @@ export function stopRingtone(): void {
     window.clearInterval(ringtoneTimer);
     ringtoneTimer = null;
   }
+
+  // Hentikan paksa seluruh osilator & node audio dering seketika agar Android melepaskan Audio Focus
+  activeRingtoneOscillators.forEach((osc) => {
+    try {
+      osc.stop();
+    } catch {
+      // ignore if already stopped
+    }
+    try {
+      osc.disconnect();
+    } catch {
+      // ignore
+    }
+  });
+  activeRingtoneOscillators.clear();
+
+  activeRingtoneNodes.forEach((node) => {
+    try {
+      node.disconnect();
+    } catch {
+      // ignore
+    }
+  });
+  activeRingtoneNodes.clear();
+
+  if (activeRingtoneAudioEl) {
+    try {
+      activeRingtoneAudioEl.pause();
+      activeRingtoneAudioEl.src = '';
+    } catch {
+      // ignore
+    }
+    activeRingtoneAudioEl = null;
+  }
+
   stopVibration();
-  // Segera lepas AudioContext agar fokus audio perangkat Android/Bluetooth kembali normal
+  // Segera lepas AudioContext agar fokus audio perangkat Android/Bluetooth kembali normal sebelum getUserMedia()
   releaseAudioContextNow();
 }
 

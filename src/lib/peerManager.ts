@@ -53,47 +53,21 @@ const STALE_CONNECTION_MS = 18000;
 export type PeerTransportMode = 'p2p' | 'relay';
 
 /**
- * Konfigurasi ICE / STUN + TURN Server aktif untuk WebRTC (DataChannel & Panggilan Suara/Video).
- * Menyertakan STUN Google serta relay TURN publik aktif OpenRelay / Metered pada port 80 & 443 (UDP, TCP, TLS)
- * agar koneksi chat dan suara panggilan tetap tembus di jaringan data seluler 4G/5G (Symmetric NAT / CGNAT).
+ * Konfigurasi ICE / STUN standar & cepat untuk WebRTC (DataChannel & Panggilan Suara/Video).
+ * Menggunakan iceTransportPolicy: 'all' tanpa pemaksaan relay yang memperlambat koneksi di Android WebView.
  */
 export const ICE_SERVERS: RTCIceServer[] = [
   { urls: 'stun:stun.l.google.com:19302' },
   { urls: 'stun:stun1.l.google.com:19302' },
   { urls: 'stun:stun2.l.google.com:19302' },
-  { urls: 'stun:stun.relay.metered.ca:80' },
-  {
-    urls: 'turn:openrelay.metered.ca:80',
-    username: 'openrelayproject',
-    credential: 'openrelayproject',
-  },
-  {
-    urls: 'turn:openrelay.metered.ca:80?transport=tcp',
-    username: 'openrelayproject',
-    credential: 'openrelayproject',
-  },
-  {
-    urls: 'turn:openrelay.metered.ca:443',
-    username: 'openrelayproject',
-    credential: 'openrelayproject',
-  },
-  {
-    urls: 'turn:openrelay.metered.ca:443?transport=tcp',
-    username: 'openrelayproject',
-    credential: 'openrelayproject',
-  },
-  {
-    urls: 'turns:openrelay.metered.ca:443?transport=tcp',
-    username: 'openrelayproject',
-    credential: 'openrelayproject',
-  },
+  { urls: 'stun:global.stun.twilio.com:3478' },
 ];
 
-export function createCallRTCConfiguration(forceRelay = false): RTCConfiguration {
+export function createCallRTCConfiguration(): RTCConfiguration {
   return {
     iceServers: ICE_SERVERS,
     iceCandidatePoolSize: 10,
-    iceTransportPolicy: forceRelay ? 'relay' : 'all',
+    iceTransportPolicy: 'all',
     bundlePolicy: 'max-bundle',
     rtcpMuxPolicy: 'require',
   };
@@ -456,14 +430,15 @@ export class WA6PeerManager {
     }
   }
 
-  private applyPeerIcePolicy(forceRelay: boolean): void {
+  private applyPeerIcePolicy(_forceRelay = false): void {
     if (!this.peer) return;
     try {
       const peerAny = this.peer as unknown as {
         options?: { config?: RTCConfiguration & { sdpSemantics?: string } };
       };
       if (peerAny.options?.config) {
-        peerAny.options.config.iceTransportPolicy = forceRelay ? 'relay' : 'all';
+        // Selalu gunakan default 'all' (tanpa pemaksaan relay yang lambat)
+        peerAny.options.config.iceTransportPolicy = 'all';
       }
     } catch {
       // ignore
@@ -1609,35 +1584,7 @@ export class WA6PeerManager {
       this.connections.set(peerSixId, conn);
     }
 
-    // Mekanisme fallback otomatis ke TURN relay (iceTransportPolicy: 'relay') bila:
-    // (a) conn gagal terbuka dalam 6 detik, ATAU
-    // (b) RTCPeerConnection mengalami iceConnectionState === 'failed'
-    const triggerRelayFallback = (reason: string) => {
-      if (this.destroyed) return;
-      if (this.connections.get(peerSixId) !== conn) return;
-
-      this.clearOpenWatchdog(peerSixId);
-
-      const alreadyTriedRelay = startedWithRelay || this.relayFallbackAttempted.has(peerSixId);
-      try {
-        conn.close();
-      } catch {
-        // ignore
-      }
-      if (this.connections.get(peerSixId) === conn) {
-        this.connections.delete(peerSixId);
-      }
-      this.markPeerVerifiedOffline(peerSixId);
-
-      if (!alreadyTriedRelay && this.peer && !this.peer.destroyed && this.peer.open) {
-        console.warn(`[WattappsAU WebRTC] ${reason} untuk ${peerSixId}, fallback paksa via TURN relay...`);
-        this.relayFallbackAttempted.add(peerSixId);
-        this.relayPreferredPeers.add(peerSixId);
-        this.forceReconnectPeer(peerSixId, conn, true);
-      }
-    };
-
-    const bindIceFailureMonitor = () => {
+    const bindIceMonitor = () => {
       const pc = getPeerConnection(conn);
       if (!pc) return;
       const handleIceChange = () => {
@@ -1645,10 +1592,7 @@ export class WA6PeerManager {
           pc.removeEventListener('iceconnectionstatechange', handleIceChange);
           return;
         }
-        if (pc.iceConnectionState === 'failed') {
-          pc.removeEventListener('iceconnectionstatechange', handleIceChange);
-          triggerRelayFallback('iceConnectionState === failed');
-        } else if (pc.iceConnectionState === 'connected' || pc.iceConnectionState === 'completed') {
+        if (pc.iceConnectionState === 'connected' || pc.iceConnectionState === 'completed') {
           if (this.verifiedOnlinePeers.has(peerSixId)) {
             void this.inspectAndEmitTransport(peerSixId, conn);
           }
@@ -1657,25 +1601,13 @@ export class WA6PeerManager {
       pc.addEventListener('iceconnectionstatechange', handleIceChange);
     };
 
-    bindIceFailureMonitor();
-
-    // Watchdog 6 detik menunggu conn.on('open')
-    if (!isConnectionLive(conn)) {
-      this.clearOpenWatchdog(peerSixId);
-      const watchdog = window.setTimeout(() => {
-        this.openWatchdogs.delete(peerSixId);
-        if (!isConnectionLive(conn) && this.connections.get(peerSixId) === conn) {
-          triggerRelayFallback('DataConnection timeout 6 detik');
-        }
-      }, OPEN_RELAY_FALLBACK_MS);
-      this.openWatchdogs.set(peerSixId, watchdog);
-    }
+    bindIceMonitor();
 
     const onOpen = () => {
       this.clearOpenWatchdog(peerSixId);
       this.connections.set(peerSixId, conn);
       this.lastPeerActivity.set(peerSixId, Date.now());
-      bindIceFailureMonitor();
+      bindIceMonitor();
 
       // Selesaikan semua waiter yang sedang menunggu ensureOpenConnection()
       const waiters = this.openWaiters.get(peerSixId);
@@ -1812,7 +1744,8 @@ export class WA6PeerManager {
 
     conn.on('error', () => {
       if (this.connections.get(peerSixId) === conn) {
-        triggerRelayFallback('DataConnection error');
+        this.connections.delete(peerSixId);
+        this.markPeerVerifiedOffline(peerSixId);
       }
     });
   }
@@ -2074,8 +2007,7 @@ export class WA6PeerManager {
   public startMediaCall(
     rawTargetId: string,
     stream: MediaStream,
-    metadata: Record<string, unknown>,
-    forceRelay = false
+    metadata: Record<string, unknown>
   ): MediaConnection | null {
     const targetSixDigitId = normalizePeerId(rawTargetId);
     if (!this.peer || this.peer.destroyed || !this.peer.open || !targetSixDigitId) return null;
@@ -2085,17 +2017,10 @@ export class WA6PeerManager {
       track.enabled = true;
     });
 
-    if (forceRelay) {
-      this.relayPreferredPeers.add(targetSixDigitId);
-    }
-    const useRelay = forceRelay || this.relayPreferredPeers.has(targetSixDigitId);
-    this.applyPeerIcePolicy(useRelay);
+    this.applyPeerIcePolicy(false);
     try {
       const mediaCall = this.peer.call(toFullPeerId(targetSixDigitId), stream, {
-        metadata: {
-          ...metadata,
-          forceRelay: useRelay,
-        },
+        metadata,
       });
       if (mediaCall) {
         ensureLocalAudioTracksAttached(mediaCall, stream);
@@ -2104,33 +2029,21 @@ export class WA6PeerManager {
     } catch (err) {
       console.error('Failed to initiate media call:', err);
       return null;
-    } finally {
-      this.applyPeerIcePolicy(false);
     }
   }
 
   public answerMediaCall(
     mediaCall: MediaConnection,
-    stream: MediaStream,
-    forceRelay = false
+    stream: MediaStream
   ): void {
     // Pastikan seluruh track audio mikrofon aktif sebelum createAnswer()
     stream.getAudioTracks().forEach((track) => {
       track.enabled = true;
     });
 
-    const peerSixId = fromFullPeerId(mediaCall.peer);
-    if (forceRelay && peerSixId) {
-      this.relayPreferredPeers.add(peerSixId);
-    }
-    const useRelay = forceRelay || (peerSixId ? this.relayPreferredPeers.has(peerSixId) : false);
-    this.applyPeerIcePolicy(useRelay);
-    try {
-      mediaCall.answer(stream);
-      ensureLocalAudioTracksAttached(mediaCall, stream);
-    } finally {
-      this.applyPeerIcePolicy(false);
-    }
+    this.applyPeerIcePolicy(false);
+    mediaCall.answer(stream);
+    ensureLocalAudioTracksAttached(mediaCall, stream);
   }
 
   public isPeerOnline(rawSixDigitId: string): boolean {
