@@ -9,7 +9,6 @@ import {
   MoreVertical,
   Power,
   QrCode,
-  RefreshCw,
   Search,
   Share2,
   Shield,
@@ -91,15 +90,6 @@ import {
   subscribeFirestoreWakeSignals,
   syncDeviceTokenToFirestore,
 } from './lib/firebase';
-import {
-  NativeNotificationActionEvent,
-  exitNativeApp,
-  getDevicePlatform,
-  isNativeCapacitor,
-  minimizeNativeApp,
-  registerNativeBackButtonHandler,
-} from './lib/nativeAndroid';
-import { startSafeNativePushAndServices } from './services/nativePush';
 import { estimateDataUrlBytes, formatSixDigitId, generateUid } from './lib/media';
 import { OnboardingScreen } from './components/OnboardingScreen';
 import { ChatList } from './components/ChatList';
@@ -112,7 +102,7 @@ import { NewGroupModal } from './components/NewGroupModal';
 import { CameraModal } from './components/CameraModal';
 import { CallOverlay, ActiveCallUIState } from './components/CallOverlay';
 import { MediaLightbox, LightboxMedia } from './components/MediaLightbox';
-import { OfflineIndicator, PWAInstallButton } from './components/PWAInstallButton';
+import { PWAInstallButton } from './components/PWAInstallButton';
 import { ShareAppModal } from './components/ShareAppModal';
 import { AppLogo } from './components/AppLogo';
 
@@ -228,7 +218,7 @@ export default function App() {
 
   // PeerJS real-time state
   const [peerState, setPeerState] = useState<PeerConnectionState>('connecting');
-  const [peerError, setPeerError] = useState<string | undefined>();
+  const [, setPeerError] = useState<string | undefined>();
   const [onlinePeers, setOnlinePeers] = useState<Record<string, boolean>>({});
   const [typingMap, setTypingMap] = useState<Record<string, string>>({});
 
@@ -237,9 +227,8 @@ export default function App() {
   const [incomingCall, setIncomingCall] = useState<IncomingCallState | null>(null);
   const [incomingCallModalForceTick, setIncomingCallModalForceTick] = useState(0);
 
-  // Firebase Auth & Native Android FCM Token state (optional Cloud Push sync)
+  // Firebase Auth state (optional Web Cloud Sync)
   const [firebaseUser, setFirebaseUser] = useState<FirebaseAuthUser | null>(null);
-  const [nativeFcmToken, setNativeFcmToken] = useState<string>('');
 
   // Refs for fresh state inside PeerJS callbacks
   const peerManagerRef = useRef<WA6PeerManager | null>(null);
@@ -2101,12 +2090,18 @@ export default function App() {
       void wakeAndSyncPeer();
     };
 
+    const handleBrowserOnline = () => {
+      void wakeAndSyncPeer();
+    };
+
     document.addEventListener('visibilitychange', handleVisibilityChange);
     window.addEventListener('focus', handleWindowFocus);
+    window.addEventListener('online', handleBrowserOnline);
 
     return () => {
       document.removeEventListener('visibilitychange', handleVisibilityChange);
       window.removeEventListener('focus', handleWindowFocus);
+      window.removeEventListener('online', handleBrowserOnline);
     };
   }, [
     profile?.id,
@@ -2195,21 +2190,12 @@ export default function App() {
         setActiveTab('chats');
       } else {
         // (c) Sudah di halaman utama daftar chat:
-        // Pada Android Native (APK), kirim aplikasi ke latar belakang seperti WhatsApp agar Mode Siaga tetap hidup.
-        // Pada Web/Chrome, tahan halaman dan tampilkan peringatan.
-        if (isNativeCapacitor()) {
-          try {
-            void minimizeNativeApp();
-          } catch (err) {
-            console.error('[App] minimizeNativeApp error:', err);
-          }
-        } else {
-          showToast(
-            'Tombol Back dikunci agar Mode Siaga tetap aktif. Tekan tombol Home (bulat) untuk ke layar utama HP, atau pilih menu ⋮ > Exit untuk keluar.',
-            4500,
-            'warning'
-          );
-        }
+        // Tahan halaman agar Mode Siaga latar belakang 18 Hz tetap aktif & tampilkan panduan singkat.
+        showToast(
+          'Tombol Back dikunci agar Mode Siaga tetap aktif. Tekan tombol Home (bulat) untuk ke layar utama HP, atau pilih menu ⋮ > Exit untuk keluar.',
+          4500,
+          'warning'
+        );
       }
     };
 
@@ -2217,167 +2203,14 @@ export default function App() {
     window.addEventListener('touchstart', trapBackButton, { passive: true });
     window.addEventListener('popstate', handlePopState);
 
-    let removeNativeBack: (() => void) | null = null;
-    if (isNativeCapacitor()) {
-      try {
-        void registerNativeBackButtonHandler(() => {
-          try {
-            if (isExitedRef.current) return;
-            const ui = backGuardStateRef.current;
-            if (ui.hasCallModal || callRuntimeRef.current || incomingCallRef.current || pendingCallRef.current) {
-              handleRejectCallRef.current();
-            } else if (ui.lightboxMedia) {
-              setLightboxMedia(null);
-            } else if (ui.cameraPurpose) {
-              setCameraPurpose(null);
-            } else if (ui.showResetConfirm) {
-              setShowResetConfirm(false);
-            } else if (ui.showMainMenu) {
-              setShowMainMenu(false);
-            } else if (ui.showProfileDrawer) {
-              setShowProfileDrawer(false);
-            } else if (ui.showShareAppModal) {
-              setShowShareAppModal(false);
-            } else if (ui.showNewChatModal) {
-              setShowNewChatModal(false);
-            } else if (ui.showNewGroupModal) {
-              setShowNewGroupModal(false);
-            } else if (ui.searchOpen) {
-              setSearchOpen(false);
-              setSearchQuery('');
-            } else if (ui.activeChatId) {
-              setActiveChatId(null);
-            } else if (ui.activeTab !== 'chats') {
-              setActiveTab('chats');
-            } else {
-              void minimizeNativeApp();
-            }
-          } catch (err) {
-            console.error('[App] Native back button callback error:', err);
-          }
-        })
-          .then((cleanup) => {
-            removeNativeBack = cleanup;
-          })
-          .catch((err) => {
-            console.error('[App] registerNativeBackButtonHandler error:', err);
-          });
-      } catch (err) {
-        console.error('[App] Native back button setup error:', err);
-      }
-    }
-
     return () => {
       window.removeEventListener('pointerdown', trapBackButton);
       window.removeEventListener('touchstart', trapBackButton);
       window.removeEventListener('popstate', handlePopState);
-      try {
-        if (removeNativeBack) removeNativeBack();
-      } catch (err) {
-        console.error('[App] Remove native back listener error:', err);
-      }
     };
   }, [isExited, showToast, finalizeCall]);
 
-  // Inisialisasi Capacitor Android Native secara aman & non-blocking setelah React render (anti force-close Android 14/15/16)
-  useEffect(() => {
-    if (!isNativeCapacitor() || isExited) return;
-
-    const handleNativeAction = (ev: NativeNotificationActionEvent) => {
-      try {
-        if (ev.actionId === 'reject_call') {
-          handleRejectCallRef.current({
-            callerId: ev.callerId,
-            callerName: ev.callerName,
-            callId: ev.callId,
-            callType: ev.callType,
-          });
-          return;
-        }
-
-        if (ev.actionId === 'accept_call') {
-          forceShowIncomingCallModal({
-            callerId: ev.callerId,
-            callerName: ev.callerName,
-            callId: ev.callId,
-            callType: ev.callType,
-            isVideo: ev.isVideo,
-          });
-          void wakeAndSyncPeer();
-          void handleAcceptCallRef.current(true);
-          return;
-        }
-
-        if (ev.kind === 'call') {
-          forceShowIncomingCallModal({
-            callerId: ev.callerId,
-            callerName: ev.callerName,
-            callId: ev.callId,
-            callType: ev.callType,
-            isVideo: ev.isVideo,
-          });
-          void wakeAndSyncPeer();
-          return;
-        }
-
-        const targetChat = ev.chatId || ev.callerId;
-        if (targetChat) {
-          const cleanId = fromFullPeerId(targetChat);
-          setActiveTab('chats');
-          setActiveChatId(cleanId);
-          activeChatIdRef.current = cleanId;
-          void wakeAndSyncPeer();
-        }
-      } catch (err) {
-        console.error('[App] handleNativeAction error:', err);
-      }
-    };
-
-    try {
-      return startSafeNativePushAndServices({
-        standbyEnabled: standbyModeRef.current,
-        onToken: (token) => {
-          setNativeFcmToken(token);
-        },
-        onNotificationAction: handleNativeAction,
-        onPushReceived: (payload) => {
-          try {
-            if (payload.kind === 'call' && payload.callerId) {
-              pauseKeepAliveForCall();
-              startIncomingRingtone();
-              forceShowIncomingCallModal({
-                callerId: payload.callerId,
-                callerName: payload.callerName,
-                callId: payload.callId,
-                callType: payload.callType,
-                isVideo: payload.isVideo,
-              });
-            }
-            void wakeAndSyncPeer();
-          } catch (err) {
-            console.error('[App] onPushReceived error:', err);
-          }
-        },
-        onAppStateChange: (isActive) => {
-          try {
-            if (isActive) {
-              void wakeAndSyncPeer();
-              if (incomingCallRef.current && isIncomingCallStillActive(incomingCallRef.current)) {
-                forceShowIncomingCallModal();
-              }
-            }
-          } catch (err) {
-            console.error('[App] onAppStateChange error:', err);
-          }
-        },
-      });
-    } catch (err) {
-      console.error('[App] startSafeNativePushAndServices error:', err);
-      return undefined;
-    }
-  }, [isExited, wakeAndSyncPeer, forceShowIncomingCallModal, isIncomingCallStillActive]);
-
-  // Sinkronisasi opsional Firebase Auth & Cloud Firestore (FCM Token + Antrean Sinyal Bangun)
+  // Sinkronisasi opsional Firebase Auth & Cloud Firestore (Antrean Sinyal Bangun Web)
   useEffect(() => {
     const unsubscribe = subscribeFirebaseAuth((user) => {
       setFirebaseUser(user);
@@ -2390,13 +2223,13 @@ export default function App() {
     void syncDeviceTokenToFirestore({
       peerId: profile.id,
       displayName: profile.name,
-      fcmToken: nativeFcmToken,
-      platform: getDevicePlatform(),
+      fcmToken: '',
+      platform: 'web',
       standbyEnabled: standbyMode,
     }).catch((err) => {
-      console.warn('[WattappsAU Firebase] Device token sync skipped:', err);
+      console.warn('[WattappsAU Firebase] Device sync skipped:', err);
     });
-  }, [firebaseUser, profile?.id, profile?.name, nativeFcmToken, standbyMode, isExited]);
+  }, [firebaseUser, profile?.id, profile?.name, standbyMode, isExited]);
 
   useEffect(() => {
     if (!firebaseUser || !profile?.id || isExited) return;
@@ -2531,9 +2364,11 @@ export default function App() {
       setCameraPurpose(null);
       setLightboxMedia(null);
 
-      // (a) Jika ini adalah panggilan masuk (?incomingCall=... atau action=call/ANSWER_CALL), paksa tampilkan Modal Layar Penuh Panggilan Masuk
+      // (a) Jika ini adalah panggilan masuk (?incomingCall=... atau action=call/ANSWER_CALL), otomatis buka halaman Panggilan & Modal Layar Penuh
       if (action === 'call') {
         const isVideo = Boolean(extraData?.isVideo ?? callTypeParam === 'video');
+        setActiveTab('calls');
+        setActiveChatId(null);
         forceShowIncomingCallModal({
           callerId: targetId || undefined,
           callerName: nameParam || undefined,
@@ -2647,7 +2482,7 @@ export default function App() {
         return;
       }
 
-      // 2. Tombol "Jawab" pada notifikasi panggilan: buka modal layar penuh & langsung angkat jika izin sudah siap
+      // 2. Tombol "Jawab" pada notifikasi panggilan: otomatis buka halaman Panggilan, tampilkan layar penuh & angkat jika izin siap
       if (payload.type === 'ACCEPT_INCOMING_CALL_FROM_NOTIFICATION') {
         const isVideo = Boolean(
           payload.isVideo ||
@@ -2655,6 +2490,8 @@ export default function App() {
             payload.data?.isVideo ||
             payload.data?.callType === 'video'
         );
+        setActiveTab('calls');
+        setActiveChatId(null);
         forceShowIncomingCallModal({
           callerId: payload.callerId || payload.data?.callerId || payload.data?.fromId,
           callerName: payload.callerName || payload.data?.callerName || payload.data?.fromName,
@@ -2679,6 +2516,8 @@ export default function App() {
             payload.data?.isVideo ||
             payload.data?.callType === 'video'
         );
+        setActiveTab('calls');
+        setActiveChatId(null);
         forceShowIncomingCallModal({
           callerId: payload.callerId || payload.data?.callerId || payload.data?.fromId,
           callerName: payload.callerName || payload.data?.callerName || payload.data?.fromName,
@@ -3578,9 +3417,8 @@ export default function App() {
     setActiveCallUI((prev) => (prev ? { ...prev, isSpeakerOn: !prev.isSpeakerOn } : null));
   };
 
-  // Toggle Mode Siaga (Background Media Keep-Alive + Media Session Lock Screen + Screen Wake Lock)
+  // Toggle Mode Siaga (Audio Sub-Audible 18 Hz Web Audio tanpa widget layar kunci + Screen Wake Lock)
   const handleToggleStandby = useCallback(async () => {
-    // Jika Mode Siaga sudah aktif DAN aliran audio penjaga sudah benar-benar berjalan, matikan
     if (standbyModeRef.current && isKeepAliveActuallyPlaying()) {
       await disableStandbyMode();
       setStandbyMode(false);
@@ -3588,12 +3426,11 @@ export default function App() {
       return;
     }
 
-    // Jalankan await audio.play() langsung di dalam event klik user agar kartu Media Session layar kunci muncul
     const res = await enableStandbyMode();
     setStandbyMode(true);
 
     if (res.audioKeepAliveActive) {
-      showToast('Mode Siaga Aktif · Saluran latar & kartu layar kunci aktif');
+      showToast('Mode Siaga Aktif · Audio sub-audible 18 Hz menjaga PeerJS tanpa widget layar kunci');
     } else if (res.wakeLockActive) {
       showToast('Mode Siaga Aktif · Layar & koneksi P2P tetap terjaga');
     } else {
@@ -3662,16 +3499,6 @@ export default function App() {
     setPeerState('disconnected');
     setOnlinePeers({});
     setIsExited(true);
-
-    // Pada aplikasi Android Native (Capacitor APK), tutup proses aplikasi secara bersih
-    if (isNativeCapacitor()) {
-      try {
-        await exitNativeApp();
-      } catch (err) {
-        console.error('[App] exitNativeApp error:', err);
-      }
-      return;
-    }
 
     // Coba tutup jendela/tab aplikasi (didukung di PWA/window tertentu)
     try {
@@ -3804,7 +3631,7 @@ export default function App() {
             </div>
           ) : (
             <div className="min-h-[60px] py-1.5 px-3 flex items-center justify-between gap-1.5">
-              {/* Brand & PeerJS Live Status Indicator */}
+              {/* Brand */}
               <div className="flex items-center gap-2 min-w-0 flex-1">
                 <button
                   type="button"
@@ -3821,39 +3648,6 @@ export default function App() {
                     </span>
                   </span>
                 </button>
-                <button
-                  type="button"
-                  onClick={() => {
-                    if (peerState !== 'online') {
-                      peerManagerRef.current?.connect();
-                      showToast('Menghubungkan ulang ke server PeerJS...');
-                    } else {
-                      setShowProfileDrawer(true);
-                    }
-                  }}
-                  title={peerError || `ID Anda: ${profile.id}`}
-                  className="inline-flex items-center gap-1 text-[11px] font-medium text-white/90 hover:text-white transition-colors whitespace-nowrap cursor-pointer shrink-0"
-                >
-                  <span
-                    className={`w-2 h-2 rounded-full shrink-0 ${
-                      peerState === 'online'
-                        ? 'bg-[#25D366]'
-                        : peerState === 'connecting'
-                        ? 'bg-amber-300 animate-pulse'
-                        : 'bg-rose-400'
-                    }`}
-                  />
-                  <span>
-                    {peerState === 'online'
-                      ? 'Online'
-                      : peerState === 'connecting'
-                      ? 'Menghubungkan...'
-                      : 'Terputus'}
-                  </span>
-                  {peerState === 'disconnected' || peerState === 'error' ? (
-                    <RefreshCw className="w-3 h-3" />
-                  ) : null}
-                </button>
               </div>
 
               {/* Right Icons: Mode Siaga / Anti-Sleep, Camera, Global Search, 3-Dot Menu */}
@@ -3861,21 +3655,21 @@ export default function App() {
                 <button
                   type="button"
                   onClick={() => void handleToggleStandby()}
-                  className={`h-8 px-2 mr-0.5 rounded-full inline-flex items-center gap-1 text-[11px] font-semibold transition-all cursor-pointer border ${
+                  className={`h-8 px-2 mr-0.5 rounded-full inline-flex items-center gap-1 text-[11px] font-semibold transition-colors cursor-pointer border ${
                     standbyMode
-                      ? 'bg-[#25D366]/20 border-[#25D366]/70 text-[#D9FDD3] shadow-[0_0_12px_rgba(37,211,102,0.35)]'
+                      ? 'bg-[#25D366]/15 border-[#25D366]/45 text-[#D9FDD3]'
                       : 'bg-white/10 border-white/15 text-white/90 hover:bg-white/20'
                   }`}
                   title={
                     standbyMode
-                      ? 'Mode Siaga Latar Belakang AKTIF (ketuk untuk matikan)'
-                      : 'Aktifkan Mode Siaga Latar Belakang agar koneksi P2P tetap hidup saat layar terkunci'
+                      ? 'Mode Siaga Latar Belakang aktif (audio sub-audible 18 Hz)'
+                      : 'Aktifkan Mode Siaga Latar Belakang'
                   }
                   aria-label="Mode Siaga Latar Belakang"
                   aria-pressed={standbyMode}
                 >
                   {standbyMode ? (
-                    <ShieldCheck className="w-3.5 h-3.5 shrink-0 text-[#25D366] animate-pulse" />
+                    <ShieldCheck className="w-3.5 h-3.5 shrink-0 text-[#25D366]" />
                   ) : (
                     <Shield className="w-3.5 h-3.5 shrink-0" />
                   )}
@@ -4223,7 +4017,6 @@ export default function App() {
         <ProfileDrawer
           profile={profile}
           firebaseUserEmail={firebaseUser?.email ?? null}
-          nativeFcmToken={nativeFcmToken}
           onSignInFirebase={async () => {
             try {
               const user = await signInWithGoogleForCloudPush();
@@ -4378,8 +4171,6 @@ export default function App() {
           {toast}
         </div>
       )}
-
-      <OfflineIndicator />
     </div>
   );
 }

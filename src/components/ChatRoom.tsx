@@ -398,9 +398,7 @@ export const ChatRoom: React.FC<ChatRoomProps> = ({
       : 'Sedang mengetik...'
     : contact.isGroup
     ? `${contact.members?.length || 1} anggota · Grup P2P`
-    : isPeerOnline
-    ? 'Online'
-    : 'Offline';
+    : `ID ${formatSixDigitId(contact.id)}`;
 
   return (
     <div className="flex-1 flex flex-col h-full min-w-0 relative overflow-hidden">
@@ -426,16 +424,10 @@ export const ChatRoom: React.FC<ChatRoomProps> = ({
               name={contact.name}
               size="md"
               isGroup={contact.isGroup}
-              isOnline={!contact.isGroup && isPeerOnline}
             />
             <div className="min-w-0 flex-1">
               <div className="flex items-center gap-2 min-w-0">
                 <h2 className="text-[15px] font-semibold truncate leading-tight">{contact.name}</h2>
-                {!contact.isGroup && (
-                  <span className="hidden sm:inline font-mono-id text-[11px] opacity-70 shrink-0">
-                    {formatSixDigitId(contact.id)}
-                  </span>
-                )}
               </div>
               <div
                 className={`text-xs truncate ${

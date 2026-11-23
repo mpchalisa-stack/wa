@@ -83,103 +83,12 @@ export function stopVibration(): void {
   }
 }
 
-function playMarimbaNote(
-  ctx: AudioContext,
-  freq: number,
-  startTime: number,
-  duration: number,
-  gainPeak = 0.24,
-  waveform: OscillatorType = 'triangle'
-) {
-  const osc = ctx.createOscillator();
-  const harmonic = ctx.createOscillator();
-  const gain = ctx.createGain();
-
-  osc.type = waveform;
-  osc.frequency.setValueAtTime(freq, startTime);
-
-  harmonic.type = 'sine';
-  harmonic.frequency.setValueAtTime(freq * 2, startTime);
-
-  const harmonicGain = ctx.createGain();
-  harmonicGain.gain.setValueAtTime(0.25, startTime);
-
-  gain.gain.setValueAtTime(0.0001, startTime);
-  gain.gain.exponentialRampToValueAtTime(gainPeak, startTime + 0.014);
-  gain.gain.exponentialRampToValueAtTime(0.0001, startTime + duration);
-
-  osc.connect(gain);
-  harmonic.connect(harmonicGain);
-  harmonicGain.connect(gain);
-  gain.connect(ctx.destination);
-
-  osc.start(startTime);
-  harmonic.start(startTime);
-  osc.stop(startTime + duration + 0.02);
-  harmonic.stop(startTime + duration + 0.02);
-}
-
-function playTelephoneBurst(ctx: AudioContext, startTime: number, duration: number, gainPeak = 0.34) {
-  // Osilator ganda 440Hz + 480Hz pola dering telepon klasik + sedikit harmonisa agar nyaring di speaker HP
-  const osc440 = ctx.createOscillator();
-  const osc480 = ctx.createOscillator();
-  const oscHarmonic = ctx.createOscillator();
-  const masterGain = ctx.createGain();
-  const harmonicGain = ctx.createGain();
-
-  osc440.type = 'sine';
-  osc480.type = 'sine';
-  oscHarmonic.type = 'triangle';
-
-  osc440.frequency.setValueAtTime(440, startTime);
-  osc480.frequency.setValueAtTime(480, startTime);
-  oscHarmonic.frequency.setValueAtTime(920, startTime);
-
-  harmonicGain.gain.setValueAtTime(0.18, startTime);
-
-  masterGain.gain.setValueAtTime(0.0001, startTime);
-  masterGain.gain.linearRampToValueAtTime(gainPeak, startTime + 0.025);
-  masterGain.gain.setValueAtTime(gainPeak, startTime + Math.max(0.05, duration - 0.03));
-  masterGain.gain.linearRampToValueAtTime(0.0001, startTime + duration);
-
-  osc440.connect(masterGain);
-  osc480.connect(masterGain);
-  oscHarmonic.connect(harmonicGain);
-  harmonicGain.connect(masterGain);
-  masterGain.connect(ctx.destination);
-
-  osc440.start(startTime);
-  osc480.start(startTime);
-  oscHarmonic.start(startTime);
-
-  const stopAt = startTime + duration + 0.03;
-  osc440.stop(stopAt);
-  osc480.stop(stopAt);
-  oscHarmonic.stop(stopAt);
-}
-
 /**
- * Nada dering panggilan masuk nyaring:
- * Osilator ganda 440Hz + 480Hz pola dering telepon berulang + getaran [1000, 300, 1000] ms
- * hingga panggilan diangkat atau ditolak.
+ * Mode notifikasi senyap untuk kenyamanan pendengaran:
+ * Panggilan masuk & pesan tidak lagi memutar nada dering nyaring atau getaran yang mengganggu.
  */
 export function startIncomingRingtone(): void {
   stopRingtone();
-  const playPattern = () => {
-    triggerAlertVibration([1000, 300, 1000]);
-    const ctx = getSharedAudioContext();
-    if (!ctx) return;
-    if (ctx.state === 'suspended') {
-      void ctx.resume();
-    }
-    const now = ctx.currentTime;
-    // Pola dering ganda khas telepon: ring 0.45s - jeda 0.18s - ring 0.55s
-    playTelephoneBurst(ctx, now, 0.45, 0.34);
-    playTelephoneBurst(ctx, now + 0.63, 0.55, 0.34);
-  };
-
-  playPattern();
-  ringtoneTimer = window.setInterval(playPattern, 2600);
 }
 
 export function startOutgoingRingback(): void {
@@ -198,8 +107,8 @@ export function startOutgoingRingback(): void {
     osc2.frequency.setValueAtTime(480, now);
 
     gain.gain.setValueAtTime(0.0001, now);
-    gain.gain.linearRampToValueAtTime(0.07, now + 0.05);
-    gain.gain.setValueAtTime(0.07, now + 0.95);
+    gain.gain.linearRampToValueAtTime(0.05, now + 0.05);
+    gain.gain.setValueAtTime(0.05, now + 0.95);
     gain.gain.linearRampToValueAtTime(0.0001, now + 1.05);
 
     osc1.connect(gain);
@@ -224,17 +133,7 @@ export function stopRingtone(): void {
   stopVibration();
 }
 
-export function playMessagePop(incoming = false): void {
-  const ctx = getSharedAudioContext();
-  if (incoming) {
-    triggerAlertVibration([500, 200, 500]);
-  }
-  if (!ctx) return;
-  const now = ctx.currentTime;
-  if (incoming) {
-    playMarimbaNote(ctx, 659.25, now, 0.13, 0.24, 'triangle');
-    playMarimbaNote(ctx, 987.77, now + 0.09, 0.2, 0.26, 'triangle');
-  } else {
-    playMarimbaNote(ctx, 660, now, 0.09, 0.06, 'sine');
-  }
+export function playMessagePop(_incoming = false): void {
+  // Senyap: tidak memutar suara atau getaran agar notifikasi tidak mengganggu kenyamanan pendengaran
+  void _incoming;
 }

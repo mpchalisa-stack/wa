@@ -1,17 +1,17 @@
-import { triggerAlertVibration } from './audio';
-import {
-  cancelNativeCallNotifications,
-  isNativeCapacitor,
-  scheduleNativeLocalNotification,
-  setNativeKeepAwake,
-} from './nativeAndroid';
-
 /**
- * Generator Audio Sub-Audible (Bukan Zero-Byte Silence):
- * Menghasilkan file WAV 16-bit PCM berdurasi 10 detik (sample rate 44100 Hz, mono)
- * berisi gelombang sinus 18 Hz amplitudo kecil (Math.sin(...) * 150 dari skala 32767).
- * Tidak terdengar telinga manusia & speaker HP, namun terbaca sebagai aliran media aktif oleh Chrome Android.
+ * Generator Audio Sub-Audible 18 Hz (Web Audio API Pure Oscillator):
+ * Menghasilkan gelombang sinus kontinu 18 Hz dengan amplitudo sangat kecil (Gain 0.0015)
+ * langsung melalui AudioContext tanpa elemen <audio> dan tanpa Media Session API.
+ *
+ * Keunggulan:
+ * 1. Tidak terdengar oleh telinga manusia (< 20 Hz) maupun speaker HP/earphone.
+ * 2. Menjaga utas audio & koneksi PeerJS/WebRTC tetap aktif di latar belakang.
+ * 3. TIDAK memicu widget pemutar media di layar kunci maupun panel notifikasi Android/OS.
  */
+const SUB_AUDIBLE_FREQ_HZ = 18;
+const SUB_AUDIBLE_GAIN = 0.0015;
+const WATCHDOG_INTERVAL_MS = 12000;
+
 let cachedSubAudibleWavBlobUrl: string | null = null;
 
 export function createSubAudibleWavBlobUrl(): string {
@@ -21,8 +21,8 @@ export function createSubAudibleWavBlobUrl(): string {
   const durationSeconds = 10;
   const numChannels = 1;
   const bitsPerSample = 16;
-  const numSamples = sampleRate * durationSeconds; // 441.000 sampel (10 detik)
-  const dataByteLength = numSamples * numChannels * (bitsPerSample / 8); // 882.000 bytes
+  const numSamples = sampleRate * durationSeconds;
+  const dataByteLength = numSamples * numChannels * (bitsPerSample / 8);
   const buffer = new ArrayBuffer(44 + dataByteLength);
   const view = new DataView(buffer);
 
@@ -36,20 +36,18 @@ export function createSubAudibleWavBlobUrl(): string {
   view.setUint32(4, 36 + dataByteLength, true);
   writeStr(8, 'WAVE');
   writeStr(12, 'fmt ');
-  view.setUint32(16, 16, true); // PCM header size
-  view.setUint16(20, 1, true); // AudioFormat = 1 (PCM)
-  view.setUint16(22, numChannels, true); // Mono
-  view.setUint32(24, sampleRate, true); // 44100 Hz
-  view.setUint32(28, sampleRate * numChannels * (bitsPerSample / 8), true); // ByteRate
-  view.setUint16(32, numChannels * (bitsPerSample / 8), true); // BlockAlign
-  view.setUint16(34, bitsPerSample, true); // 16-bit
+  view.setUint32(16, 16, true);
+  view.setUint16(20, 1, true);
+  view.setUint16(22, numChannels, true);
+  view.setUint32(24, sampleRate, true);
+  view.setUint32(28, sampleRate * numChannels * (bitsPerSample / 8), true);
+  view.setUint16(32, numChannels * (bitsPerSample / 8), true);
+  view.setUint16(34, bitsPerSample, true);
   writeStr(36, 'data');
   view.setUint32(40, dataByteLength, true);
 
-  // Gelombang sinus sub-audible 18 Hz dengan amplitudo 150 (dari skala 32767)
-  const freqHz = 18;
   const amplitude = 150;
-  const twoPiFreqOverRate = (2 * Math.PI * freqHz) / sampleRate;
+  const twoPiFreqOverRate = (2 * Math.PI * SUB_AUDIBLE_FREQ_HZ) / sampleRate;
   for (let i = 0; i < numSamples; i++) {
     const sample = Math.round(Math.sin(twoPiFreqOverRate * i) * amplitude);
     view.setInt16(44 + i * 2, sample, true);
@@ -72,14 +70,14 @@ type NavigatorWithOptionalWakeLock = {
   };
 };
 
-const WATCHDOG_INTERVAL_MS = 15000;
-
 let isStandbyActive = false;
 let isPausedForCall = false;
 let resumeTimer: number | null = null;
 let watchdogTimer: number | null = null;
 let wakeLockSentinel: WakeLockSentinelLike | null = null;
-let keepAliveAudioEl: HTMLAudioElement | null = null;
+let subAudibleCtx: AudioContext | null = null;
+let subAudibleOsc: OscillatorNode | null = null;
+let subAudibleGain: GainNode | null = null;
 let visibilityListenerAttached = false;
 let pendingGestureUnlockAttached = false;
 let standbyStateListener: ((active: boolean) => void) | null = null;
@@ -89,7 +87,44 @@ export function setStandbyExternalListener(listener: ((active: boolean) => void)
 }
 
 export function isKeepAliveActuallyPlaying(): boolean {
-  return Boolean(keepAliveAudioEl && !keepAliveAudioEl.paused && !keepAliveAudioEl.ended);
+  return Boolean(
+    subAudibleCtx &&
+      subAudibleCtx.state === 'running' &&
+      subAudibleOsc &&
+      subAudibleGain
+  );
+}
+
+/**
+ * Pastikan Media Session dan elemen <audio> lama benar-benar dibersihkan
+ * sehingga sistem operasi TIDAK pernah menampilkan widget pemutar media di layar kunci.
+ */
+function suppressLockScreenMediaWidget(): void {
+  try {
+    if (typeof document !== 'undefined') {
+      const legacyEl = document.getElementById('keepalive-audio') as HTMLAudioElement | null;
+      if (legacyEl) {
+        legacyEl.pause();
+        legacyEl.removeAttribute('src');
+        legacyEl.load();
+        legacyEl.remove();
+      }
+    }
+    if (typeof navigator !== 'undefined' && 'mediaSession' in navigator) {
+      navigator.mediaSession.playbackState = 'none';
+      navigator.mediaSession.metadata = null;
+      const actions: MediaSessionAction[] = ['play', 'pause', 'stop', 'seekbackward', 'seekforward'];
+      for (const act of actions) {
+        try {
+          navigator.mediaSession.setActionHandler(act, null);
+        } catch {
+          // ignore unsupported action
+        }
+      }
+    }
+  } catch {
+    // ignore
+  }
 }
 
 async function requestScreenWakeLock(): Promise<boolean> {
@@ -125,186 +160,86 @@ async function releaseScreenWakeLock(): Promise<void> {
   }
 }
 
-let cachedMinimalArtworkDataUrl: string | null = null;
+function createOrEnsureSubAudibleNodes(): AudioContext | null {
+  if (typeof window === 'undefined') return null;
 
-/**
- * Menghasilkan ikon minimalis 192x192px (gelap netral transparan dengan gelombang sinyal halus)
- * dalam bentuk DataURL khusus untuk artwork Media Session layar kunci agar tidak mencolok.
- */
-function createMinimalStandbyArtworkDataUrl(): string {
-  if (cachedMinimalArtworkDataUrl) return cachedMinimalArtworkDataUrl;
+  const AudioCtxCtor =
+    window.AudioContext ||
+    (window as unknown as { webkitAudioContext?: typeof AudioContext }).webkitAudioContext;
+  if (!AudioCtxCtor) return null;
 
-  const fallbackSvg =
-    'data:image/svg+xml;charset=utf-8,' +
-    encodeURIComponent(
-      `<svg xmlns="http://www.w3.org/2000/svg" width="192" height="192" viewBox="0 0 192 192">` +
-        `<rect width="192" height="192" rx="36" fill="#1e293b" fill-opacity="0.88"/>` +
-        `<g fill="none" stroke="#94a3b8" stroke-width="6" stroke-linecap="round" stroke-opacity="0.65">` +
-        `<path d="M68 68 A40 40 0 0 0 68 124"/>` +
-        `<path d="M124 68 A40 40 0 0 1 124 124"/>` +
-        `<path d="M50 50 A65 65 0 0 0 50 142" stroke-opacity="0.38"/>` +
-        `<path d="M142 50 A65 65 0 0 1 142 142" stroke-opacity="0.38"/>` +
-        `</g>` +
-        `<circle cx="96" cy="96" r="10" fill="#94a3b8" fill-opacity="0.8"/>` +
-        `</svg>`
-    );
-
-  if (typeof document === 'undefined') {
-    cachedMinimalArtworkDataUrl = fallbackSvg;
-    return cachedMinimalArtworkDataUrl;
+  if (!subAudibleCtx || subAudibleCtx.state === 'closed') {
+    subAudibleCtx = new AudioCtxCtor({ latencyHint: 'playback' });
+    subAudibleOsc = null;
+    subAudibleGain = null;
   }
 
-  try {
-    const size = 192;
-    const canvas = document.createElement('canvas');
-    canvas.width = size;
-    canvas.height = size;
-    const ctx = canvas.getContext('2d');
-    if (!ctx) {
-      cachedMinimalArtworkDataUrl = fallbackSvg;
-      return cachedMinimalArtworkDataUrl;
-    }
+  if (!subAudibleOsc || !subAudibleGain) {
+    const ctx = subAudibleCtx;
+    const osc = ctx.createOscillator();
+    const gain = ctx.createGain();
 
-    // Latar belakang gelap abu-abu transparan netral
-    ctx.clearRect(0, 0, size, size);
-    ctx.fillStyle = 'rgba(24, 34, 41, 0.88)';
-    ctx.beginPath();
-    ctx.roundRect(10, 10, size - 20, size - 20, 36);
-    ctx.fill();
+    osc.type = 'sine';
+    osc.frequency.setValueAtTime(SUB_AUDIBLE_FREQ_HZ, ctx.currentTime);
 
-    ctx.strokeStyle = 'rgba(148, 163, 184, 0.16)';
-    ctx.lineWidth = 2;
-    ctx.stroke();
+    gain.gain.setValueAtTime(0.00001, ctx.currentTime);
+    gain.gain.linearRampToValueAtTime(SUB_AUDIBLE_GAIN, ctx.currentTime + 0.04);
 
-    const cx = size / 2;
-    const cy = size / 2;
+    osc.connect(gain);
+    gain.connect(ctx.destination);
+    osc.start();
 
-    // Gelombang sinyal netral minimalis (kiri & kanan)
-    ctx.lineCap = 'round';
-    ctx.strokeStyle = 'rgba(148, 163, 184, 0.65)';
-    ctx.lineWidth = 5.5;
-    ctx.beginPath();
-    ctx.arc(cx, cy, 32, Math.PI * 0.72, Math.PI * 1.28);
-    ctx.stroke();
-    ctx.beginPath();
-    ctx.arc(cx, cy, 32, -Math.PI * 0.28, Math.PI * 0.28);
-    ctx.stroke();
-
-    ctx.strokeStyle = 'rgba(148, 163, 184, 0.34)';
-    ctx.lineWidth = 5;
-    ctx.beginPath();
-    ctx.arc(cx, cy, 54, Math.PI * 0.74, Math.PI * 1.26);
-    ctx.stroke();
-    ctx.beginPath();
-    ctx.arc(cx, cy, 54, -Math.PI * 0.26, Math.PI * 0.26);
-    ctx.stroke();
-
-    // Titik pusat sinyal netral
-    ctx.fillStyle = 'rgba(148, 163, 184, 0.82)';
-    ctx.beginPath();
-    ctx.arc(cx, cy, 9, 0, Math.PI * 2);
-    ctx.fill();
-
-    cachedMinimalArtworkDataUrl = canvas.toDataURL('image/png');
-    return cachedMinimalArtworkDataUrl;
-  } catch {
-    cachedMinimalArtworkDataUrl = fallbackSvg;
-    return cachedMinimalArtworkDataUrl;
+    subAudibleOsc = osc;
+    subAudibleGain = gain;
   }
+
+  return subAudibleCtx;
 }
 
-function registerStandbyMediaSession(state: 'playing' | 'paused' | 'none'): void {
+function teardownSubAudibleOscillator(closeContext: boolean): void {
   try {
-    if (typeof navigator === 'undefined' || !('mediaSession' in navigator)) return;
-
-    if (state === 'none') {
-      navigator.mediaSession.playbackState = 'none';
-      try {
-        navigator.mediaSession.metadata = null;
-        navigator.mediaSession.setActionHandler('play', null);
-        navigator.mediaSession.setActionHandler('pause', null);
-      } catch {
-        // ignore
-      }
-      return;
+    if (subAudibleGain && subAudibleCtx && subAudibleCtx.state === 'running') {
+      const now = subAudibleCtx.currentTime;
+      subAudibleGain.gain.cancelScheduledValues(now);
+      subAudibleGain.gain.setValueAtTime(Math.max(subAudibleGain.gain.value, 0.00001), now);
+      subAudibleGain.gain.linearRampToValueAtTime(0.00001, now + 0.03);
     }
+  } catch {
+    // ignore
+  }
 
-    if (typeof MediaMetadata !== 'undefined') {
-      const minimalArtwork = createMinimalStandbyArtworkDataUrl();
-      navigator.mediaSession.metadata = new MediaMetadata({
-        title: 'Layanan Siaga Aktif',
-        artist: 'Terhubung',
-        album: '',
-        artwork: [
-          {
-            src: minimalArtwork,
-            sizes: '192x192',
-            type: minimalArtwork.startsWith('data:image/png') ? 'image/png' : 'image/svg+xml',
-          },
-        ],
-      });
-    }
-
-    // Chrome Android mewajibkan minimal satu action handler agar kartu Media Session muncul di layar kunci
+  if (closeContext) {
     try {
-      navigator.mediaSession.setActionHandler('play', () => {
-        if (isPausedForCall) return;
-        isStandbyActive = true;
-        standbyStateListener?.(true);
-        void startSilentAudioKeepAlive();
-      });
-      navigator.mediaSession.setActionHandler('pause', () => {
-        // Pengguna menekan jeda langsung dari kartu layar kunci
-        void disableStandbyMode();
-        standbyStateListener?.(false);
-      });
+      subAudibleOsc?.stop();
     } catch {
-      // ignore unsupported action handlers
+      // ignore
     }
-
-    navigator.mediaSession.playbackState = state;
-  } catch {
-    // ignore on unsupported browsers
-  }
-}
-
-function ensureKeepAliveAudioElement(): HTMLAudioElement {
-  if (!keepAliveAudioEl) {
-    const existing = document.getElementById('keepalive-audio') as HTMLAudioElement | null;
-    if (existing) {
-      keepAliveAudioEl = existing;
-    } else {
-      const audio = document.createElement('audio');
-      audio.id = 'keepalive-audio';
-      audio.style.display = 'none';
-      audio.setAttribute('aria-hidden', 'true');
-      document.body.appendChild(audio);
-      keepAliveAudioEl = audio;
+    try {
+      subAudibleOsc?.disconnect();
+      subAudibleGain?.disconnect();
+    } catch {
+      // ignore
     }
+    subAudibleOsc = null;
+    subAudibleGain = null;
+
+    if (subAudibleCtx && subAudibleCtx.state !== 'closed') {
+      void subAudibleCtx.close().catch(() => {});
+    }
+    subAudibleCtx = null;
+  } else if (subAudibleCtx && subAudibleCtx.state === 'running') {
+    void subAudibleCtx.suspend().catch(() => {});
   }
 
-  const blobUrl = createSubAudibleWavBlobUrl();
-  if (keepAliveAudioEl.src !== blobUrl) {
-    keepAliveAudioEl.src = blobUrl;
-  }
-  keepAliveAudioEl.loop = true;
-  keepAliveAudioEl.setAttribute('loop', '');
-  keepAliveAudioEl.setAttribute('playsinline', 'true');
-  keepAliveAudioEl.setAttribute('webkit-playsinline', 'true');
-  keepAliveAudioEl.preload = 'auto';
-  // Pengaturan wajib agar Chrome Android mengakui aliran audio aktif
-  keepAliveAudioEl.muted = false;
-  keepAliveAudioEl.volume = 0.5;
-  return keepAliveAudioEl;
+  suppressLockScreenMediaWidget();
 }
 
 function startStandbyWatchdog(): void {
   if (watchdogTimer !== null) return;
   watchdogTimer = window.setInterval(() => {
     if (isStandbyActive && !isPausedForCall) {
-      const audio = keepAliveAudioEl;
-      if (!audio || audio.paused) {
-        void startSilentAudioKeepAlive();
+      if (!isKeepAliveActuallyPlaying()) {
+        void startSubAudible18HzKeepAlive();
       }
     }
   }, WATCHDOG_INTERVAL_MS);
@@ -320,7 +255,7 @@ function stopStandbyWatchdog(): void {
 const handleGestureAutoplayResume = () => {
   disarmPendingGestureUnlock();
   if (!isStandbyActive || isPausedForCall) return;
-  void startSilentAudioKeepAlive();
+  void startSubAudible18HzKeepAlive();
   void requestScreenWakeLock();
 };
 
@@ -340,57 +275,56 @@ function disarmPendingGestureUnlock(): void {
   window.removeEventListener('keydown', handleGestureAutoplayResume);
 }
 
-async function startSilentAudioKeepAlive(): Promise<boolean> {
+async function startSubAudible18HzKeepAlive(): Promise<boolean> {
   if (!isStandbyActive || isPausedForCall) return false;
-  if (typeof document === 'undefined') return false;
+  if (typeof window === 'undefined') return false;
+
+  suppressLockScreenMediaWidget();
 
   try {
-    const audio = ensureKeepAliveAudioElement();
-    // Jalankan audio.play() langsung tanpa await lain di depannya agar tetap dalam user gesture
-    await audio.play();
-    disarmPendingGestureUnlock();
-    registerStandbyMediaSession('playing');
-    startStandbyWatchdog();
-    return true;
+    const ctx = createOrEnsureSubAudibleNodes();
+    if (!ctx) return false;
+
+    if (ctx.state === 'suspended') {
+      await ctx.resume();
+    }
+
+    if (subAudibleGain && ctx.state === 'running') {
+      const now = ctx.currentTime;
+      subAudibleGain.gain.cancelScheduledValues(now);
+      subAudibleGain.gain.setValueAtTime(Math.max(subAudibleGain.gain.value, 0.00001), now);
+      subAudibleGain.gain.linearRampToValueAtTime(SUB_AUDIBLE_GAIN, now + 0.04);
+    }
+
+    const running = ctx.state === 'running';
+    if (running) {
+      disarmPendingGestureUnlock();
+      startStandbyWatchdog();
+      standbyStateListener?.(true);
+      return true;
+    }
+
+    armPendingGestureUnlock();
+    return false;
   } catch {
-    // Jika browser menahan autoplay sebelum interaksi pertama, tunggu sentuhan pertama di layar
     armPendingGestureUnlock();
     return false;
   }
-}
-
-function stopSilentAudioKeepAlive(playbackState: 'paused' | 'none' = 'none'): void {
-  const audio =
-    keepAliveAudioEl ||
-    (typeof document !== 'undefined'
-      ? (document.getElementById('keepalive-audio') as HTMLAudioElement | null)
-      : null);
-  if (audio) {
-    try {
-      audio.pause();
-      if (playbackState === 'none') {
-        audio.currentTime = 0;
-      }
-    } catch {
-      // ignore
-    }
-  }
-  registerStandbyMediaSession(playbackState);
 }
 
 const handleStandbyVisibilityChange = () => {
   if (!isStandbyActive) return;
   if (document.visibilityState === 'visible') {
     void requestScreenWakeLock();
-    if (!isPausedForCall && keepAliveAudioEl && keepAliveAudioEl.paused) {
-      void startSilentAudioKeepAlive();
+    if (!isPausedForCall && !isKeepAliveActuallyPlaying()) {
+      void startSubAudible18HzKeepAlive();
     }
   }
 };
 
 /**
- * Transisi Saat Panggilan Masuk & Keluar:
- * Jeda sementara (audio.pause()) audio sub-audible penjaga agar mikrofon & speaker panggilan tidak bentrok.
+ * Jeda sementara generator audio sub-audible 18 Hz selama panggilan aktif
+ * agar tidak mengganggu saluran mikrofon/speaker WebRTC.
  */
 export function pauseKeepAliveForCall(): void {
   if (resumeTimer !== null) {
@@ -398,12 +332,12 @@ export function pauseKeepAliveForCall(): void {
     resumeTimer = null;
   }
   isPausedForCall = true;
-  stopSilentAudioKeepAlive('paused');
+  teardownSubAudibleOscillator(false);
 }
 
 /**
- * Setelah panggilan selesai (call.on('close')), jika Mode Siaga masih aktif,
- * jalankan kembali audio.play() dan Media Session agar perangkat kembali siaga di layar kunci.
+ * Setelah panggilan selesai, hidupkan kembali generator sub-audible 18 Hz
+ * agar PeerJS kembali terjaga di latar belakang tanpa widget media layar kunci.
  */
 export function resumeKeepAliveAfterCall(): void {
   isPausedForCall = false;
@@ -414,7 +348,7 @@ export function resumeKeepAliveAfterCall(): void {
   resumeTimer = window.setTimeout(() => {
     resumeTimer = null;
     if (isStandbyActive && !isPausedForCall) {
-      void startSilentAudioKeepAlive();
+      void startSubAudible18HzKeepAlive();
       void requestScreenWakeLock();
     }
   }, 500);
@@ -453,9 +387,8 @@ export async function enableStandbyMode(): Promise<{
     visibilityListenerAttached = true;
   }
 
-  // WAJIB panggil audio.play() terlebih dahulu secara sinkron di dalam event klik user
   const audioPlayPromise = !isPausedForCall
-    ? startSilentAudioKeepAlive()
+    ? startSubAudible18HzKeepAlive()
     : Promise.resolve(false);
   startStandbyWatchdog();
 
@@ -463,7 +396,6 @@ export async function enableStandbyMode(): Promise<{
     audioPlayPromise,
     requestScreenWakeLock(),
     requestNotificationPermission(),
-    setNativeKeepAwake(true),
   ]);
 
   return { wakeLockActive, audioKeepAliveActive, notificationPermission };
@@ -481,8 +413,9 @@ export async function disableStandbyMode(): Promise<void> {
     document.removeEventListener('visibilitychange', handleStandbyVisibilityChange);
     visibilityListenerAttached = false;
   }
-  stopSilentAudioKeepAlive('none');
-  await Promise.all([releaseScreenWakeLock(), setNativeKeepAwake(false)]);
+  teardownSubAudibleOscillator(true);
+  standbyStateListener?.(false);
+  await releaseScreenWakeLock();
 }
 
 export interface NotificationClickData {
@@ -536,7 +469,7 @@ interface NotificationActionOption {
 
 type ExtendedSWNotificationOptions = NotificationOptions & {
   renotify?: boolean;
-  vibrate?: number[];
+  timestamp?: number;
   actions?: NotificationActionOption[];
 };
 
@@ -550,7 +483,6 @@ export function showIncomingWebNotification(options: {
   onClick?: () => void;
 }): void {
   const isCall = Boolean(options.isCall || options.data?.kind === 'call');
-  triggerAlertVibration(isCall ? [1000, 500, 1000, 500, 1000] : [250, 120, 250]);
 
   const senderId =
     options.data?.callerId || options.data?.chatId || options.data?.fromId || '';
@@ -560,30 +492,12 @@ export function showIncomingWebNotification(options: {
     (senderId ? `ID: ${senderId}` : 'Penelepon');
   const isVideo = Boolean(options.data?.isVideo || options.data?.callType === 'video');
 
-  // Format notifikasi khas WhatsApp:
-  // Panggilan: Title = Nama Penelepon (atau "ID: ..."), Body = "Panggilan suara/video WattappsAU"
-  // Pesan: Title = Nama Pengirim, Body = Isi teks / "📷 Foto"
   const notifTitle = isCall ? callerName : options.title;
   const notifBody = isCall
     ? isVideo
       ? 'Panggilan video WattappsAU'
       : 'Panggilan suara WattappsAU'
     : options.body;
-
-  // Pada aplikasi Android Native (Capacitor APK), kirim melalui LocalNotifications berprioritas tinggi di layar kunci
-  if (isNativeCapacitor()) {
-    void scheduleNativeLocalNotification({
-      title: notifTitle,
-      body: notifBody,
-      isCall,
-      callerId: senderId,
-      callerName,
-      callId: options.data?.callId,
-      callType: isVideo ? 'video' : 'audio',
-      chatId: options.data?.chatId || senderId,
-    });
-    return;
-  }
 
   if (typeof window === 'undefined' || !('Notification' in window)) return;
   if (Notification.permission !== 'granted') return;
@@ -622,16 +536,17 @@ export function showIncomingWebNotification(options: {
     url: targetUrl,
   };
 
-  // Opsi lengkap khusus ServiceWorkerRegistration.showNotification (mendukung actions, vibrate, renotify)
+  // Notifikasi berprioritas tinggi untuk panggilan masuk (heads-up & tetap tampil hingga ditanggapi)
+  // dan notifikasi senyap yang nyaman untuk pesan chat masuk.
   const swNotifOptions: ExtendedSWNotificationOptions = {
     body: notifBody,
     icon: notifIcon,
     badge: '/icon-512.png',
     tag: notifTag,
+    timestamp: Date.now(),
     renotify: isCall,
     requireInteraction: isCall,
-    vibrate: isCall ? [1000, 500, 1000, 500, 1000] : [200, 100, 200],
-    silent: false,
+    silent: !isCall,
     actions: isCall
       ? [
           { action: 'reject_call', title: 'Tolak' },
@@ -641,14 +556,13 @@ export function showIncomingWebNotification(options: {
     data: enrichedData,
   };
 
-  // Fallback window.Notification tanpa properti `actions` agar tidak memicu TypeError
   const windowNotifOptions: NotificationOptions = {
     body: notifBody,
     icon: notifIcon,
     badge: '/icon-512.png',
     tag: notifTag,
     requireInteraction: isCall,
-    silent: false,
+    silent: !isCall,
     data: enrichedData,
   };
 
@@ -670,7 +584,7 @@ export function showIncomingWebNotification(options: {
     }
   };
 
-  // Utamakan Service Worker reg.showNotification agar tombol aksi Tolak/Jawab/Balas tampil di layar kunci Android
+  // Utamakan Service Worker agar notifikasi berprioritas tinggi & klik notifikasi otomatis membuka halaman panggilan
   if ('serviceWorker' in navigator) {
     navigator.serviceWorker
       .getRegistration()
@@ -683,6 +597,21 @@ export function showIncomingWebNotification(options: {
         );
       })
       .catch(() => {
+        if (navigator.serviceWorker.controller) {
+          navigator.serviceWorker.controller.postMessage({
+            type: 'SHOW_NOTIFICATION',
+            title: notifTitle,
+            body: notifBody,
+            icon: notifIcon,
+            tag: notifTag,
+            isCall,
+            isVideo,
+            senderId,
+            eventType,
+            data: enrichedData,
+          });
+          return;
+        }
         showWindowNotificationFallback();
       });
     return;
@@ -692,10 +621,17 @@ export function showIncomingWebNotification(options: {
 }
 
 export function dismissIncomingCallNotification(peerId?: string): void {
-  if (isNativeCapacitor()) {
-    void cancelNativeCallNotifications();
-  }
   if (typeof navigator === 'undefined' || !('serviceWorker' in navigator)) return;
+
+  try {
+    navigator.serviceWorker.controller?.postMessage({
+      type: 'DISMISS_CALL_NOTIFICATIONS',
+      peerId: peerId || '',
+    });
+  } catch {
+    // ignore
+  }
+
   navigator.serviceWorker
     .getRegistration()
     .then((reg) => {
