@@ -268,16 +268,114 @@ export default function App() {
   >(() => {});
   const remoteCallAudioRef = useRef<HTMLAudioElement | null>(null);
   const remoteStreamRef = useRef<MediaStream | null>(null);
+  const callAudioCtxRef = useRef<AudioContext | null>(null);
+  const callRemoteSourceRef = useRef<MediaStreamAudioSourceNode | null>(null);
+  const callRemoteGainRef = useRef<GainNode | null>(null);
   const boundStreamCallsRef = useRef<WeakSet<MediaConnection>>(new WeakSet());
   const boundPcRef = useRef<WeakSet<RTCPeerConnection>>(new WeakSet());
   const isSpeakerOnRef = useRef<boolean>(true);
+
+  const closeCallAudioContext = useCallback(() => {
+    try {
+      callRemoteSourceRef.current?.disconnect();
+    } catch {
+      // ignore
+    }
+    callRemoteSourceRef.current = null;
+
+    try {
+      callRemoteGainRef.current?.disconnect();
+    } catch {
+      // ignore
+    }
+    callRemoteGainRef.current = null;
+
+    const ctx = callAudioCtxRef.current;
+    callAudioCtxRef.current = null;
+    if (ctx && ctx.state !== 'closed') {
+      try {
+        void ctx.close().catch(() => {});
+      } catch {
+        // ignore
+      }
+    }
+  }, []);
+
+  const ensureCallAudioContext = useCallback(
+    (forceReset = false): AudioContext | null => {
+      if (forceReset) {
+        closeCallAudioContext();
+      }
+      try {
+        if (!callAudioCtxRef.current || callAudioCtxRef.current.state === 'closed') {
+          const AudioCtxCtor =
+            window.AudioContext ||
+            (window as unknown as { webkitAudioContext?: typeof AudioContext }).webkitAudioContext;
+          if (!AudioCtxCtor) return null;
+          callAudioCtxRef.current = new AudioCtxCtor();
+        }
+        const ctx = callAudioCtxRef.current;
+        if (ctx.state === 'suspended') {
+          void ctx.resume().catch(() => {});
+        }
+        return ctx;
+      } catch {
+        return null;
+      }
+    },
+    [closeCallAudioContext]
+  );
+
+  const connectRemoteStreamToAudioContext = useCallback(
+    (remoteStream: MediaStream) => {
+      if (remoteStream.getAudioTracks().length === 0) return;
+      const ctx = ensureCallAudioContext(false);
+      if (!ctx) return;
+
+      try {
+        callRemoteSourceRef.current?.disconnect();
+      } catch {
+        // ignore
+      }
+      callRemoteSourceRef.current = null;
+
+      try {
+        callRemoteGainRef.current?.disconnect();
+      } catch {
+        // ignore
+      }
+      callRemoteGainRef.current = null;
+
+      try {
+        const source = ctx.createMediaStreamSource(remoteStream);
+        const gain = ctx.createGain();
+        gain.gain.value = isSpeakerOnRef.current ? 1.0 : 0.0;
+        source.connect(gain);
+        gain.connect(ctx.destination);
+        callRemoteSourceRef.current = source;
+        callRemoteGainRef.current = gain;
+
+        if (ctx.state === 'suspended') {
+          void ctx.resume().catch(() => {});
+        }
+      } catch (err) {
+        console.warn('[WattappsAU WebRTC Audio] Gagal menyambungkan remoteStream ke AudioContext:', err);
+      }
+    },
+    [ensureCallAudioContext]
+  );
 
   const getCallLocalStream = useCallback(async (callType: CallType): Promise<MediaStream> => {
     const stream = await navigator.mediaDevices.getUserMedia({
       audio: true,
       video: callType === 'video' ? { facingMode: 'user' } : false,
     });
-    stream.getAudioTracks().forEach((track) => {
+    const audioTracks = stream.getAudioTracks();
+    if (audioTracks.length === 0) {
+      stream.getTracks().forEach((t) => t.stop());
+      throw new Error('Mikrofon tidak menyediakan track audio aktif.');
+    }
+    audioTracks.forEach((track) => {
       track.enabled = true;
     });
     return stream;
@@ -301,74 +399,99 @@ export default function App() {
     }
   }, []);
 
-  const attachRemoteCallAudioStream = useCallback((remoteStream: MediaStream | null) => {
-    remoteStreamRef.current = remoteStream;
+  const attachRemoteCallAudioStream = useCallback(
+    (remoteStream: MediaStream | null, forceRebind = false) => {
+      remoteStreamRef.current = remoteStream;
 
-    const audioEl =
-      remoteCallAudioRef.current ||
-      (document.getElementById('remoteAudio') as HTMLAudioElement | null);
-    if (!audioEl) return;
-
-    if (!remoteStream) {
-      audioEl.pause();
-      audioEl.srcObject = null;
-      return;
-    }
-
-    // Pastikan seluruh track audio lawan dalam keadaan aktif
-    remoteStream.getAudioTracks().forEach((track) => {
-      track.enabled = true;
-    });
-
-    if (callRuntimeRef.current) {
-      callRuntimeRef.current.remoteStream = remoteStream;
-    }
-
-    if (audioEl.srcObject !== remoteStream) {
-      audioEl.srcObject = remoteStream;
-    }
-    audioEl.volume = 1.0;
-    audioEl.muted = !isSpeakerOnRef.current;
-
-    const tryPlay = () => {
-      const el =
+      const audioEl =
         remoteCallAudioRef.current ||
         (document.getElementById('remoteAudio') as HTMLAudioElement | null);
-      if (!el || !el.srcObject) return;
-      el.volume = 1.0;
-      el.muted = !isSpeakerOnRef.current;
-      el.play().catch((err) => {
-        console.warn('[WattappsAU WebRTC Audio] Autoplay diblokir, mencoba ulang saat sentuhan:', err);
-        const unlockOnGesture = () => {
-          const currentEl =
-            remoteCallAudioRef.current ||
-            (document.getElementById('remoteAudio') as HTMLAudioElement | null);
-          if (currentEl && currentEl.srcObject) {
-            currentEl.volume = 1.0;
-            currentEl.muted = !isSpeakerOnRef.current;
-            void currentEl.play().catch(() => {});
-          }
-        };
-        window.addEventListener('pointerdown', unlockOnGesture, { once: true, passive: true });
-        window.addEventListener('touchstart', unlockOnGesture, { once: true, passive: true });
-      });
-    };
 
-    // Paksa pemutaran ulang jika track audio masuk belakangan atau baru keluar dari status muted WebRTC
-    remoteStream.onaddtrack = () => {
+      if (!remoteStream) {
+        if (audioEl) {
+          audioEl.pause();
+          audioEl.srcObject = null;
+        }
+        closeCallAudioContext();
+        return;
+      }
+
+      // Pastikan seluruh track audio lawan dalam keadaan aktif
       remoteStream.getAudioTracks().forEach((track) => {
         track.enabled = true;
       });
-      tryPlay();
-    };
-    remoteStream.getAudioTracks().forEach((track) => {
-      track.onunmute = () => {
+
+      if (callRuntimeRef.current) {
+        callRuntimeRef.current.remoteStream = remoteStream;
+      }
+
+      // 1. Sambungkan remoteStream ke Web Audio API (AudioContext) sebagai jalur backup & penguat di Android WebView
+      connectRemoteStreamToAudioContext(remoteStream);
+
+      // 2. Tempelkan juga ke elemen <audio id="remoteAudio" autoplay playsinline> (diperlukan Chromium agar PCM WebRTC mengalir)
+      if (audioEl) {
+        if (forceRebind) {
+          audioEl.pause();
+          audioEl.srcObject = null;
+        }
+        if (audioEl.srcObject !== remoteStream) {
+          audioEl.srcObject = remoteStream;
+        }
+        audioEl.volume = 1.0;
+        audioEl.muted = !isSpeakerOnRef.current;
+      }
+
+      const tryPlay = () => {
+        const ctx = callAudioCtxRef.current;
+        if (ctx && ctx.state === 'suspended') {
+          void ctx.resume().catch(() => {});
+        }
+        const el =
+          remoteCallAudioRef.current ||
+          (document.getElementById('remoteAudio') as HTMLAudioElement | null);
+        if (!el || !el.srcObject) return;
+        el.volume = 1.0;
+        el.muted = !isSpeakerOnRef.current;
+        el.play().catch((err) => {
+          console.warn('[WattappsAU WebRTC Audio] Autoplay diblokir, mencoba ulang saat sentuhan:', err);
+          const unlockOnGesture = () => {
+            const activeCtx = callAudioCtxRef.current;
+            if (activeCtx && activeCtx.state === 'suspended') {
+              void activeCtx.resume().catch(() => {});
+            }
+            const currentEl =
+              remoteCallAudioRef.current ||
+              (document.getElementById('remoteAudio') as HTMLAudioElement | null);
+            if (currentEl && currentEl.srcObject) {
+              currentEl.volume = 1.0;
+              currentEl.muted = !isSpeakerOnRef.current;
+              void currentEl.play().catch(() => {});
+            }
+          };
+          window.addEventListener('pointerdown', unlockOnGesture, { once: true, passive: true });
+          window.addEventListener('touchstart', unlockOnGesture, { once: true, passive: true });
+        });
+      };
+
+      // Paksa sambung ulang AudioContext & pemutaran jika track audio masuk belakangan atau baru unmute
+      remoteStream.onaddtrack = () => {
+        remoteStream.getAudioTracks().forEach((track) => {
+          track.enabled = true;
+        });
+        connectRemoteStreamToAudioContext(remoteStream);
         tryPlay();
       };
-    });
+      remoteStream.getAudioTracks().forEach((track) => {
+        track.onunmute = () => {
+          connectRemoteStreamToAudioContext(remoteStream);
+          tryPlay();
+        };
+      });
 
-    tryPlay();
-  }, []);
+      tryPlay();
+    },
+    [closeCallAudioContext, connectRemoteStreamToAudioContext]
+  );
 
   const isExitedRef = useRef<boolean>(isExited);
   const backGuardStateRef = useRef({
@@ -3461,13 +3584,14 @@ export default function App() {
     }
 
     // 1. Tepat di baris pertama klik tombol Panggil (User Gesture Android WebView):
-    // Hentikan dering & keep-alive, resume AudioContext, aktifkan mode audio panggilan native Android,
-    // buka kunci <audio id="remoteAudio">, dan langsung tangkap mikrofon SEBELUM proses jaringan apa pun
+    // Reset audio panggilan sebelumnya, hentikan dering & keep-alive, buka & resume AudioContext panggilan,
+    // aktifkan mode audio panggilan native Android, buka kunci <audio id="remoteAudio">, lalu tangkap mikrofon
     stopRingtone();
     pauseKeepAliveForCall();
+    attachRemoteCallAudioStream(null);
     resumeWebAudioContext();
+    ensureCallAudioContext(true);
     setAndroidBridgeCallAudioMode(true);
-    remoteStreamRef.current = null;
     isSpeakerOnRef.current = true;
     unlockRemoteAudioElement();
 
@@ -3475,6 +3599,7 @@ export default function App() {
     try {
       localStream = await getCallLocalStream(callType);
     } catch {
+      closeCallAudioContext();
       setAndroidBridgeCallAudioMode(false);
       resumeKeepAliveAfterCall();
       showToast(
@@ -3552,6 +3677,7 @@ export default function App() {
 
     if (!mediaCall) {
       localStream.getTracks().forEach((t) => t.stop());
+      closeCallAudioContext();
       setAndroidBridgeCallAudioMode(false);
       resumeKeepAliveAfterCall();
       showToast('Gagal memulai panggilan. Pastikan teman sedang online.');
@@ -3627,18 +3753,19 @@ export default function App() {
     const targetCallType: CallType = rt?.callType || pending?.callType || 'audio';
 
     // 1. Tepat di baris pertama klik tombol Jawab (User Gesture Android WebView):
-    // Hentikan total nada dering agar Android melepas Audio Focus untuk mikrofon, resume AudioContext,
+    // Hentikan total nada dering agar Android melepas Audio Focus untuk mikrofon, buat & resume AudioContext panggilan,
     // aktifkan mode audio panggilan native Android, buka kunci <audio id="remoteAudio">, lalu segera panggil getUserMedia
     stopRingtone();
     pauseKeepAliveForCall();
     resumeWebAudioContext();
+    ensureCallAudioContext(true);
     setAndroidBridgeCallAudioMode(true);
     isSpeakerOnRef.current = true;
     unlockRemoteAudioElement();
 
     // Jika remoteStream sudah sempat masuk lebih awal (ter-buffer di remoteStreamRef), langsung tempelkan & putar di dalam gesture Jawab
     if (remoteStreamRef.current) {
-      attachRemoteCallAudioStream(remoteStreamRef.current);
+      attachRemoteCallAudioStream(remoteStreamRef.current, true);
     }
 
     if (wakeRingtoneTimerRef.current !== null) {
@@ -3655,6 +3782,7 @@ export default function App() {
       localStream = await getCallLocalStream(targetCallType);
     } catch {
       if (isAutoAccept) {
+        closeCallAudioContext();
         setAndroidBridgeCallAudioMode(false);
         // Jangan tolak panggilan jika browser meminta sentuhan langsung; biarkan layar penuh tetap terbuka
         showToast('Ketuk tombol hijau Jawab untuk menghubungkan audio/video.');
@@ -3669,6 +3797,7 @@ export default function App() {
     if (rt) {
       stopRingtone();
       resumeWebAudioContext();
+      ensureCallAudioContext(false);
       setAndroidBridgeCallAudioMode(true);
       dismissIncomingCallNotification(rt.peerId);
       setPersistentIncomingCall(null);
@@ -3690,10 +3819,10 @@ export default function App() {
       }
       bindMediaCallDiagnostics(rt.callId, rt.mediaCall);
 
-      // Tempelkan kembali remoteStream yang sudah ter-buffer di remoteStreamRef segera setelah Jawab
+      // Tempelkan & re-bind remoteStream yang sudah ter-buffer di remoteStreamRef segera setelah Jawab
       const bufferedRemote = remoteStreamRef.current || rt.remoteStream || null;
       if (bufferedRemote) {
-        attachRemoteCallAudioStream(bufferedRemote);
+        attachRemoteCallAudioStream(bufferedRemote, true);
       }
 
       setActiveCallUI((prev) =>
@@ -3809,7 +3938,7 @@ export default function App() {
 
     // Fallback bila penolakan dari layar kunci datang sebelum state runtime terbentuk
     stopRingtone();
-    remoteStreamRef.current = null;
+    attachRemoteCallAudioStream(null);
     setAndroidBridgeCallAudioMode(false);
     resumeKeepAliveAfterCall();
     setPersistentIncomingCall(null);
@@ -3925,7 +4054,15 @@ export default function App() {
       if (!prev) return null;
       const nextSpeaker = !prev.isSpeakerOn;
       isSpeakerOnRef.current = nextSpeaker;
-      const audioEl = remoteCallAudioRef.current;
+      if (callRemoteGainRef.current) {
+        callRemoteGainRef.current.gain.value = nextSpeaker ? 1.0 : 0.0;
+      }
+      if (nextSpeaker && callAudioCtxRef.current?.state === 'suspended') {
+        void callAudioCtxRef.current.resume().catch(() => {});
+      }
+      const audioEl =
+        remoteCallAudioRef.current ||
+        (document.getElementById('remoteAudio') as HTMLAudioElement | null);
       if (audioEl) {
         audioEl.volume = 1.0;
         audioEl.muted = !nextSpeaker;
@@ -3937,13 +4074,17 @@ export default function App() {
     });
   };
 
-  // Tombol pemulih suara di layar panggilan:
-  // Hentikan dering tersisa, paksa speaker aktif + volume 1.0 + remoteAudio.play(),
-  // dan pastikan track mikrofon lokal aktif tanpa memutus atau me-restart ICE panggilan.
+  // Tombol darurat "Paksa Suara / Speaker" di layar panggilan:
+  // Menjalankan audioCtx.resume(), re-bind & remoteAudio.play(), menyambungkan ulang remoteStream ke AudioContext,
+  // serta memanggil window.AndroidBridge?.setCallAudioMode?.(true).
   const handleRefreshCallAudio = () => {
     const rt = callRuntimeRef.current;
     stopRingtone();
     resumeWebAudioContext();
+    const ctx = ensureCallAudioContext(false);
+    if (ctx) {
+      void ctx.resume().catch(() => {});
+    }
     setAndroidBridgeCallAudioMode(true);
     isSpeakerOnRef.current = true;
     setActiveCallUI((prev) => (prev ? { ...prev, isSpeakerOn: true } : null));
@@ -3960,15 +4101,13 @@ export default function App() {
     const audioEl =
       remoteCallAudioRef.current ||
       (document.getElementById('remoteAudio') as HTMLAudioElement | null);
-    if (audioEl) {
-      if (remoteStream) {
-        attachRemoteCallAudioStream(remoteStream);
-        setActiveCallUI((prev) => (prev ? { ...prev, remoteStream } : null));
-      } else {
-        audioEl.volume = 1.0;
-        audioEl.muted = false;
-        void audioEl.play().catch(() => {});
-      }
+    if (remoteStream) {
+      attachRemoteCallAudioStream(remoteStream, true);
+      setActiveCallUI((prev) => (prev ? { ...prev, remoteStream } : null));
+    } else if (audioEl) {
+      audioEl.volume = 1.0;
+      audioEl.muted = false;
+      void audioEl.play().catch(() => {});
     }
 
     if (rt) {
@@ -3985,7 +4124,7 @@ export default function App() {
       });
     }
 
-    showToast('Audio & speaker panggilan disegarkan');
+    showToast('Suara & speaker panggilan dipaksa aktif');
   };
 
   // Toggle Mode Siaga (Service Worker + Auto-Reconnect PeerJS + Screen Wake Lock tanpa membajak fokus audio Android/Bluetooth)

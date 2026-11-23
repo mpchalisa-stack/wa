@@ -639,12 +639,12 @@ export const CallOverlay: React.FC<CallOverlayProps> = ({
               <button
                 type="button"
                 onClick={onRefreshAudio}
-                className="inline-flex items-center gap-2 rounded-full bg-[#1F2C34]/90 hover:bg-[#2A3942] active:scale-95 border border-emerald-400/35 px-4 py-2 text-xs font-semibold text-emerald-200 shadow-lg backdrop-blur-md transition-all cursor-pointer"
-                aria-label="Refresh Audio atau Speaker"
-                title="Segarkan pemutaran suara, speaker, dan jalur ICE panggilan"
+                className="inline-flex items-center gap-2 rounded-full bg-emerald-600/90 hover:bg-emerald-500 active:scale-95 border border-emerald-300/45 px-4 py-2 text-xs font-semibold text-white shadow-lg shadow-emerald-950/50 backdrop-blur-md transition-all cursor-pointer"
+                aria-label="Paksa Suara atau Speaker"
+                title="Paksa resume AudioContext, putar ulang remoteAudio, dan aktifkan speaker panggilan"
               >
-                <RefreshCw className="w-3.5 h-3.5 text-emerald-400" />
-                <span>Refresh Audio / Speaker</span>
+                <Volume2 className="w-3.5 h-3.5 text-white shrink-0" />
+                <span>Paksa Suara / Speaker</span>
               </button>
             )}
             <div className="w-full bg-[#1F2C34]/90 backdrop-blur-md rounded-3xl px-4 py-3.5 flex items-center justify-around shadow-2xl border border-white/10">

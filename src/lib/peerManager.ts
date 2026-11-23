@@ -2012,8 +2012,13 @@ export class WA6PeerManager {
     const targetSixDigitId = normalizePeerId(rawTargetId);
     if (!this.peer || this.peer.destroyed || !this.peer.open || !targetSixDigitId) return null;
 
-    // Pastikan seluruh track audio mikrofon aktif sebelum createOffer()
-    stream.getAudioTracks().forEach((track) => {
+    // Pastikan localStream sudah siap dan memiliki minimal 1 track audio aktif sebelum peer.call()
+    const audioTracks = stream?.getAudioTracks?.() || [];
+    if (audioTracks.length === 0) {
+      console.error('[WattappsAU WebRTC] startMediaCall dibatalkan: localStream tidak memiliki track audio.');
+      return null;
+    }
+    audioTracks.forEach((track) => {
       track.enabled = true;
     });
 
@@ -2036,8 +2041,13 @@ export class WA6PeerManager {
     mediaCall: MediaConnection,
     stream: MediaStream
   ): void {
-    // Pastikan seluruh track audio mikrofon aktif sebelum createAnswer()
-    stream.getAudioTracks().forEach((track) => {
+    // Pastikan localStream sudah siap dan seluruh track audio mikrofon aktif sebelum call.answer()
+    const audioTracks = stream?.getAudioTracks?.() || [];
+    if (audioTracks.length === 0) {
+      console.error('[WattappsAU WebRTC] answerMediaCall dibatalkan: localStream tidak memiliki track audio.');
+      return;
+    }
+    audioTracks.forEach((track) => {
       track.enabled = true;
     });
 
