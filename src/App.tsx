@@ -81,6 +81,7 @@ import {
   resumeKeepAliveAfterCall,
   setStandbyExternalListener,
   showIncomingWebNotification,
+  syncConnectionWakeLock,
   syncPeerMediaSession,
 } from './lib/standby';
 import {
@@ -2015,6 +2016,17 @@ export default function App() {
     };
   }, [profile?.id, peerState, standbyMode, isExited, onlineContactsCount]);
 
+  // Screen Wake Lock API (navigator.wakeLock): aktif saat koneksi PeerJS online agar layar
+  // HP/tablet tidak mati otomatis selama aplikasi terbuka, dan dilepas saat koneksi terhenti
+  useEffect(() => {
+    const isConnectionActive = Boolean(profile && !isExited && peerState === 'online');
+    void syncConnectionWakeLock(isConnectionActive);
+
+    return () => {
+      void syncConnectionWakeLock(false);
+    };
+  }, [profile?.id, isExited, peerState]);
+
   // Stream SSE tunggal & hemat baterai ke https://ntfy.sh/wattappsau-signal-{my6DigitId}/sse
   // Menggantikan polling timer agresif agar broker PeerJS stabil & bebas rate-limit
   useEffect(() => {
@@ -2135,76 +2147,79 @@ export default function App() {
     };
   }, [profile?.id, isExited, finalizeCall, presentPendingCallModal]);
 
-  // Pemulihan koneksi otomatis (anti zombie socket) saat aplikasi kembali dari latar belakang (visibilitychange & focus)
-  const wakeAndSyncPeer = useCallback(async () => {
-    const me = profileRef.current;
-    const manager = peerManagerRef.current;
-    if (!me || !manager) return;
+  // Pemulihan koneksi otomatis (anti zombie socket) saat aplikasi kembali dari latar belakang (visibilitychange, focus, online)
+  const wakeAndSyncPeer = useCallback(
+    async (force = false) => {
+      const me = profileRef.current;
+      const manager = peerManagerRef.current;
+      if (!me || !manager) return;
 
-    const now = Date.now();
-    if (now - lastAppWakeSyncRef.current < APP_WAKE_SYNC_COOLDOWN_MS) {
-      return;
-    }
-    lastAppWakeSyncRef.current = now;
-
-    // Kumpulkan kontak prioritas: ruang chat aktif, penerima pesan tertunda, penelpon pendingCall, & kontak 1:1
-    const priorityIds = new Set<string>();
-    const currentChat = activeChatIdRef.current;
-    if (currentChat) {
-      const chatContact = contactsRef.current.find((c) => c.id === currentChat);
-      if (chatContact?.isGroup && chatContact.members) {
-        chatContact.members.forEach((mId) => {
-          if (mId !== me.id) priorityIds.add(mId);
-        });
-      } else {
-        priorityIds.add(currentChat);
+      const now = Date.now();
+      if (!force && now - lastAppWakeSyncRef.current < APP_WAKE_SYNC_COOLDOWN_MS) {
+        return;
       }
-    }
-    pendingMessagesRef.current.forEach((p) => {
-      if (p.recipientId && p.recipientId !== me.id) {
-        priorityIds.add(p.recipientId);
+      lastAppWakeSyncRef.current = now;
+
+      // Kumpulkan kontak prioritas: ruang chat aktif, penerima pesan tertunda, penelpon pendingCall, & kontak 1:1
+      const priorityIds = new Set<string>();
+      const currentChat = activeChatIdRef.current;
+      if (currentChat) {
+        const chatContact = contactsRef.current.find((c) => c.id === currentChat);
+        if (chatContact?.isGroup && chatContact.members) {
+          chatContact.members.forEach((mId) => {
+            if (mId !== me.id) priorityIds.add(mId);
+          });
+        } else {
+          priorityIds.add(currentChat);
+        }
       }
-    });
-    if (pendingCallRef.current?.peerId) {
-      priorityIds.add(pendingCallRef.current.peerId);
-    }
-    contactsRef.current
-      .filter((c) => !c.isGroup)
-      .forEach((c) => priorityIds.add(c.id));
-
-    await manager.wakeAndSyncPeer(Array.from(priorityIds));
-
-    // (c) Segera tarik/kirim antrean pesan tertunda untuk semua peer yang sudah online
-    const pendingRecipients = new Set(
-      pendingMessagesRef.current.map((item) => item.recipientId)
-    );
-    pendingRecipients.forEach((recipientId) => {
-      if (peerManagerRef.current?.isPeerOnline(recipientId)) {
-        void flushPendingForPeer(recipientId);
+      pendingMessagesRef.current.forEach((p) => {
+        if (p.recipientId && p.recipientId !== me.id) {
+          priorityIds.add(p.recipientId);
+        }
+      });
+      if (pendingCallRef.current?.peerId) {
+        priorityIds.add(pendingCallRef.current.peerId);
       }
-    });
+      contactsRef.current
+        .filter((c) => !c.isGroup)
+        .forEach((c) => priorityIds.add(c.id));
 
-    // Tampilkan pop-up panggilan masuk jika ada permintaan panggilan yang masih menunggu (pendingCall)
-    const pendingCall = pendingCallRef.current;
-    if (pendingCall && !callRuntimeRef.current) {
-      if (Date.now() - pendingCall.receivedAt <= PENDING_CALL_TTL_MS) {
-        presentPendingCallModal(pendingCall);
-        peerManagerRef.current?.sendPacket(pendingCall.peerId, {
-          kind: 'CALL_SIGNAL',
-          action: 'ringing',
-          callId: pendingCall.callId,
-          callType: pendingCall.callType,
-          fromId: me.id,
-          fromName: me.name,
-          fromAvatar: me.avatar,
-        });
-      } else {
-        pendingCallRef.current = null;
+      await manager.wakeAndSyncPeer(Array.from(priorityIds), force);
+
+      // (c) Segera tarik/kirim antrean pesan tertunda untuk semua peer yang sudah online
+      const pendingRecipients = new Set(
+        pendingMessagesRef.current.map((item) => item.recipientId)
+      );
+      pendingRecipients.forEach((recipientId) => {
+        if (peerManagerRef.current?.isPeerOnline(recipientId)) {
+          void flushPendingForPeer(recipientId);
+        }
+      });
+
+      // Tampilkan pop-up panggilan masuk jika ada permintaan panggilan yang masih menunggu (pendingCall)
+      const pendingCall = pendingCallRef.current;
+      if (pendingCall && !callRuntimeRef.current) {
+        if (Date.now() - pendingCall.receivedAt <= PENDING_CALL_TTL_MS) {
+          presentPendingCallModal(pendingCall);
+          peerManagerRef.current?.sendPacket(pendingCall.peerId, {
+            kind: 'CALL_SIGNAL',
+            action: 'ringing',
+            callId: pendingCall.callId,
+            callType: pendingCall.callType,
+            fromId: me.id,
+            fromName: me.name,
+            fromAvatar: me.avatar,
+          });
+        } else {
+          pendingCallRef.current = null;
+        }
       }
-    }
-  }, [flushPendingForPeer, presentPendingCallModal]);
+    },
+    [flushPendingForPeer, presentPendingCallModal]
+  );
 
-  // Dengarkan visibilitychange & window.focus untuk otomatis memulihkan PeerJS + tampilkan modal panggilan masuk jika masih aktif
+  // Dengarkan visibilitychange, online, pageshow & window.focus untuk auto-reconnect PeerJS/WebRTC
   useEffect(() => {
     if (!profile || isExited) return;
 
@@ -2238,21 +2253,37 @@ export default function App() {
     const handleVisibilityChange = () => {
       if (document.visibilityState === 'visible') {
         checkIncomingCallOnResume();
-        void wakeAndSyncPeer();
+        void wakeAndSyncPeer(true);
       }
+    };
+
+    const handleNetworkOnline = () => {
+      checkIncomingCallOnResume();
+      void wakeAndSyncPeer(true);
     };
 
     const handleWindowFocus = () => {
       checkIncomingCallOnResume();
-      void wakeAndSyncPeer();
+      void wakeAndSyncPeer(false);
+    };
+
+    const handlePageShow = (event: PageTransitionEvent) => {
+      if (event.persisted || document.visibilityState === 'visible') {
+        checkIncomingCallOnResume();
+        void wakeAndSyncPeer(true);
+      }
     };
 
     document.addEventListener('visibilitychange', handleVisibilityChange);
+    window.addEventListener('online', handleNetworkOnline);
     window.addEventListener('focus', handleWindowFocus);
+    window.addEventListener('pageshow', handlePageShow);
 
     return () => {
       document.removeEventListener('visibilitychange', handleVisibilityChange);
+      window.removeEventListener('online', handleNetworkOnline);
       window.removeEventListener('focus', handleWindowFocus);
+      window.removeEventListener('pageshow', handlePageShow);
     };
   }, [
     profile?.id,
@@ -3494,6 +3525,7 @@ export default function App() {
     standbyModeRef.current = false;
     setStandbyMode(false);
     await disableStandbyMode();
+    await syncConnectionWakeLock(false);
     releaseActiveMediaSession();
     clearPeerMediaSession();
     releaseAudioContextNow();

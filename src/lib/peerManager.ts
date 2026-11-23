@@ -35,14 +35,17 @@ const MAX_ACK_RETRIES = 3;
 /** Jeda minimal 15 detik sebelum mencoba reconnect peer.connect() lagi jika gagal (anti rate-limit 0.peerjs.com) */
 const RECONNECT_COOLDOWN_MS = 15000;
 
-/** Interval heartbeat PING ringan sekali tiap 20 detik HANYA pada koneksi yang sudah terbuka */
-const HEARTBEAT_INTERVAL_MS = 20000;
+/** Interval heartbeat PING ringan sekali tiap 12 detik untuk mencegah signaling socket & DataChannel idle */
+const HEARTBEAT_INTERVAL_MS = 12000;
 
 /** Jeda anti-spam minimal 3 detik saat menjalankan wakeAndSyncPeer() pada visibilitychange / focus */
 const WAKE_SYNC_COOLDOWN_MS = 3000;
 
 /** Timeout tunggu balasan PONG (2 detik) untuk mendeteksi zombie socket saat kembali dari latar belakang */
 const ZOMBIE_PING_TIMEOUT_MS = 2000;
+
+/** Batas waktu tanpa aktivitas/PONG pada DataChannel (35 detik) sebelum dianggap mati diam-diam */
+const STALE_CONNECTION_MS = 35000;
 
 /**
  * Konfigurasi ICE Servers untuk WebRTC (DataChannel & Panggilan Suara/Video).
@@ -273,6 +276,7 @@ export class WA6PeerManager {
   private completedReceivedFiles = new Map<string, string>(); // fileId -> messageId
   private awaitingFileAcks = new Map<string, PendingAckTransfer>();
   private lastConnectAttempt = new Map<string, number>();
+  private lastPeerActivity = new Map<string, number>();
   private lastWakeSyncAt = 0;
   private wakeSyncInFlight = false;
   private heartbeatTimer: number | null = null;
@@ -358,15 +362,24 @@ export class WA6PeerManager {
    * - Uji seluruh koneksi kontak aktif dengan PING; jika tidak ada PONG dalam 2 detik, tutup paksa zombie socket
    *   dan buat peer.connect(...) baru agar jalur chat dan panggilan langsung segar kembali.
    */
-  public async wakeAndSyncPeer(priorityContactIds: string[] = []): Promise<boolean> {
+  public async wakeAndSyncPeer(priorityContactIds: string[] = [], force = false): Promise<boolean> {
     if (this.destroyed) return false;
+    if (typeof navigator !== 'undefined' && navigator.onLine === false) {
+      return false;
+    }
     const now = Date.now();
-    if (this.wakeSyncInFlight || now - this.lastWakeSyncAt < WAKE_SYNC_COOLDOWN_MS) {
+    if (this.wakeSyncInFlight || (!force && now - this.lastWakeSyncAt < WAKE_SYNC_COOLDOWN_MS)) {
       return false;
     }
 
     this.wakeSyncInFlight = true;
     this.lastWakeSyncAt = now;
+
+    // Bersihkan timer reconnect tertunda agar pemulihan langsung berjalan
+    if (this.reconnectTimer !== null) {
+      window.clearTimeout(this.reconnectTimer);
+      this.reconnectTimer = null;
+    }
 
     try {
       // (a) Pulihkan signaling PeerJS terlebih dahulu
@@ -558,8 +571,9 @@ export class WA6PeerManager {
   }
 
   /**
-   * Heartbeat PING ringan sekali setiap 20 detik HANYA pada koneksi DataConnection yang sudah terbuka.
-   * Tidak pernah memanggil peer.connect() agar bebas rate-limit broker 0.peerjs.com.
+   * Heartbeat ringan setiap 12 detik agar socket signaling PeerJS & DataChannel WebRTC tidak dianggap idle:
+   * 1. Kirim frame HEARTBEAT resmi ke WebSocket signaling PeerJS bila masih terbuka (atau pulihkan jika terputus).
+   * 2. Kirim paket PING ringan pada setiap DataConnection terbuka & deteksi koneksi zombie yang diam > 35 detik.
    */
   private startHeartbeatLoop(): void {
     if (this.heartbeatTimer !== null) {
@@ -567,9 +581,54 @@ export class WA6PeerManager {
     }
     this.heartbeatTimer = window.setInterval(() => {
       if (this.destroyed) return;
+      if (typeof navigator !== 'undefined' && navigator.onLine === false) return;
+
+      // (1) Jaga WebSocket signaling PeerJS tetap hidup (anti-idle timeout NAT/operator seluler)
+      if (!this.peer || this.peer.destroyed) {
+        this.scheduleReconnect();
+      } else if (this.peer.disconnected) {
+        try {
+          this.peer.reconnect();
+        } catch {
+          this.scheduleReconnect();
+        }
+      } else if (this.peer.open) {
+        try {
+          const internalPeer = this.peer as unknown as {
+            socket?: {
+              _socket?: WebSocket;
+              send?: (data: { type: string }) => void;
+            };
+          };
+          const ws = internalPeer.socket?._socket;
+          if (ws && ws.readyState === WebSocket.OPEN && typeof internalPeer.socket?.send === 'function') {
+            internalPeer.socket.send({ type: 'HEARTBEAT' });
+          } else if (ws && ws.readyState === WebSocket.CLOSED) {
+            this.peer.reconnect();
+          }
+        } catch {
+          // ignore if internal PeerJS socket structure differs
+        }
+      }
+
+      // (2) Kirim PING ringan pada seluruh DataConnection WebRTC yang aktif
       const now = Date.now();
       this.connections.forEach((conn, peerSixId) => {
-        if (!isConnectionLive(conn)) return;
+        if (!isConnectionLive(conn)) {
+          this.connections.delete(peerSixId);
+          this.lastPeerActivity.delete(peerSixId);
+          this.callbacks.onPeerPresence(peerSixId, false);
+          return;
+        }
+
+        const lastSeen = this.lastPeerActivity.get(peerSixId);
+        if (lastSeen && now - lastSeen > STALE_CONNECTION_MS) {
+          // Koneksi tidak membalas beberapa siklus heartbeat -> tutup & sambung ulang bersih
+          this.lastPeerActivity.delete(peerSixId);
+          this.forceReconnectPeer(peerSixId, conn);
+          return;
+        }
+
         try {
           conn.send({
             kind: 'PING',
@@ -578,6 +637,7 @@ export class WA6PeerManager {
           } satisfies PeerPacket);
         } catch {
           this.connections.delete(peerSixId);
+          this.lastPeerActivity.delete(peerSixId);
           this.callbacks.onPeerPresence(peerSixId, false);
         }
       });
@@ -1189,6 +1249,7 @@ export class WA6PeerManager {
 
     const onOpen = () => {
       this.connections.set(peerSixId, conn);
+      this.lastPeerActivity.set(peerSixId, Date.now());
       this.callbacks.onPeerPresence(peerSixId, true);
 
       // Selesaikan semua waiter yang sedang menunggu ensureOpenConnection()
@@ -1253,6 +1314,8 @@ export class WA6PeerManager {
       if (isConnectionLive(conn) && this.connections.get(peerSixId) !== conn) {
         this.connections.set(peerSixId, conn);
       }
+
+      this.lastPeerActivity.set(peerSixId, Date.now());
 
       // Handle paket chunking & ACK file WebRTC (JSON string / object)
       if (isFileChunkPacket(data)) {

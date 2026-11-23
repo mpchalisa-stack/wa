@@ -49,10 +49,12 @@ const ALL_MEDIA_SESSION_ACTIONS: MediaSessionAction[] = [
 ];
 
 let isStandbyActive = false;
+let isConnectionWakeLockDesired = false;
 let activeMediaSessionMode: 'call' | 'vox' | null = null;
 let lastPeerMediaSessionStatus: PeerMediaSessionStatus | null = null;
 let wakeLockSentinel: WakeLockSentinelLike | null = null;
 let visibilityListenerAttached = false;
+let wakeLockGestureRetryAttached = false;
 let standbyStateListener: ((active: boolean) => void) | null = null;
 
 function resolvePublicAssetUrl(assetPath: string): string {
@@ -95,7 +97,32 @@ export function isActiveMediaSessionRunning(): boolean {
   return activeMediaSessionMode !== null;
 }
 
-async function requestScreenWakeLock(): Promise<boolean> {
+export function isScreenWakeLockActive(): boolean {
+  return Boolean(wakeLockSentinel && !wakeLockSentinel.released);
+}
+
+function detachWakeLockGestureRetry(): void {
+  if (!wakeLockGestureRetryAttached || typeof window === 'undefined') return;
+  window.removeEventListener('pointerdown', handleWakeLockGestureRetry);
+  window.removeEventListener('touchstart', handleWakeLockGestureRetry);
+  wakeLockGestureRetryAttached = false;
+}
+
+function handleWakeLockGestureRetry(): void {
+  detachWakeLockGestureRetry();
+  if (isConnectionWakeLockDesired) {
+    void requestScreenWakeLock();
+  }
+}
+
+function attachWakeLockGestureRetry(): void {
+  if (wakeLockGestureRetryAttached || typeof window === 'undefined') return;
+  wakeLockGestureRetryAttached = true;
+  window.addEventListener('pointerdown', handleWakeLockGestureRetry, { passive: true, once: true });
+  window.addEventListener('touchstart', handleWakeLockGestureRetry, { passive: true, once: true });
+}
+
+export async function requestScreenWakeLock(): Promise<boolean> {
   try {
     if (typeof document !== 'undefined' && document.visibilityState !== 'visible') {
       return false;
@@ -108,7 +135,17 @@ async function requestScreenWakeLock(): Promise<boolean> {
       return true;
     }
     const sentinel = await nav.wakeLock.request('screen');
+    // Jika koneksi tidak aktif lagi saat promise selesai, segera lepaskan kembali
+    if (!isConnectionWakeLockDesired) {
+      try {
+        await sentinel.release();
+      } catch {
+        // ignore
+      }
+      return false;
+    }
     wakeLockSentinel = sentinel;
+    detachWakeLockGestureRetry();
     sentinel.addEventListener?.('release', () => {
       if (wakeLockSentinel === sentinel) {
         wakeLockSentinel = null;
@@ -116,19 +153,45 @@ async function requestScreenWakeLock(): Promise<boolean> {
     });
     return true;
   } catch {
+    // Beberapa browser mobile mewajibkan sentuhan pengguna pertama sebelum mengizinkan wakeLock
+    if (isConnectionWakeLockDesired) {
+      attachWakeLockGestureRetry();
+    }
     return false;
   }
 }
 
-async function releaseScreenWakeLock(): Promise<void> {
+export async function releaseScreenWakeLock(): Promise<void> {
+  detachWakeLockGestureRetry();
   if (wakeLockSentinel) {
+    const current = wakeLockSentinel;
+    wakeLockSentinel = null;
     try {
-      await wakeLockSentinel.release();
+      await current.release();
     } catch {
       // ignore
     }
-    wakeLockSentinel = null;
   }
+}
+
+/**
+ * Mengaktifkan Screen Wake Lock (navigator.wakeLock) saat koneksi PeerJS aktif agar layar
+ * HP/tablet tidak mati otomatis selama aplikasi terbuka, dan melepaskannya saat koneksi berhenti.
+ */
+export async function syncConnectionWakeLock(connectionActive: boolean): Promise<boolean> {
+  isConnectionWakeLockDesired = connectionActive;
+
+  if (!visibilityListenerAttached && typeof document !== 'undefined') {
+    document.addEventListener('visibilitychange', handleStandbyVisibilityChange);
+    visibilityListenerAttached = true;
+  }
+
+  if (connectionActive) {
+    return requestScreenWakeLock();
+  }
+
+  await releaseScreenWakeLock();
+  return false;
 }
 
 /**
@@ -344,7 +407,7 @@ export function releaseActiveMediaSession(mode?: 'call' | 'vox'): void {
 
 const handleStandbyVisibilityChange = () => {
   if (document.visibilityState === 'visible') {
-    if (isStandbyActive) {
+    if (isConnectionWakeLockDesired) {
       void requestScreenWakeLock();
     }
     if (activeMediaSessionMode === null && lastPeerMediaSessionStatus && !lastPeerMediaSessionStatus.isExited) {
@@ -370,7 +433,7 @@ export function pauseKeepAliveForCall(): void {
 export function resumeKeepAliveAfterCall(): void {
   releaseActiveMediaSession('call');
   releaseAudioContextNow();
-  if (isStandbyActive && typeof document !== 'undefined' && document.visibilityState === 'visible') {
+  if (isConnectionWakeLockDesired && typeof document !== 'undefined' && document.visibilityState === 'visible') {
     void requestScreenWakeLock();
   }
 }
@@ -431,7 +494,7 @@ export async function disableStandbyMode(): Promise<void> {
   isStandbyActive = false;
   standbyStateListener?.(false);
 
-  if (visibilityListenerAttached && typeof document !== 'undefined') {
+  if (!isConnectionWakeLockDesired && visibilityListenerAttached && typeof document !== 'undefined') {
     document.removeEventListener('visibilitychange', handleStandbyVisibilityChange);
     visibilityListenerAttached = false;
   }
@@ -440,7 +503,9 @@ export async function disableStandbyMode(): Promise<void> {
     releaseActiveMediaSession();
     releaseAudioContextNow();
   }
-  await releaseScreenWakeLock();
+  if (!isConnectionWakeLockDesired) {
+    await releaseScreenWakeLock();
+  }
 }
 
 export interface NotificationClickData {
