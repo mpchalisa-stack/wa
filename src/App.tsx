@@ -71,6 +71,7 @@ import {
 } from './lib/audio';
 import {
   NotificationClickData,
+  clearPeerMediaSession,
   disableStandbyMode,
   dismissIncomingCallNotification,
   enableStandbyMode,
@@ -80,6 +81,7 @@ import {
   resumeKeepAliveAfterCall,
   setStandbyExternalListener,
   showIncomingWebNotification,
+  syncPeerMediaSession,
 } from './lib/standby';
 import {
   buildConversationScope,
@@ -1965,6 +1967,46 @@ export default function App() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [profile?.id, isExited]);
 
+  // Sinkronisasi real-time navigator.mediaSession dengan status koneksi PeerJS & logo resmi WattappsAU
+  // tanpa mendaftarkan pemicu kontrol pemutar audio HP di layar kunci
+  const onlineContactsCount = useMemo(
+    () => Object.values(onlinePeers).filter(Boolean).length,
+    [onlinePeers]
+  );
+
+  useEffect(() => {
+    if (!profile || isExited) {
+      clearPeerMediaSession();
+      return;
+    }
+
+    const pushCurrentMediaMetadata = () => {
+      syncPeerMediaSession({
+        peerState,
+        standbyEnabled: standbyMode,
+        peerId: profile.id,
+        onlineContactsCount,
+        isExited,
+      });
+    };
+
+    pushCurrentMediaMetadata();
+
+    const handleVisibilityOrNetworkRefresh = () => {
+      pushCurrentMediaMetadata();
+    };
+
+    document.addEventListener('visibilitychange', handleVisibilityOrNetworkRefresh);
+    window.addEventListener('online', handleVisibilityOrNetworkRefresh);
+    window.addEventListener('focus', handleVisibilityOrNetworkRefresh);
+
+    return () => {
+      document.removeEventListener('visibilitychange', handleVisibilityOrNetworkRefresh);
+      window.removeEventListener('online', handleVisibilityOrNetworkRefresh);
+      window.removeEventListener('focus', handleVisibilityOrNetworkRefresh);
+    };
+  }, [profile?.id, peerState, standbyMode, isExited, onlineContactsCount]);
+
   // Stream SSE tunggal & hemat baterai ke https://ntfy.sh/wattappsau-signal-{my6DigitId}/sse
   // Menggantikan polling timer agresif agar broker PeerJS stabil & bebas rate-limit
   useEffect(() => {
@@ -3445,6 +3487,7 @@ export default function App() {
     setStandbyMode(false);
     await disableStandbyMode();
     releaseActiveMediaSession();
+    clearPeerMediaSession();
     releaseAudioContextNow();
 
     isHistoryTrapped = false;

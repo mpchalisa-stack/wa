@@ -29,6 +29,14 @@ export interface ActiveMediaSessionOptions {
   onEndOrPause?: () => void;
 }
 
+export interface PeerMediaSessionStatus {
+  peerState: 'connecting' | 'online' | 'disconnected' | 'error';
+  standbyEnabled: boolean;
+  peerId?: string;
+  onlineContactsCount?: number;
+  isExited?: boolean;
+}
+
 const ALL_MEDIA_SESSION_ACTIONS: MediaSessionAction[] = [
   'play',
   'pause',
@@ -42,10 +50,50 @@ const ALL_MEDIA_SESSION_ACTIONS: MediaSessionAction[] = [
 
 let isStandbyActive = false;
 let activeMediaSessionMode: 'call' | 'vox' | null = null;
+let lastPeerMediaSessionStatus: PeerMediaSessionStatus | null = null;
 let wakeLockSentinel: WakeLockSentinelLike | null = null;
 let visibilityListenerAttached = false;
 let standbyStateListener: ((active: boolean) => void) | null = null;
-let cachedTacticalArtworkDataUrl: string | null = null;
+
+function resolvePublicAssetUrl(assetPath: string): string {
+  if (typeof window !== 'undefined' && window.location?.origin) {
+    try {
+      return new URL(assetPath, window.location.origin).href;
+    } catch {
+      return assetPath;
+    }
+  }
+  return assetPath;
+}
+
+/**
+ * Daftar artwork resmi WattappsAU dari folder /public untuk kartu MediaMetadata layar kunci.
+ * Menggunakan logo SWA BHUWANA PAKSA & ikon aplikasi dari folder public dengan URL absolut.
+ */
+function buildAppMediaArtwork(): MediaImage[] {
+  return [
+    {
+      src: resolvePublicAssetUrl('/assets/aistudio/1792503945296_954409ac.jpg'),
+      sizes: '2048x2048',
+      type: 'image/jpeg',
+    },
+    {
+      src: resolvePublicAssetUrl('/icon-512.png'),
+      sizes: '512x512',
+      type: 'image/png',
+    },
+    {
+      src: resolvePublicAssetUrl('/pwa-512x512.png'),
+      sizes: '512x512',
+      type: 'image/png',
+    },
+    {
+      src: resolvePublicAssetUrl('/pwa-192x192.png'),
+      sizes: '192x192',
+      type: 'image/png',
+    },
+  ];
+}
 
 export function setStandbyExternalListener(listener: ((active: boolean) => void) | null): void {
   standbyStateListener = listener;
@@ -96,90 +144,6 @@ async function releaseScreenWakeLock(): Promise<void> {
 }
 
 /**
- * Menghasilkan artwork kustom taktis 192x192px (navy/slate + neon cyan & emas)
- * khusus untuk kartu Media Session selama panggilan / VOX aktif.
- */
-function createCustomTacticalArtworkDataUrl(): string {
-  if (cachedTacticalArtworkDataUrl) return cachedTacticalArtworkDataUrl;
-
-  const fallbackSvg =
-    'data:image/svg+xml;charset=utf-8,' +
-    encodeURIComponent(
-      `<svg xmlns="http://www.w3.org/2000/svg" width="192" height="192" viewBox="0 0 192 192">` +
-        `<rect width="192" height="192" rx="36" fill="#0b141a"/>` +
-        `<rect x="8" y="8" width="176" height="176" rx="30" fill="none" stroke="#22d3ee" stroke-opacity="0.45" stroke-width="3"/>` +
-        `<g fill="none" stroke="#22d3ee" stroke-width="6" stroke-linecap="round">` +
-        `<path d="M68 68 A40 40 0 0 0 68 124"/>` +
-        `<path d="M124 68 A40 40 0 0 1 124 124"/>` +
-        `<path d="M50 50 A65 65 0 0 0 50 142" stroke-opacity="0.4"/>` +
-        `<path d="M142 50 A65 65 0 0 1 142 142" stroke-opacity="0.4"/>` +
-        `</g>` +
-        `<circle cx="96" cy="96" r="11" fill="#f59e0b"/>` +
-        `</svg>`
-    );
-
-  if (typeof document === 'undefined') {
-    cachedTacticalArtworkDataUrl = fallbackSvg;
-    return cachedTacticalArtworkDataUrl;
-  }
-
-  try {
-    const size = 192;
-    const canvas = document.createElement('canvas');
-    canvas.width = size;
-    canvas.height = size;
-    const ctx = canvas.getContext('2d');
-    if (!ctx) {
-      cachedTacticalArtworkDataUrl = fallbackSvg;
-      return cachedTacticalArtworkDataUrl;
-    }
-
-    ctx.clearRect(0, 0, size, size);
-    ctx.fillStyle = '#0b141a';
-    ctx.beginPath();
-    ctx.roundRect(6, 6, size - 12, size - 12, 36);
-    ctx.fill();
-
-    ctx.strokeStyle = 'rgba(34, 211, 238, 0.45)';
-    ctx.lineWidth = 3;
-    ctx.stroke();
-
-    const cx = size / 2;
-    const cy = size / 2;
-
-    ctx.lineCap = 'round';
-    ctx.strokeStyle = '#22d3ee';
-    ctx.lineWidth = 5.5;
-    ctx.beginPath();
-    ctx.arc(cx, cy, 32, Math.PI * 0.72, Math.PI * 1.28);
-    ctx.stroke();
-    ctx.beginPath();
-    ctx.arc(cx, cy, 32, -Math.PI * 0.28, Math.PI * 0.28);
-    ctx.stroke();
-
-    ctx.strokeStyle = 'rgba(34, 211, 238, 0.38)';
-    ctx.lineWidth = 5;
-    ctx.beginPath();
-    ctx.arc(cx, cy, 54, Math.PI * 0.74, Math.PI * 1.26);
-    ctx.stroke();
-    ctx.beginPath();
-    ctx.arc(cx, cy, 54, -Math.PI * 0.26, Math.PI * 0.26);
-    ctx.stroke();
-
-    ctx.fillStyle = '#f59e0b';
-    ctx.beginPath();
-    ctx.arc(cx, cy, 10, 0, Math.PI * 2);
-    ctx.fill();
-
-    cachedTacticalArtworkDataUrl = canvas.toDataURL('image/png');
-    return cachedTacticalArtworkDataUrl;
-  } catch {
-    cachedTacticalArtworkDataUrl = fallbackSvg;
-    return cachedTacticalArtworkDataUrl;
-  }
-}
-
-/**
  * Membersihkan elemen audio legacy (keepalive-audio) jika masih ada di DOM
  * agar tidak pernah menahan audio focus Android.
  */
@@ -220,6 +184,104 @@ function clearAllMediaSessionHandlers(): void {
   }
 }
 
+function formatPeerDisplayId(peerId?: string): string {
+  if (!peerId) return '';
+  const digits = peerId.replace(/\D/g, '');
+  return digits.length === 6 ? `${digits.slice(0, 3)}-${digits.slice(3)}` : peerId;
+}
+
+function applyPeerMediaMetadata(status: PeerMediaSessionStatus): void {
+  if (typeof navigator === 'undefined' || !('mediaSession' in navigator)) return;
+
+  try {
+    // Selalu kosongkan seluruh handler tombol pemutar audio (play/pause/stop/next/prev/seek)
+    // dan pastikan playbackState = 'none' agar tidak memicu kontrol pemutar audio HP di layar kunci.
+    clearAllMediaSessionHandlers();
+
+    if (status.isExited) {
+      navigator.mediaSession.metadata = null;
+      navigator.mediaSession.playbackState = 'none';
+      return;
+    }
+
+    if (typeof MediaMetadata !== 'undefined') {
+      const artistText =
+        status.peerState === 'online'
+          ? 'Status: Online'
+          : status.peerState === 'connecting'
+          ? 'Status: Menghubungkan...'
+          : 'Status: Menyambung Ulang...';
+
+      const formattedId = formatPeerDisplayId(status.peerId);
+      const onlineCount = status.onlineContactsCount ?? 0;
+      const albumParts: string[] = [];
+
+      if (status.peerState === 'online') {
+        if (onlineCount > 0) {
+          albumParts.push(`${onlineCount} Rekan Aktif`);
+        } else if (status.standbyEnabled) {
+          albumParts.push('Mode Siaga Aktif');
+        } else {
+          albumParts.push('Jaringan P2P Aktif');
+        }
+      } else {
+        albumParts.push('Jaringan P2P WattappsAU');
+      }
+
+      if (formattedId) {
+        albumParts.push(`ID ${formattedId}`);
+      }
+
+      navigator.mediaSession.metadata = new MediaMetadata({
+        title: 'WattappsAU',
+        artist: artistText,
+        album: albumParts.join(' · '),
+        artwork: buildAppMediaArtwork(),
+      });
+    }
+
+    navigator.mediaSession.playbackState = 'none';
+  } catch {
+    // ignore on unsupported browsers
+  }
+}
+
+/**
+ * Memperbarui navigator.mediaSession secara real-time sesuai status koneksi PeerJS
+ * tanpa menyalakan pemutar audio maupun mendaftarkan tombol kontrol audio HP.
+ */
+export function syncPeerMediaSession(status: PeerMediaSessionStatus): void {
+  lastPeerMediaSessionStatus = status;
+  purgeLegacyKeepAliveAudioElement();
+
+  // Jika sedang dalam panggilan atau memutar VOX, biarkan metadata sesi aktif tampil lebih dulu;
+  // begitu sesi berakhir, releaseActiveMediaSession akan otomatis memulihkan metadata PeerJS terbaru.
+  if (activeMediaSessionMode !== null && !status.isExited) {
+    return;
+  }
+
+  applyPeerMediaMetadata(status);
+}
+
+/**
+ * Membersihkan total metadata & state MediaSession saat pengguna memilih Exit.
+ */
+export function clearPeerMediaSession(): void {
+  lastPeerMediaSessionStatus = null;
+  activeMediaSessionMode = null;
+  purgeLegacyKeepAliveAudioElement();
+
+  try {
+    if (typeof navigator !== 'undefined' && 'mediaSession' in navigator) {
+      clearAllMediaSessionHandlers();
+      navigator.mediaSession.metadata = null;
+      navigator.mediaSession.playbackState = 'none';
+    }
+  } catch {
+    // ignore
+  }
+}
+
 /**
  * Mengaktifkan Media Session secara terkontrol HANYA saat panggilan aktif atau transmisi VOX berlangsung.
  */
@@ -231,7 +293,6 @@ export function activateActiveMediaSession(options: ActiveMediaSessionOptions): 
     if (typeof navigator === 'undefined' || !('mediaSession' in navigator)) return;
 
     if (typeof MediaMetadata !== 'undefined') {
-      const customArtwork = createCustomTacticalArtworkDataUrl();
       const albumText = options.peerName
         ? `${options.peerName} · Enkripsi DTLS/SRTP`
         : 'Tactical P2P Terenkripsi (AES-256)';
@@ -240,18 +301,7 @@ export function activateActiveMediaSession(options: ActiveMediaSessionOptions): 
         title: 'WattappsAU',
         artist: options.statusText,
         album: albumText,
-        artwork: [
-          {
-            src: '/icon-512.png',
-            sizes: '512x512',
-            type: 'image/png',
-          },
-          {
-            src: customArtwork,
-            sizes: '192x192',
-            type: customArtwork.startsWith('data:image/png') ? 'image/png' : 'image/svg+xml',
-          },
-        ],
+        artwork: buildAppMediaArtwork(),
       });
     }
 
@@ -289,8 +339,9 @@ export function activateActiveMediaSession(options: ActiveMediaSessionOptions): 
 }
 
 /**
- * Melepas total sesi media, membersihkan metadata & action handler, serta membuang audio idle
- * agar Android & perangkat Bluetooth eksternal (VIVAN Sport X3) langsung bebas kembali.
+ * Melepas sesi media aktif (panggilan/VOX), membersihkan seluruh handler pemutar audio,
+ * dan langsung memulihkan identitas MediaMetadata WattappsAU sesuai status PeerJS real-time
+ * dengan playbackState = 'none' agar kontrol pemutar audio HP tetap bebas.
  */
 export function releaseActiveMediaSession(mode?: 'call' | 'vox'): void {
   // Jika mode diberikan dan tidak cocok dengan sesi aktif saat ini, jangan ganggu sesi yang lebih prioritas
@@ -304,8 +355,12 @@ export function releaseActiveMediaSession(mode?: 'call' | 'vox'): void {
   try {
     if (typeof navigator !== 'undefined' && 'mediaSession' in navigator) {
       clearAllMediaSessionHandlers();
-      navigator.mediaSession.metadata = null;
-      navigator.mediaSession.playbackState = 'none';
+      if (lastPeerMediaSessionStatus && !lastPeerMediaSessionStatus.isExited) {
+        applyPeerMediaMetadata(lastPeerMediaSessionStatus);
+      } else {
+        navigator.mediaSession.metadata = null;
+        navigator.mediaSession.playbackState = 'none';
+      }
     }
   } catch {
     // ignore
@@ -317,8 +372,11 @@ const handleStandbyVisibilityChange = () => {
     if (isStandbyActive) {
       void requestScreenWakeLock();
     }
+    if (activeMediaSessionMode === null && lastPeerMediaSessionStatus && !lastPeerMediaSessionStatus.isExited) {
+      applyPeerMediaMetadata(lastPeerMediaSessionStatus);
+    }
   } else if (activeMediaSessionMode === null) {
-    // Saat berpindah ke latar belakang tanpa panggilan/VOX aktif, pastikan fokus audio & MediaSession 100% dilepas
+    // Saat berpindah ke latar belakang tanpa panggilan/VOX aktif, lepas fokus audio & pertahankan identitas metadata pasif
     releaseActiveMediaSession();
     releaseAudioContextNow();
   }
