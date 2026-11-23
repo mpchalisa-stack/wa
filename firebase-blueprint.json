@@ -1,0 +1,214 @@
+{
+  "entities": {
+    "DeviceToken": {
+      "title": "DeviceToken",
+      "description": "Private device registration storing a user's Android/Web FCM push token and standby state.",
+      "type": "object",
+      "properties": {
+        "userId": {
+          "type": "string",
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$",
+          "description": "Firebase Auth UID of the device owner."
+        },
+        "peerId": {
+          "type": "string",
+          "minLength": 6,
+          "maxLength": 6,
+          "pattern": "^[0-9]{6}$",
+          "description": "6-digit WattappsAU tactical peer ID."
+        },
+        "fcmToken": {
+          "type": "string",
+          "maxLength": 512,
+          "description": "Firebase Cloud Messaging device token (empty string if web-only without FCM)."
+        },
+        "platform": {
+          "type": "string",
+          "enum": ["android", "ios", "web"],
+          "description": "Device platform identifier."
+        },
+        "standbyEnabled": {
+          "type": "boolean",
+          "description": "Whether Mode Siaga latar belakang is active on this device."
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Server timestamp when device record was first registered."
+        },
+        "updatedAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Server timestamp of the last device token/status refresh."
+        }
+      },
+      "required": [
+        "userId",
+        "peerId",
+        "fcmToken",
+        "platform",
+        "standbyEnabled",
+        "createdAt",
+        "updatedAt"
+      ]
+    },
+    "PeerDirectoryEntry": {
+      "title": "PeerDirectoryEntry",
+      "description": "Public non-PII lookup mapping a 6-digit WattappsAU peer ID to its Firebase owner UID for wake signal routing.",
+      "type": "object",
+      "properties": {
+        "peerId": {
+          "type": "string",
+          "minLength": 6,
+          "maxLength": 6,
+          "pattern": "^[0-9]{6}$",
+          "description": "6-digit WattappsAU peer ID matching the document ID."
+        },
+        "ownerUid": {
+          "type": "string",
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$",
+          "description": "Firebase Auth UID that owns this 6-digit peer ID."
+        },
+        "displayName": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 80,
+          "description": "Display callsign shown for peer wake resolution."
+        },
+        "pushReady": {
+          "type": "boolean",
+          "description": "Whether the peer has an active native push token or wake listener."
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Server timestamp when directory entry was created."
+        },
+        "updatedAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Server timestamp of the last update."
+        }
+      },
+      "required": [
+        "peerId",
+        "ownerUid",
+        "displayName",
+        "pushReady",
+        "createdAt",
+        "updatedAt"
+      ]
+    },
+    "WakeSignal": {
+      "title": "WakeSignal",
+      "description": "Queued wake/incoming-call/message notification signal delivered via Firestore realtime listeners or FCM triggers.",
+      "type": "object",
+      "properties": {
+        "signalId": {
+          "type": "string",
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$",
+          "description": "Unique signal ID matching the document ID."
+        },
+        "senderUid": {
+          "type": "string",
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$",
+          "description": "Firebase Auth UID of the sender."
+        },
+        "senderPeerId": {
+          "type": "string",
+          "minLength": 6,
+          "maxLength": 6,
+          "pattern": "^[0-9]{6}$",
+          "description": "6-digit WattappsAU ID of the sender."
+        },
+        "senderName": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 80,
+          "description": "Sender display name."
+        },
+        "recipientUid": {
+          "type": "string",
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$",
+          "description": "Firebase Auth UID of the target recipient."
+        },
+        "recipientPeerId": {
+          "type": "string",
+          "minLength": 6,
+          "maxLength": 6,
+          "pattern": "^[0-9]{6}$",
+          "description": "6-digit WattappsAU ID of the target recipient."
+        },
+        "type": {
+          "type": "string",
+          "enum": ["INCOMING_CALL", "NEW_MSG", "PING"],
+          "description": "Category of wake signal."
+        },
+        "callType": {
+          "type": "string",
+          "enum": ["audio", "video", "none"],
+          "description": "Call media type for INCOMING_CALL signals, or none for messages."
+        },
+        "callId": {
+          "type": "string",
+          "maxLength": 128,
+          "description": "Optional call correlation identifier (empty string if non-call)."
+        },
+        "status": {
+          "type": "string",
+          "enum": ["pending", "acknowledged"],
+          "description": "Delivery lifecycle state; acknowledged is terminal."
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Server timestamp when wake signal was created."
+        },
+        "updatedAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Server timestamp when wake signal was last updated."
+        }
+      },
+      "required": [
+        "signalId",
+        "senderUid",
+        "senderPeerId",
+        "senderName",
+        "recipientUid",
+        "recipientPeerId",
+        "type",
+        "callType",
+        "callId",
+        "status",
+        "createdAt",
+        "updatedAt"
+      ]
+    }
+  },
+  "firestore": {
+    "/devices/{userId}": {
+      "schema": {
+        "$ref": "#/entities/DeviceToken"
+      },
+      "description": "Private per-user device FCM token and Mode Siaga status document."
+    },
+    "/peerDirectory/{peerId}": {
+      "schema": {
+        "$ref": "#/entities/PeerDirectoryEntry"
+      },
+      "description": "Single-document lookup mapping a 6-digit WattappsAU peer ID to its Firebase UID without exposing private tokens."
+    },
+    "/wakeSignals/{signalId}": {
+      "schema": {
+        "$ref": "#/entities/WakeSignal"
+      },
+      "description": "Realtime wake-signal and offline push notification queue between authenticated peers."
+    }
+  }
+}

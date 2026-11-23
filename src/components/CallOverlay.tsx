@@ -14,6 +14,7 @@ import {
 } from 'lucide-react';
 import { CallType } from '../types';
 import { formatDuration, formatSixDigitId } from '../lib/media';
+import { activateActiveMediaSession, releaseActiveMediaSession } from '../lib/standby';
 import { Avatar } from './Avatar';
 import { AppLogo } from './AppLogo';
 
@@ -71,6 +72,52 @@ export const CallOverlay: React.FC<CallOverlayProps> = ({
     setMinimizedBanner(false);
     setAvatarImgFailed(false);
   }, [call.callId, call.phase, call.peerAvatar, forceFullscreenTick]);
+
+  // Kelola navigator.mediaSession secara terkontrol HANYA selama panggilan berlangsung
+  useEffect(() => {
+    const isVideoCall = call.callType === 'video';
+    const statusText =
+      call.phase === 'incoming'
+        ? isVideoCall
+          ? 'Panggilan Video Masuk'
+          : 'Panggilan Suara Masuk'
+        : call.phase === 'outgoing'
+        ? isVideoCall
+          ? 'Memanggil Video...'
+          : 'Memanggil Suara...'
+        : isVideoCall
+        ? 'Panggilan Video Terenkripsi'
+        : 'Panggilan Suara Terenkripsi';
+
+    activateActiveMediaSession({
+      mode: 'call',
+      statusText,
+      peerName: call.peerName,
+      onEndOrPause: call.phase === 'incoming' ? onReject : onEnd,
+    });
+  }, [call.callId, call.phase, call.callType, call.peerName, onReject, onEnd]);
+
+  // Pastikan seluruh elemen audio/video & MediaSession dibersihkan penuh saat CallOverlay ditutup
+  useEffect(() => {
+    const audioEl = remoteAudioRef.current;
+    const remoteVid = remoteVideoRef.current;
+    const localVid = localVideoRef.current;
+    return () => {
+      if (audioEl) {
+        audioEl.pause();
+        audioEl.srcObject = null;
+      }
+      if (remoteVid) {
+        remoteVid.pause();
+        remoteVid.srcObject = null;
+      }
+      if (localVid) {
+        localVid.pause();
+        localVid.srcObject = null;
+      }
+      releaseActiveMediaSession('call');
+    };
+  }, []);
 
   useEffect(() => {
     if (remoteVideoRef.current && call.remoteStream) {
