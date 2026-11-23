@@ -14,17 +14,34 @@ if (!fs.existsSync(manifestPath)) {
   process.exit(0);
 }
 
-// 1. Copy root google-services.json into android/app/google-services.json if not already copied
-if (fs.existsSync(rootGoogleServices) && !fs.existsSync(targetGoogleServices)) {
+// 1. Always sync root google-services.json into android/app/google-services.json
+// (unless CI already decoded GOOGLE_SERVICES_JSON_BASE64 into android/app/google-services.json)
+if (!process.env.GOOGLE_SERVICES_JSON_BASE64 && fs.existsSync(rootGoogleServices)) {
   fs.copyFileSync(rootGoogleServices, targetGoogleServices);
-  console.log('[configure-android] Copied google-services.json to android/app/google-services.json.');
+  console.log('[configure-android] Copied root google-services.json to android/app/google-services.json.');
+} else if (fs.existsSync(targetGoogleServices)) {
+  console.log('[configure-android] Using existing android/app/google-services.json.');
+} else {
+  console.warn('[configure-android] WARNING: google-services.json not found in root or android/app/.');
 }
 
-// 2. Ensure classpath 'com.google.gms:google-services:4.4.2' is present in android/build.gradle
+// 2. Ensure classpath 'com.google.gms:google-services:4.4.2' is present in android/build.gradle buildscript.dependencies
 if (fs.existsSync(rootBuildGradlePath)) {
   let rootGradle = fs.readFileSync(rootBuildGradlePath, 'utf8');
-  if (!rootGradle.includes('com.google.gms:google-services')) {
-    const depAnchor = /(dependencies\s*\{)/;
+  const existingGmsRegex = /classpath\s+['"]com\.google\.gms:google-services:[^'"]+['"]/;
+  if (existingGmsRegex.test(rootGradle)) {
+    const updated = rootGradle.replace(
+      existingGmsRegex,
+      "classpath 'com.google.gms:google-services:4.4.2'"
+    );
+    if (updated !== rootGradle) {
+      fs.writeFileSync(rootBuildGradlePath, updated, 'utf8');
+      console.log("[configure-android] Set classpath 'com.google.gms:google-services:4.4.2' in android/build.gradle.");
+    } else {
+      console.log("[configure-android] classpath 'com.google.gms:google-services:4.4.2' already set in android/build.gradle.");
+    }
+  } else {
+    const depAnchor = /(buildscript\s*\{[\s\S]*?dependencies\s*\{)/;
     if (depAnchor.test(rootGradle)) {
       rootGradle = rootGradle.replace(
         depAnchor,
@@ -33,22 +50,28 @@ if (fs.existsSync(rootBuildGradlePath)) {
       fs.writeFileSync(rootBuildGradlePath, rootGradle, 'utf8');
       console.log("[configure-android] Injected classpath 'com.google.gms:google-services:4.4.2' into android/build.gradle.");
     }
-  } else {
-    console.log('[configure-android] com.google.gms:google-services classpath already present in android/build.gradle.');
   }
 }
 
-// 3. Ensure apply plugin: 'com.google.gms.google-services' is present in android/app/build.gradle when google-services.json exists
+// 3. Explicitly apply plugin 'com.google.gms.google-services' at the bottom of android/app/build.gradle
 const hasGoogleServicesJson = fs.existsSync(targetGoogleServices);
 if (hasGoogleServicesJson && fs.existsSync(appBuildGradlePath)) {
   let appGradle = fs.readFileSync(appBuildGradlePath, 'utf8');
-  if (!appGradle.includes("com.google.gms.google-services")) {
-    appGradle = `${appGradle.trimEnd()}\n\napply plugin: 'com.google.gms.google-services'\n`;
-    fs.writeFileSync(appBuildGradlePath, appGradle, 'utf8');
-    console.log("[configure-android] Appended apply plugin: 'com.google.gms.google-services' to android/app/build.gradle.");
-  } else {
-    console.log('[configure-android] google-services plugin already configured in android/app/build.gradle.');
+
+  // Replace Capacitor's silent try/catch wrapper so Google Services plugin is guaranteed to run cleanly
+  const silentTryCatchRegex = /try\s*\{\s*def\s+servicesJSON\s*=\s*file\(['"]google-services\.json['"]\)[\s\S]*?catch\s*\([^)]*\)\s*\{[\s\S]*?\}/m;
+  if (silentTryCatchRegex.test(appGradle)) {
+    appGradle = appGradle.replace(silentTryCatchRegex, '').trimEnd();
   }
+
+  // Remove any duplicate standalone apply lines before appending cleanly at the bottom
+  appGradle = appGradle
+    .replace(/\n*apply\s+plugin:\s*['"]com\.google\.gms\.google-services['"]\s*/g, '\n')
+    .trimEnd();
+
+  appGradle = `${appGradle}\n\napply plugin: 'com.google.gms.google-services'\n`;
+  fs.writeFileSync(appBuildGradlePath, appGradle, 'utf8');
+  console.log("[configure-android] Applied plugin 'com.google.gms.google-services' at bottom of android/app/build.gradle.");
 } else {
   console.log('[configure-android] google-services.json not present in android/app/; skipping google-services plugin injection.');
 }

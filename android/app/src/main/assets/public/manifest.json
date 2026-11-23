@@ -1,0 +1,27 @@
+{
+  "id": "/",
+  "name": "WattappsAU — Komunikasi P2P",
+  "short_name": "WattappsAU",
+  "description": "Aplikasi komunikasi real-time Peer-to-Peer Diskomlekau dengan ID 6 digit tanpa nomor telepon, tanpa email, dan tanpa database eksternal.",
+  "start_url": "/",
+  "scope": "/",
+  "display": "standalone",
+  "orientation": "portrait-primary",
+  "background_color": "#ffffff",
+  "theme_color": "#008069",
+  "categories": ["social", "communication"],
+  "icons": [
+    {
+      "src": "/icon-512.png",
+      "sizes": "192x192",
+      "type": "image/png",
+      "purpose": "any maskable"
+    },
+    {
+      "src": "/icon-512.png",
+      "sizes": "512x512",
+      "type": "image/png",
+      "purpose": "any maskable"
+    }
+  ]
+}

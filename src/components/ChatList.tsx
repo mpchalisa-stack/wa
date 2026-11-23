@@ -203,7 +203,6 @@ export const ChatList: React.FC<ChatListProps> = ({
             const last = lastMsgByChat.get(chat.id);
             const unread = unreadCounts[chat.id] || 0;
             const isSelected = activeChatId === chat.id;
-            const isOnline = !chat.isGroup && Boolean(onlinePeers[chat.id]);
 
             return (
               <button
@@ -221,7 +220,6 @@ export const ChatList: React.FC<ChatListProps> = ({
                   name={chat.name}
                   size="lg"
                   isGroup={chat.isGroup}
-                  isOnline={isOnline}
                 />
 
                 <div className="flex-1 min-w-0">

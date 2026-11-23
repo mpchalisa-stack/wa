@@ -1,12 +1,20 @@
-// Synthesized Web Audio API ringtones (440Hz+480Hz telephone ring), message chimes, global AudioContext unlock, and vibration
+// Synthesized Web Audio API ringtones (440Hz+480Hz telephone ring), message chimes, and strict AudioContext focus release
 
 let ringtoneTimer: number | null = null;
+let idleReleaseTimer: number | null = null;
 let audioCtx: AudioContext | null = null;
-let unlockRegistered = false;
+
+function clearIdleReleaseTimer(): void {
+  if (idleReleaseTimer !== null) {
+    window.clearTimeout(idleReleaseTimer);
+    idleReleaseTimer = null;
+  }
+}
 
 export function getSharedAudioContext(): AudioContext | null {
   try {
-    if (!audioCtx) {
+    clearIdleReleaseTimer();
+    if (!audioCtx || audioCtx.state === 'closed') {
       const Ctx =
         window.AudioContext ||
         (window as unknown as { webkitAudioContext: typeof AudioContext }).webkitAudioContext;
@@ -15,7 +23,7 @@ export function getSharedAudioContext(): AudioContext | null {
       }
     }
     if (audioCtx && audioCtx.state === 'suspended') {
-      void audioCtx.resume();
+      void audioCtx.resume().catch(() => {});
     }
     return audioCtx;
   } catch {
@@ -24,42 +32,63 @@ export function getSharedAudioContext(): AudioContext | null {
 }
 
 /**
- * Unlock AudioContext global secara otomatis pada sentuhan/klik pertama pengguna di layar mana pun
- * agar browser mengizinkan pemutaran nada dering & notifikasi di tab latar belakang.
+ * Menutup & melepas AudioContext sepenuhnya agar sistem Android dan perangkat Bluetooth
+ * eksternal (misal headset VIVAN Sport X3) langsung mendapatkan kembali fokus audio normal.
+ */
+export function releaseAudioContextNow(): void {
+  clearIdleReleaseTimer();
+  if (ringtoneTimer !== null) return; // Jangan tutup saat dering panggilan masih aktif
+
+  const ctx = audioCtx;
+  audioCtx = null;
+  if (!ctx) return;
+
+  try {
+    if (ctx.state !== 'closed') {
+      void ctx.close().catch(() => {
+        try {
+          void ctx.suspend().catch(() => {});
+        } catch {
+          // ignore
+        }
+      });
+    }
+  } catch {
+    // ignore
+  }
+}
+
+function scheduleIdleAudioContextRelease(delayMs = 550): void {
+  clearIdleReleaseTimer();
+  if (ringtoneTimer !== null) return;
+  idleReleaseTimer = window.setTimeout(() => {
+    idleReleaseTimer = null;
+    if (ringtoneTimer === null) {
+      releaseAudioContextNow();
+    }
+  }, delayMs);
+}
+
+/**
+ * Jangan memainkan silent buffer terus-menerus pada setiap sentuhan layar agar tidak
+ * mencuri fokus audio Android / Bluetooth saat aplikasi idle.
+ * Hanya dengarkan visibilitychange untuk memastikan AudioContext dilepas saat ke latar belakang.
  */
 export function initGlobalAudioUnlock(): () => void {
-  if (typeof window === 'undefined' || unlockRegistered) {
+  if (typeof window === 'undefined' || typeof document === 'undefined') {
     return () => {};
   }
-  unlockRegistered = true;
 
-  const unlockHandler = () => {
-    try {
-      const ctx = getSharedAudioContext();
-      if (!ctx) return;
-      if (ctx.state === 'suspended') {
-        void ctx.resume();
-      }
-      // Putar 1-sample silent buffer untuk membuka kunci pipeline audio di Chrome Android / iOS Safari
-      const buffer = ctx.createBuffer(1, 1, 22050);
-      const source = ctx.createBufferSource();
-      source.buffer = buffer;
-      source.connect(ctx.destination);
-      source.start(0);
-    } catch {
-      // ignore
+  const handleVisibilityRelease = () => {
+    if (document.visibilityState === 'hidden' && ringtoneTimer === null) {
+      releaseAudioContextNow();
     }
   };
 
-  window.addEventListener('pointerdown', unlockHandler, { passive: true });
-  window.addEventListener('touchstart', unlockHandler, { passive: true });
-  window.addEventListener('keydown', unlockHandler, { passive: true });
-
+  document.addEventListener('visibilitychange', handleVisibilityRelease);
   return () => {
-    unlockRegistered = false;
-    window.removeEventListener('pointerdown', unlockHandler);
-    window.removeEventListener('touchstart', unlockHandler);
-    window.removeEventListener('keydown', unlockHandler);
+    document.removeEventListener('visibilitychange', handleVisibilityRelease);
+    releaseAudioContextNow();
   };
 }
 
@@ -165,12 +194,13 @@ function playTelephoneBurst(ctx: AudioContext, startTime: number, duration: numb
  */
 export function startIncomingRingtone(): void {
   stopRingtone();
+  clearIdleReleaseTimer();
   const playPattern = () => {
     triggerAlertVibration([1000, 300, 1000]);
     const ctx = getSharedAudioContext();
     if (!ctx) return;
     if (ctx.state === 'suspended') {
-      void ctx.resume();
+      void ctx.resume().catch(() => {});
     }
     const now = ctx.currentTime;
     // Pola dering ganda khas telepon: ring 0.45s - jeda 0.18s - ring 0.55s
@@ -184,6 +214,7 @@ export function startIncomingRingtone(): void {
 
 export function startOutgoingRingback(): void {
   stopRingtone();
+  clearIdleReleaseTimer();
   const playPulse = () => {
     const ctx = getSharedAudioContext();
     if (!ctx) return;
@@ -222,19 +253,28 @@ export function stopRingtone(): void {
     ringtoneTimer = null;
   }
   stopVibration();
+  // Segera lepas AudioContext agar fokus audio perangkat Android/Bluetooth kembali normal
+  releaseAudioContextNow();
 }
 
 export function playMessagePop(incoming = false): void {
-  const ctx = getSharedAudioContext();
   if (incoming) {
-    triggerAlertVibration([500, 200, 500]);
+    triggerAlertVibration([300, 120, 300]);
   }
+  // Saat tab tidak terlihat dan bukan panggilan, cukup andalkan notifikasi sistem + getar
+  // agar tidak merebut fokus audio musik/Bluetooth di latar belakang
+  if (typeof document !== 'undefined' && document.visibilityState === 'hidden') {
+    return;
+  }
+  const ctx = getSharedAudioContext();
   if (!ctx) return;
   const now = ctx.currentTime;
   if (incoming) {
     playMarimbaNote(ctx, 659.25, now, 0.13, 0.24, 'triangle');
     playMarimbaNote(ctx, 987.77, now + 0.09, 0.2, 0.26, 'triangle');
+    scheduleIdleAudioContextRelease(480);
   } else {
     playMarimbaNote(ctx, 660, now, 0.09, 0.06, 'sine');
+    scheduleIdleAudioContextRelease(260);
   }
 }

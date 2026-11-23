@@ -45,6 +45,7 @@ import {
 import { Avatar } from './Avatar';
 import { VoiceNoteBubble } from './VoiceNoteBubble';
 import { LightboxMedia } from './MediaLightbox';
+import { activateActiveMediaSession, releaseActiveMediaSession } from '../lib/standby';
 
 interface ChatRoomProps {
   profile: UserProfile;
@@ -124,6 +125,7 @@ export const ChatRoom: React.FC<ChatRoomProps> = ({
   const mediaRecorderRef = useRef<MediaRecorder | null>(null);
   const audioChunksRef = useRef<Blob[]>([]);
   const recordStreamRef = useRef<MediaStream | null>(null);
+  const recordAudioCtxRef = useRef<AudioContext | null>(null);
   const recordTimerRef = useRef<number | null>(null);
   const waveRafRef = useRef<number | null>(null);
   const recordSecondsRef = useRef(0);
@@ -165,10 +167,22 @@ export const ChatRoom: React.FC<ChatRoomProps> = ({
       cancelAnimationFrame(waveRafRef.current);
       waveRafRef.current = null;
     }
+    if (recordAudioCtxRef.current) {
+      const ctx = recordAudioCtxRef.current;
+      recordAudioCtxRef.current = null;
+      try {
+        if (ctx.state !== 'closed') {
+          void ctx.close().catch(() => {});
+        }
+      } catch {
+        // ignore
+      }
+    }
     if (recordStreamRef.current) {
       recordStreamRef.current.getTracks().forEach((t) => t.stop());
       recordStreamRef.current = null;
     }
+    releaseActiveMediaSession('vox');
   };
 
   const handleTextChange = (val: string) => {
@@ -324,6 +338,12 @@ export const ChatRoom: React.FC<ChatRoomProps> = ({
       };
 
       recorder.start();
+      activateActiveMediaSession({
+        mode: 'vox',
+        statusText: 'Transmisi VOX Aktif',
+        peerName: contact.name,
+        onEndOrPause: () => stopVoiceRecording(false),
+      });
 
       // Timer
       recordTimerRef.current = window.setInterval(() => {
@@ -331,12 +351,13 @@ export const ChatRoom: React.FC<ChatRoomProps> = ({
         setRecordSeconds(recordSecondsRef.current);
       }, 1000);
 
-      // Live Web Audio Waveform Visualizer
+      // Live Web Audio Waveform Visualizer (ditutup penuh di cleanupRecorderResources agar tidak menahan fokus audio)
       try {
         const AudioCtx =
           window.AudioContext ||
           (window as unknown as { webkitAudioContext: typeof AudioContext }).webkitAudioContext;
         const ctx = new AudioCtx();
+        recordAudioCtxRef.current = ctx;
         const source = ctx.createMediaStreamSource(stream);
         const analyser = ctx.createAnalyser();
         analyser.fftSize = 64;
@@ -344,6 +365,7 @@ export const ChatRoom: React.FC<ChatRoomProps> = ({
         const dataArr = new Uint8Array(analyser.frequencyBinCount);
 
         const updateWave = () => {
+          if (!recordAudioCtxRef.current) return;
           analyser.getByteFrequencyData(dataArr);
           const avg = dataArr.reduce((acc, v) => acc + v, 0) / Math.max(1, dataArr.length);
           const barVal = Math.min(100, Math.max(16, Math.round((avg / 140) * 100)));

@@ -44,6 +44,13 @@ export interface ReplyPreview {
   text: string;
 }
 
+export interface EncryptedTextPayload {
+  alg: 'AES-256-GCM';
+  v: 1;
+  iv: string; // Base64 96-bit random IV
+  ct: string; // Base64 ciphertext + GCM auth tag
+}
+
 export interface ChatMessage {
   id: string;
   chatId: string; // Peer 6-digit ID or Group ID
@@ -51,6 +58,7 @@ export interface ChatMessage {
   senderName: string;
   type: MessageType;
   text?: string;
+  e2ee?: boolean; // True when protected with AES-256-GCM
   mediaId?: string; // Reference key in IndexedDB `media` store
   mediaData?: string; // Base64 Data URL for image, video, document, or voice
   fileName?: string;
@@ -124,6 +132,7 @@ export interface ChunkMessageMeta {
   senderName: string;
   msgType: 'image' | 'video' | 'document' | 'voice';
   text?: string;
+  encrypted?: EncryptedTextPayload;
   duration?: number;
   timestamp: number;
   replyTo?: ReplyPreview;
@@ -189,6 +198,7 @@ export type PeerPacket =
   | {
       kind: 'MESSAGE';
       message: ChatMessage;
+      encrypted?: EncryptedTextPayload;
       groupMeta?: GroupMeta;
     }
   | {
