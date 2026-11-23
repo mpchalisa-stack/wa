@@ -251,6 +251,58 @@ export default function App() {
   const handleRejectCallRef = useRef<
     (fallback?: { callerId?: string; callerName?: string; callId?: string; callType?: CallType }) => void
   >(() => {});
+  const remoteCallAudioRef = useRef<HTMLAudioElement | null>(null);
+  const isSpeakerOnRef = useRef<boolean>(true);
+
+  const getCallLocalStream = useCallback(async (callType: CallType): Promise<MediaStream> => {
+    const stream = await navigator.mediaDevices.getUserMedia({
+      audio: {
+        echoCancellation: true,
+        noiseSuppression: true,
+        autoGainControl: true,
+      },
+      video: callType === 'video' ? { facingMode: 'user' } : false,
+    });
+    stream.getAudioTracks().forEach((track) => {
+      track.enabled = true;
+    });
+    return stream;
+  }, []);
+
+  const attachRemoteCallAudioStream = useCallback((remoteStream: MediaStream | null) => {
+    const audioEl = remoteCallAudioRef.current;
+    if (!audioEl) return;
+
+    if (!remoteStream) {
+      audioEl.pause();
+      audioEl.srcObject = null;
+      return;
+    }
+
+    audioEl.srcObject = remoteStream;
+    audioEl.volume = 1;
+    audioEl.muted = !isSpeakerOnRef.current;
+
+    const tryPlay = () => {
+      const el = remoteCallAudioRef.current;
+      if (!el || !el.srcObject) return;
+      el.muted = !isSpeakerOnRef.current;
+      el.play().catch((err) => {
+        console.warn('[WattappsAU WebRTC Audio] Autoplay diblokir, mencoba ulang saat sentuhan:', err);
+        const unlockOnGesture = () => {
+          const currentEl = remoteCallAudioRef.current;
+          if (currentEl && currentEl.srcObject) {
+            currentEl.muted = !isSpeakerOnRef.current;
+            void currentEl.play().catch(() => {});
+          }
+        };
+        window.addEventListener('pointerdown', unlockOnGesture, { once: true, passive: true });
+        window.addEventListener('touchstart', unlockOnGesture, { once: true, passive: true });
+      });
+    };
+
+    tryPlay();
+  }, []);
 
   const isExitedRef = useRef<boolean>(isExited);
   const backGuardStateRef = useRef({
@@ -611,6 +663,8 @@ export default function App() {
 
       const rt = callRuntimeRef.current;
       callRuntimeRef.current = null;
+      isSpeakerOnRef.current = true;
+      attachRemoteCallAudioStream(null);
       setActiveCallUI(null);
       dismissIncomingCallNotification(rt?.peerId || pendingCall?.peerId || currentIncoming?.callerId);
 
@@ -840,6 +894,7 @@ export default function App() {
           unansweredCallTimerRef.current = null;
         }
         stopRingtone();
+        attachRemoteCallAudioStream(remoteStream);
         if (!callRuntimeRef.current.connectedAt) {
           callRuntimeRef.current.connectedAt = Date.now();
           if (callTimerRef.current !== null) {
@@ -1346,6 +1401,31 @@ export default function App() {
           facingMode: 'user',
         };
 
+        // Pasang listener stream/close/error SEBELUM memanggil mediaCall.answer() agar stream awal tidak terlewat
+        mediaCall.on('stream', (remoteStream) => {
+          if (callRuntimeRef.current?.callId !== callId) return;
+          attachRemoteCallAudioStream(remoteStream);
+          setActiveCallUI((prev) => (prev ? { ...prev, remoteStream } : null));
+        });
+
+        mediaCall.on('close', () => {
+          if (
+            callRuntimeRef.current?.callId === callId &&
+            callRuntimeRef.current.mediaCall === mediaCall
+          ) {
+            finalizeCall();
+          }
+        });
+
+        mediaCall.on('error', () => {
+          if (
+            callRuntimeRef.current?.callId === callId &&
+            callRuntimeRef.current.mediaCall === mediaCall
+          ) {
+            finalizeCall();
+          }
+        });
+
         mediaCall.answer(awaitingAnswer.localStream);
 
         setActiveCallUI({
@@ -1371,29 +1451,6 @@ export default function App() {
           const secs = Math.floor((Date.now() - callRuntimeRef.current.connectedAt) / 1000);
           setActiveCallUI((prev) => (prev ? { ...prev, duration: secs } : null));
         }, 1000);
-
-        mediaCall.on('stream', (remoteStream) => {
-          if (callRuntimeRef.current?.callId !== callId) return;
-          setActiveCallUI((prev) => (prev ? { ...prev, remoteStream } : null));
-        });
-
-        mediaCall.on('close', () => {
-          if (
-            callRuntimeRef.current?.callId === callId &&
-            callRuntimeRef.current.mediaCall === mediaCall
-          ) {
-            finalizeCall();
-          }
-        });
-
-        mediaCall.on('error', () => {
-          if (
-            callRuntimeRef.current?.callId === callId &&
-            callRuntimeRef.current.mediaCall === mediaCall
-          ) {
-            finalizeCall();
-          }
-        });
         return;
       }
 
@@ -1964,6 +2021,9 @@ export default function App() {
     });
 
     peerManagerRef.current = manager;
+    manager.setSavedContactIds(
+      contactsRef.current.filter((c) => !c.isGroup).map((c) => c.id)
+    );
     manager.connect();
 
     return () => {
@@ -1973,6 +2033,26 @@ export default function App() {
     // Re-init only when user ID or exited state changes (login/reset/exit)
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [profile?.id, isExited]);
+
+  // Sinkronkan daftar kontak tersimpan ke PeerManager untuk siklus PRESENCE_PING setiap 5 detik
+  useEffect(() => {
+    const manager = peerManagerRef.current;
+    if (!manager || !profile || isExited) return;
+    manager.setSavedContactIds(
+      contacts.filter((c) => !c.isGroup).map((c) => c.id)
+    );
+  }, [contacts, profile?.id, isExited]);
+
+  // Segera kirim ulang semua pesan chat pending (ikon jam pasir) begitu penerima berstatus Online
+  useEffect(() => {
+    if (!profile || isExited || pendingMessages.length === 0) return;
+    const recipientIds = new Set(pendingMessages.map((p) => p.recipientId));
+    recipientIds.forEach((recipientId) => {
+      if (onlinePeers[recipientId] || peerManagerRef.current?.isPeerOnline(recipientId)) {
+        void flushPendingForPeer(recipientId);
+      }
+    });
+  }, [onlinePeers, pendingMessages, profile?.id, isExited, flushPendingForPeer]);
 
   // Sinkronisasi real-time navigator.mediaSession dengan status koneksi PeerJS & logo resmi WattappsAU
   // tanpa mendaftarkan pemicu kontrol pemutar audio HP di layar kunci
@@ -3107,10 +3187,7 @@ export default function App() {
     }
 
     try {
-      const localStream = await navigator.mediaDevices.getUserMedia({
-        audio: true,
-        video: callType === 'video' ? { facingMode: 'user' } : false,
-      });
+      const localStream = await getCallLocalStream(callType);
 
       const mediaCall = manager.startMediaCall(peerId, localStream, {
         callId,
@@ -3127,6 +3204,7 @@ export default function App() {
         return;
       }
 
+      isSpeakerOnRef.current = true;
       callRuntimeRef.current = {
         callId,
         peerId,
@@ -3140,6 +3218,9 @@ export default function App() {
         connectedAt: null,
         facingMode: 'user',
       };
+
+      // Pasang listener stream/close/error segera setelah peer.call() agar audio remote tidak terlewat
+      bindOutgoingMediaCall(callId, mediaCall);
 
       setActiveCallUI({
         callId,
@@ -3157,7 +3238,6 @@ export default function App() {
       });
 
       startOutgoingRingback();
-      bindOutgoingMediaCall(callId, mediaCall);
 
       if (unansweredCallTimerRef.current !== null) {
         window.clearTimeout(unansweredCallTimerRef.current);
@@ -3212,16 +3292,22 @@ export default function App() {
     // Kasus 1: MediaConnection sudah masuk secara normal
     if (rt) {
       try {
-        const localStream = await navigator.mediaDevices.getUserMedia({
-          audio: true,
-          video: rt.callType === 'video' ? { facingMode: 'user' } : false,
-        });
+        const localStream = await getCallLocalStream(rt.callType);
 
         stopRingtone();
         dismissIncomingCallNotification(rt.peerId);
         setPersistentIncomingCall(null);
+        isSpeakerOnRef.current = true;
         rt.localStream = localStream;
         rt.connectedAt = Date.now();
+
+        // Pasang listener stream SEBELUM memanggil rt.mediaCall.answer(localStream)
+        rt.mediaCall.on('stream', (remoteStream) => {
+          if (callRuntimeRef.current?.callId !== rt.callId) return;
+          attachRemoteCallAudioStream(remoteStream);
+          setActiveCallUI((prev) => (prev ? { ...prev, remoteStream } : null));
+        });
+
         rt.mediaCall.answer(localStream);
 
         setActiveCallUI((prev) =>
@@ -3236,11 +3322,6 @@ export default function App() {
           const secs = Math.floor((Date.now() - callRuntimeRef.current.connectedAt) / 1000);
           setActiveCallUI((prev) => (prev ? { ...prev, duration: secs } : null));
         }, 1000);
-
-        rt.mediaCall.on('stream', (remoteStream) => {
-          if (callRuntimeRef.current?.callId !== rt.callId) return;
-          setActiveCallUI((prev) => (prev ? { ...prev, remoteStream } : null));
-        });
       } catch {
         if (isAutoAccept) {
           // Jangan tolak panggilan jika browser meminta sentuhan langsung; biarkan layar penuh WhatsApp tetap terbuka
@@ -3256,10 +3337,7 @@ export default function App() {
     // Kasus 2: Pengguna mengetuk Jawab pada pop-up pendingCall sebelum MediaConnection baru tiba dari penelepon
     if (pending && me) {
       try {
-        const localStream = await navigator.mediaDevices.getUserMedia({
-          audio: true,
-          video: pending.callType === 'video' ? { facingMode: 'user' } : false,
-        });
+        const localStream = await getCallLocalStream(pending.callType);
 
         stopRingtone();
         dismissIncomingCallNotification(pending.peerId);
@@ -3465,7 +3543,19 @@ export default function App() {
   };
 
   const handleToggleSpeaker = () => {
-    setActiveCallUI((prev) => (prev ? { ...prev, isSpeakerOn: !prev.isSpeakerOn } : null));
+    setActiveCallUI((prev) => {
+      if (!prev) return null;
+      const nextSpeaker = !prev.isSpeakerOn;
+      isSpeakerOnRef.current = nextSpeaker;
+      const audioEl = remoteCallAudioRef.current;
+      if (audioEl) {
+        audioEl.muted = !nextSpeaker;
+        if (nextSpeaker && audioEl.srcObject) {
+          void audioEl.play().catch(() => {});
+        }
+      }
+      return { ...prev, isSpeakerOn: nextSpeaker };
+    });
   };
 
   // Toggle Mode Siaga (Service Worker + Auto-Reconnect PeerJS + Screen Wake Lock tanpa membajak fokus audio Android/Bluetooth)
@@ -4223,6 +4313,14 @@ export default function App() {
           {toast}
         </div>
       )}
+
+      {/* Elemen audio panggilan WebRTC persisten agar suara remoteStream selalu terdengar jelas tanpa terputus */}
+      <audio
+        ref={remoteCallAudioRef}
+        autoPlay
+        playsInline
+        className="sr-only pointer-events-none"
+      />
 
       <OfflineIndicator />
     </div>

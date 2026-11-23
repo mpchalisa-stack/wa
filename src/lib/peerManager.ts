@@ -32,45 +32,51 @@ const FILE_ACK_RETRY_MS = 3000;
 /** Batas maksimal auto-retry FILE_END / missingChunks */
 const MAX_ACK_RETRIES = 3;
 
-/** Jeda minimal 15 detik sebelum mencoba reconnect peer.connect() lagi jika gagal (anti rate-limit 0.peerjs.com) */
-const RECONNECT_COOLDOWN_MS = 15000;
+/** Jeda minimal 10 detik sebelum mencoba reconnect peer.connect() lagi untuk kontak offline */
+const RECONNECT_COOLDOWN_MS = 10000;
 
-/** Interval heartbeat PING ringan sekali tiap 12 detik untuk mencegah signaling socket & DataChannel idle */
-const HEARTBEAT_INTERVAL_MS = 12000;
+/** Interval PRESENCE_PING & heartbeat ringan setiap 5 detik agar status Online/Offline sinkron real-time */
+const HEARTBEAT_INTERVAL_MS = 5000;
 
 /** Jeda anti-spam minimal 3 detik saat menjalankan wakeAndSyncPeer() pada visibilitychange / focus */
 const WAKE_SYNC_COOLDOWN_MS = 3000;
 
-/** Timeout tunggu balasan PONG (2 detik) untuk mendeteksi zombie socket saat kembali dari latar belakang */
+/** Timeout tunggu balasan PONG/PRESENCE_ACK (2 detik) untuk mendeteksi zombie socket saat kembali dari latar belakang */
 const ZOMBIE_PING_TIMEOUT_MS = 2000;
 
-/** Batas waktu tanpa aktivitas/PONG pada DataChannel (35 detik) sebelum dianggap mati diam-diam */
-const STALE_CONNECTION_MS = 35000;
+/** Batas waktu tanpa balasan/aktivitas pada DataChannel (18 detik = >3 siklus ping 5 detik) sebelum dianggap offline */
+const STALE_CONNECTION_MS = 18000;
 
 /**
- * Konfigurasi ICE Servers untuk WebRTC (DataChannel & Panggilan Suara/Video).
- * Menggunakan server STUN publik Google secara default.
- *
- * Untuk menembus jaringan seluler 4G/5G dengan Symmetric NAT atau firewall ketat,
- * tambahkan server TURN (misal: Coturn, Metered.ca, Twilio, atau Cloudflare TURN)
- * di bawah komentar berikut:
+ * Konfigurasi ICE / STUN + TURN Server lengkap untuk WebRTC (DataChannel & Panggilan Suara/Video).
+ * Menyertakan STUN Google serta relay TURN publik gratis OpenRelay / Metered (UDP, TCP, TLS port 80 & 443)
+ * agar koneksi chat dan suara panggilan tetap tembus di jaringan data seluler 4G/5G (Symmetric NAT / CGNAT).
  */
 export const ICE_SERVERS: RTCIceServer[] = [
   { urls: 'stun:stun.l.google.com:19302' },
   { urls: 'stun:stun1.l.google.com:19302' },
   { urls: 'stun:stun2.l.google.com:19302' },
-  /*
-  // CONTOH KONFIGURASI TURN SERVER (hapus komentar & isi kredensial Anda):
+  { urls: 'stun:stun.relay.metered.ca:80' },
   {
-    urls: [
-      'turn:standard.relay.metered.ca:80',
-      'turn:standard.relay.metered.ca:443',
-      'turns:standard.relay.metered.ca:443?transport=tcp'
-    ],
-    username: 'YOUR_TURN_USERNAME',
-    credential: 'YOUR_TURN_PASSWORD',
+    urls: 'turn:openrelay.metered.ca:80',
+    username: 'openrelayproject',
+    credential: 'openrelayproject',
   },
-  */
+  {
+    urls: 'turn:openrelay.metered.ca:443',
+    username: 'openrelayproject',
+    credential: 'openrelayproject',
+  },
+  {
+    urls: 'turn:openrelay.metered.ca:443?transport=tcp',
+    username: 'openrelayproject',
+    credential: 'openrelayproject',
+  },
+  {
+    urls: 'turns:openrelay.metered.ca:443?transport=tcp',
+    username: 'openrelayproject',
+    credential: 'openrelayproject',
+  },
 ];
 
 export interface ReassembledFileTransfer {
@@ -277,6 +283,7 @@ export class WA6PeerManager {
   private awaitingFileAcks = new Map<string, PendingAckTransfer>();
   private lastConnectAttempt = new Map<string, number>();
   private lastPeerActivity = new Map<string, number>();
+  private savedContactIds = new Set<string>();
   private lastWakeSyncAt = 0;
   private wakeSyncInFlight = false;
   private heartbeatTimer: number | null = null;
@@ -286,6 +293,50 @@ export class WA6PeerManager {
   constructor(profile: UserProfile, callbacks: PeerManagerCallbacks) {
     this.profile = profile;
     this.callbacks = callbacks;
+  }
+
+  /**
+   * Menyimpan daftar ID kontak 1:1 tersimpan agar siklus PRESENCE_PING 5 detik
+   * selalu memeriksa kehadiran seluruh kontak dan memicu pengiriman ulang chat pending.
+   */
+  public setSavedContactIds(contactIds: string[]): void {
+    const nextSet = new Set<string>();
+    for (const id of contactIds) {
+      if (id && id !== this.profile.id) {
+        nextSet.add(id);
+      }
+    }
+    this.savedContactIds = nextSet;
+
+    // Jika PeerJS sudah online, segera buka/ping kontak baru yang belum tersambung
+    if (!this.destroyed && this.peer && !this.peer.destroyed && this.peer.open) {
+      this.savedContactIds.forEach((contactId) => {
+        const conn = this.connections.get(contactId);
+        if (conn && isConnectionLive(conn)) {
+          this.sendPresencePacket(conn, 'PRESENCE_PING');
+        } else {
+          this.ensureConnection(contactId, false);
+        }
+      });
+    }
+  }
+
+  private sendPresencePacket(
+    conn: DataConnection,
+    type: 'PRESENCE_PING' | 'PRESENCE_ACK'
+  ): boolean {
+    if (!isConnectionLive(conn)) return false;
+    try {
+      conn.send({
+        type,
+        status: 'online',
+        fromId: this.profile.id,
+        ts: Date.now(),
+      });
+      return true;
+    } catch {
+      return false;
+    }
   }
 
   private resolvePongWaiters(peerSixId: string): void {
@@ -504,6 +555,7 @@ export class WA6PeerManager {
       debug: 0,
       config: {
         iceServers: ICE_SERVERS,
+        iceCandidatePoolSize: 10,
         // Enkripsi end-to-end bawaan WebRTC (DTLS/SRTP) untuk seluruh aliran audio/video & DataChannel
         bundlePolicy: 'max-bundle',
         rtcpMuxPolicy: 'require',
@@ -516,10 +568,15 @@ export class WA6PeerManager {
       if (this.destroyed) return;
       this.callbacks.onStatusChange('online');
       this.startHeartbeatLoop();
+      // Langsung sambungkan seluruh kontak tersimpan saat broker signaling siap
+      this.savedContactIds.forEach((contactId) => {
+        this.ensureConnection(contactId, false);
+      });
     });
 
     peer.on('connection', (conn) => {
-      this.attachConnection(conn);
+      // Koneksi masuk dua arah: segera simpan conn aktif, balas PRESENCE_ACK, dan tandai pengirim Online di UI
+      this.attachConnection(conn, true);
     });
 
     peer.on('call', (mediaCall) => {
@@ -571,9 +628,11 @@ export class WA6PeerManager {
   }
 
   /**
-   * Heartbeat ringan setiap 12 detik agar socket signaling PeerJS & DataChannel WebRTC tidak dianggap idle:
-   * 1. Kirim frame HEARTBEAT resmi ke WebSocket signaling PeerJS bila masih terbuka (atau pulihkan jika terputus).
-   * 2. Kirim paket PING ringan pada setiap DataConnection terbuka & deteksi koneksi zombie yang diam > 35 detik.
+   * Siklus PRESENCE_PING & heartbeat ringan setiap 5 detik:
+   * 1. Menjaga WebSocket signaling PeerJS tetap hidup (anti-idle timeout NAT/operator seluler).
+   * 2. Mengirim PRESENCE_PING ke seluruh koneksi aktif & mencoba menyambungkan kontak tersimpan yang belum terbuka.
+   * 3. Jika koneksi terbuka atau menerima balasan, tandai Online dan picu onPeerReady untuk menguras pesan pending.
+   * 4. Mendeteksi koneksi macet/zombie (> 18 detik tanpa balasan) lalu menandai Offline & menyambung ulang.
    */
   private startHeartbeatLoop(): void {
     if (this.heartbeatTimer !== null) {
@@ -611,10 +670,18 @@ export class WA6PeerManager {
         }
       }
 
-      // (2) Kirim PING ringan pada seluruh DataConnection WebRTC yang aktif
+      // (2) Kirim PRESENCE_PING ke seluruh DataConnection WebRTC yang aktif
       const now = Date.now();
+      const checkedPeers = new Set<string>();
+
       this.connections.forEach((conn, peerSixId) => {
+        checkedPeers.add(peerSixId);
         if (!isConnectionLive(conn)) {
+          // Jangan hapus bila masih baru mencoba handshake (< 8 detik)
+          const lastTry = this.lastConnectAttempt.get(peerSixId) ?? 0;
+          if (!conn.open && now - lastTry < CONNECTION_OPEN_TIMEOUT_MS) {
+            return;
+          }
           this.connections.delete(peerSixId);
           this.lastPeerActivity.delete(peerSixId);
           this.callbacks.onPeerPresence(peerSixId, false);
@@ -623,24 +690,31 @@ export class WA6PeerManager {
 
         const lastSeen = this.lastPeerActivity.get(peerSixId);
         if (lastSeen && now - lastSeen > STALE_CONNECTION_MS) {
-          // Koneksi tidak membalas beberapa siklus heartbeat -> tutup & sambung ulang bersih
+          // Koneksi tidak membalas beberapa siklus PRESENCE_PING -> tandai Offline & sambung ulang bersih
           this.lastPeerActivity.delete(peerSixId);
           this.forceReconnectPeer(peerSixId, conn);
           return;
         }
 
-        try {
-          conn.send({
-            kind: 'PING',
-            fromId: this.profile.id,
-            ts: now,
-          } satisfies PeerPacket);
-        } catch {
+        const sent = this.sendPresencePacket(conn, 'PRESENCE_PING');
+        if (sent) {
+          this.callbacks.onPeerPresence(peerSixId, true);
+          this.callbacks.onPeerReady?.(peerSixId);
+        } else {
           this.connections.delete(peerSixId);
           this.lastPeerActivity.delete(peerSixId);
           this.callbacks.onPeerPresence(peerSixId, false);
         }
       });
+
+      // (3) Untuk seluruh kontak tersimpan yang belum memiliki koneksi aktif, coba sambungkan berkala (hormati cooldown)
+      if (this.peer && !this.peer.destroyed && this.peer.open) {
+        this.savedContactIds.forEach((contactId) => {
+          if (!checkedPeers.has(contactId)) {
+            this.ensureConnection(contactId, false);
+          }
+        });
+      }
     }, HEARTBEAT_INTERVAL_MS);
   }
 
@@ -1238,13 +1312,19 @@ export class WA6PeerManager {
     }
   }
 
-  private attachConnection(conn: DataConnection): void {
+  private attachConnection(conn: DataConnection, isIncoming = false): void {
     const peerSixId = fromFullPeerId(conn.peer);
 
-    // Jangan timpa koneksi lain yang sudah aktif sebelum koneksi baru ini benar-benar terbuka
+    // Koneksi masuk dua arah: segera simpan conn ke daftar koneksi aktif (kecuali sudah ada jalur lain yang hidup & bukan koneksi masuk baru)
     const existing = this.connections.get(peerSixId);
-    if (!isConnectionLive(existing)) {
+    if (isIncoming || !isConnectionLive(existing)) {
       this.connections.set(peerSixId, conn);
+    }
+
+    // Pada koneksi masuk, langsung tandai aktivitas & kehadiran Online di UI tanpa menunggu koneksi keluar baru
+    if (isIncoming) {
+      this.lastPeerActivity.set(peerSixId, Date.now());
+      this.callbacks.onPeerPresence(peerSixId, true);
     }
 
     const onOpen = () => {
@@ -1258,6 +1338,10 @@ export class WA6PeerManager {
         this.openWaiters.delete(peerSixId);
         waiters.forEach((resolveFn) => resolveFn(conn));
       }
+
+      // Langsung kirim PRESENCE_ACK (pada koneksi masuk) atau PRESENCE_PING (pada koneksi keluar)
+      // agar kedua belah pihak seketika sinkron berstatus Online dua arah
+      this.sendPresencePacket(conn, isIncoming ? 'PRESENCE_ACK' : 'PRESENCE_PING');
 
       // Kirim handshake HELLO berisi profil kita
       try {
@@ -1296,7 +1380,7 @@ export class WA6PeerManager {
         }
       }
 
-      // Beri tahu aplikasi agar segera menguras antrean pendingMessages untuk peer ini
+      // Beri tahu aplikasi agar segera menguras antrean pendingMessages (ikon jam pasir) untuk peer ini
       this.callbacks.onPeerReady?.(peerSixId);
     };
 
@@ -1310,12 +1394,31 @@ export class WA6PeerManager {
       const data = parseIncomingData(rawData);
       if (!data || typeof data !== 'object') return;
 
-      // Pastikan koneksi pengirim tercatat aktif
+      // Pastikan koneksi pengirim tercatat sebagai jalur aktif dua arah
       if (isConnectionLive(conn) && this.connections.get(peerSixId) !== conn) {
         this.connections.set(peerSixId, conn);
       }
 
       this.lastPeerActivity.set(peerSixId, Date.now());
+
+      // Handle paket kehadiran dua arah: PRESENCE_PING & PRESENCE_ACK
+      if ('type' in data) {
+        const presenceType = (data as { type?: string }).type;
+        if (presenceType === 'PRESENCE_PING') {
+          this.connections.set(peerSixId, conn);
+          this.callbacks.onPeerPresence(peerSixId, true);
+          this.sendPresencePacket(conn, 'PRESENCE_ACK');
+          this.callbacks.onPeerReady?.(peerSixId);
+          return;
+        }
+        if (presenceType === 'PRESENCE_ACK') {
+          this.connections.set(peerSixId, conn);
+          this.callbacks.onPeerPresence(peerSixId, true);
+          this.resolvePongWaiters(peerSixId);
+          this.callbacks.onPeerReady?.(peerSixId);
+          return;
+        }
+      }
 
       // Handle paket chunking & ACK file WebRTC (JSON string / object)
       if (isFileChunkPacket(data)) {
@@ -1339,6 +1442,7 @@ export class WA6PeerManager {
           } catch {
             // ignore
           }
+          this.sendPresencePacket(conn, 'PRESENCE_ACK');
           this.callbacks.onPeerReady?.(peerSixId);
           return;
         }
@@ -1359,6 +1463,7 @@ export class WA6PeerManager {
     conn.on('close', () => {
       if (this.connections.get(peerSixId) === conn) {
         this.connections.delete(peerSixId);
+        this.lastPeerActivity.delete(peerSixId);
         this.callbacks.onPeerPresence(peerSixId, false);
       }
     });
@@ -1366,6 +1471,7 @@ export class WA6PeerManager {
     conn.on('error', () => {
       if (this.connections.get(peerSixId) === conn) {
         this.connections.delete(peerSixId);
+        this.lastPeerActivity.delete(peerSixId);
         this.callbacks.onPeerPresence(peerSixId, false);
       }
     });

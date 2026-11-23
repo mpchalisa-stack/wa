@@ -59,7 +59,6 @@ export const CallOverlay: React.FC<CallOverlayProps> = ({
   onToggleSpeaker,
 }) => {
   const remoteVideoRef = useRef<HTMLVideoElement>(null);
-  const remoteAudioRef = useRef<HTMLAudioElement>(null);
   const localVideoRef = useRef<HTMLVideoElement>(null);
   const [shakeStopped, setShakeStopped] = useState(false);
   const [minimizedBanner, setMinimizedBanner] = useState(false);
@@ -97,16 +96,11 @@ export const CallOverlay: React.FC<CallOverlayProps> = ({
     });
   }, [call.callId, call.phase, call.callType, call.peerName, onReject, onEnd]);
 
-  // Pastikan seluruh elemen audio/video & MediaSession dibersihkan penuh saat CallOverlay ditutup
+  // Pastikan seluruh elemen video & MediaSession dibersihkan penuh saat CallOverlay ditutup
   useEffect(() => {
-    const audioEl = remoteAudioRef.current;
     const remoteVid = remoteVideoRef.current;
     const localVid = localVideoRef.current;
     return () => {
-      if (audioEl) {
-        audioEl.pause();
-        audioEl.srcObject = null;
-      }
       if (remoteVid) {
         remoteVid.pause();
         remoteVid.srcObject = null;
@@ -122,15 +116,11 @@ export const CallOverlay: React.FC<CallOverlayProps> = ({
   useEffect(() => {
     if (remoteVideoRef.current && call.remoteStream) {
       remoteVideoRef.current.srcObject = call.remoteStream;
-      remoteVideoRef.current.muted = !call.isSpeakerOn;
+      // Audio ditangani oleh elemen <audio autoplay playsinline> persisten di root App.tsx agar bebas gema
+      remoteVideoRef.current.muted = true;
       void remoteVideoRef.current.play().catch(() => {});
     }
-    if (remoteAudioRef.current && call.remoteStream) {
-      remoteAudioRef.current.srcObject = call.remoteStream;
-      remoteAudioRef.current.muted = !call.isSpeakerOn;
-      void remoteAudioRef.current.play().catch(() => {});
-    }
-  }, [call.remoteStream, call.isSpeakerOn]);
+  }, [call.remoteStream]);
 
   useEffect(() => {
     if (localVideoRef.current && call.localStream) {
@@ -260,15 +250,13 @@ export const CallOverlay: React.FC<CallOverlayProps> = ({
 
   return (
     <div className="fixed inset-0 z-[150] bg-[#0b141a] text-white flex flex-col justify-between overflow-hidden select-none">
-      {/* Remote Audio Element (always active for voice/video audio playback) */}
-      <audio ref={remoteAudioRef} autoPlay playsInline className="hidden" />
-
       {/* Background / Remote Full-Screen Video */}
       {showRemoteVideo ? (
         <video
           ref={remoteVideoRef}
           autoPlay
           playsInline
+          muted
           className="absolute inset-0 w-full h-full object-cover bg-black"
         />
       ) : (
