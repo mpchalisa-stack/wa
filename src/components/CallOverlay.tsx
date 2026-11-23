@@ -29,6 +29,7 @@ export interface ActiveCallUIState {
   isMuted: boolean;
   isCameraOff: boolean;
   isSpeakerOn: boolean;
+  connectionMode?: 'connecting' | 'direct' | 'relay' | 'reconnecting_relay';
   localStream: MediaStream | null;
   remoteStream: MediaStream | null;
 }
@@ -43,6 +44,7 @@ interface CallOverlayProps {
   onToggleCamera: () => void;
   onSwitchCamera: () => void;
   onToggleSpeaker: () => void;
+  onRefreshAudio?: () => void;
 }
 
 const WHATSAPP_DARK_PATTERN_SVG = `url("data:image/svg+xml,%3Csvg width='120' height='120' viewBox='0 0 120 120' xmlns='http://www.w3.org/2000/svg'%3E%3Cg fill='none' stroke='%23ffffff' stroke-opacity='0.045' stroke-width='1.1'%3E%3Ccircle cx='24' cy='24' r='9'/%3E%3Cpath d='M78 16l10 6v12l-10 6-10-6V22z'/%3E%3Cpath d='M18 76h18v12H24l-6 5z'/%3E%3Cpath d='M76 78c4-5 12-5 16 0M80 84c2-2.5 6-2.5 8 0'/%3E%3Ccircle cx='84' cy='90' r='1.5' fill='%23ffffff' fill-opacity='0.06'/%3E%3Cpath d='M52 48l6 6-6 6-6-6z'/%3E%3C/g%3E%3C/svg%3E")`;
@@ -57,6 +59,7 @@ export const CallOverlay: React.FC<CallOverlayProps> = ({
   onToggleCamera,
   onSwitchCamera,
   onToggleSpeaker,
+  onRefreshAudio,
 }) => {
   const remoteVideoRef = useRef<HTMLVideoElement>(null);
   const localVideoRef = useRef<HTMLVideoElement>(null);
@@ -402,6 +405,28 @@ export const CallOverlay: React.FC<CallOverlayProps> = ({
                 ID: {formatSixDigitId(call.peerId)}
               </div>
             )}
+            {call.connectionMode && (
+              <div className="mt-2 inline-flex items-center gap-1.5 rounded-full bg-white/10 border border-white/15 px-3 py-1 text-[11px] font-medium tracking-wide text-slate-100">
+                <span
+                  className={`w-2 h-2 rounded-full ${
+                    call.connectionMode === 'relay'
+                      ? 'bg-amber-400'
+                      : call.connectionMode === 'direct'
+                      ? 'bg-emerald-400'
+                      : 'bg-sky-400 animate-pulse'
+                  }`}
+                />
+                <span>
+                  {call.connectionMode === 'relay'
+                    ? 'TURN Relay'
+                    : call.connectionMode === 'direct'
+                    ? 'Direct P2P'
+                    : call.connectionMode === 'reconnecting_relay'
+                    ? 'Beralih ke TURN Relay...'
+                    : 'Menghubungkan ICE...'}
+                </span>
+              </div>
+            )}
           </div>
 
           {!showRemoteVideo && (
@@ -463,7 +488,20 @@ export const CallOverlay: React.FC<CallOverlayProps> = ({
             </div>
           </div>
         ) : (
-          <div className="max-w-md mx-auto bg-[#1F2C34]/90 backdrop-blur-md rounded-3xl px-4 py-3.5 flex items-center justify-around shadow-2xl border border-white/10">
+          <div className="max-w-md mx-auto flex flex-col items-center gap-3">
+            {onRefreshAudio && (
+              <button
+                type="button"
+                onClick={onRefreshAudio}
+                className="inline-flex items-center gap-2 rounded-full bg-[#1F2C34]/90 hover:bg-[#2A3942] active:scale-95 border border-emerald-400/35 px-4 py-2 text-xs font-semibold text-emerald-200 shadow-lg backdrop-blur-md transition-all cursor-pointer"
+                aria-label="Refresh Audio atau Speaker"
+                title="Segarkan pemutaran suara, speaker, dan jalur ICE panggilan"
+              >
+                <RefreshCw className="w-3.5 h-3.5 text-emerald-400" />
+                <span>Refresh Audio / Speaker</span>
+              </button>
+            )}
+            <div className="w-full bg-[#1F2C34]/90 backdrop-blur-md rounded-3xl px-4 py-3.5 flex items-center justify-around shadow-2xl border border-white/10">
             {/* Speaker */}
             <div className="flex flex-col items-center gap-1">
               <button
@@ -548,6 +586,7 @@ export const CallOverlay: React.FC<CallOverlayProps> = ({
                 <PhoneOff className="w-5 h-5" />
               </button>
               <span className="text-[11px] font-medium text-rose-300">Akhiri</span>
+            </div>
             </div>
           </div>
         )}

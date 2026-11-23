@@ -268,7 +268,7 @@ export type PeerPacket =
     }
   | {
       kind: 'CALL_SIGNAL';
-      action: 'ringing' | 'accept' | 'reject' | 'end' | 'busy';
+      action: 'ringing' | 'accept' | 'reject' | 'end' | 'busy' | 'relay_fallback';
       callId: string;
       callType: CallType;
       fromId: string;

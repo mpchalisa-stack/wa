@@ -60,7 +60,10 @@ import {
   PeerTransportMode,
   ReassembledFileTransfer,
   WA6PeerManager,
+  ensureLocalAudioTracksAttached,
   fromFullPeerId,
+  getMediaCallPeerConnection,
+  inspectMediaCallTransport,
   normalizePeerId,
 } from './lib/peerManager';
 import {
@@ -123,9 +126,12 @@ interface ActiveCallRuntime {
   direction: 'incoming' | 'outgoing';
   mediaCall: MediaConnection;
   localStream: MediaStream | null;
+  remoteStream?: MediaStream | null;
   startedAt: number;
   connectedAt: number | null;
   facingMode: 'user' | 'environment';
+  relayFallbackUsed?: boolean;
+  startedWithRelay?: boolean;
 }
 
 interface PendingIncomingCall {
@@ -262,6 +268,9 @@ export default function App() {
   >(() => {});
   const remoteCallAudioRef = useRef<HTMLAudioElement | null>(null);
   const isSpeakerOnRef = useRef<boolean>(true);
+  const callIceWatchdogRef = useRef<number | null>(null);
+  const callRelayWaitTimerRef = useRef<number | null>(null);
+  const upgradeActiveCallToRelayRef = useRef<(callId: string, reason: string) => void>(() => {});
 
   const getCallLocalStream = useCallback(async (callType: CallType): Promise<MediaStream> => {
     const stream = await navigator.mediaDevices.getUserMedia({
@@ -288,19 +297,30 @@ export default function App() {
       return;
     }
 
+    // Pastikan seluruh track audio lawan dalam keadaan aktif
+    remoteStream.getAudioTracks().forEach((track) => {
+      track.enabled = true;
+    });
+
+    if (callRuntimeRef.current) {
+      callRuntimeRef.current.remoteStream = remoteStream;
+    }
+
     audioEl.srcObject = remoteStream;
-    audioEl.volume = 1;
+    audioEl.volume = 1.0;
     audioEl.muted = !isSpeakerOnRef.current;
 
     const tryPlay = () => {
       const el = remoteCallAudioRef.current;
       if (!el || !el.srcObject) return;
+      el.volume = 1.0;
       el.muted = !isSpeakerOnRef.current;
       el.play().catch((err) => {
         console.warn('[WattappsAU WebRTC Audio] Autoplay diblokir, mencoba ulang saat sentuhan:', err);
         const unlockOnGesture = () => {
           const currentEl = remoteCallAudioRef.current;
           if (currentEl && currentEl.srcObject) {
+            currentEl.volume = 1.0;
             currentEl.muted = !isSpeakerOnRef.current;
             void currentEl.play().catch(() => {});
           }
@@ -309,6 +329,19 @@ export default function App() {
         window.addEventListener('touchstart', unlockOnGesture, { once: true, passive: true });
       });
     };
+
+    // Paksa pemutaran ulang jika track audio masuk belakangan atau baru keluar dari status muted WebRTC
+    remoteStream.onaddtrack = () => {
+      remoteStream.getAudioTracks().forEach((track) => {
+        track.enabled = true;
+      });
+      tryPlay();
+    };
+    remoteStream.getAudioTracks().forEach((track) => {
+      track.onunmute = () => {
+        tryPlay();
+      };
+    });
 
     tryPlay();
   }, []);
@@ -667,6 +700,14 @@ export default function App() {
         window.clearTimeout(unansweredCallTimerRef.current);
         unansweredCallTimerRef.current = null;
       }
+      if (callIceWatchdogRef.current !== null) {
+        window.clearTimeout(callIceWatchdogRef.current);
+        callIceWatchdogRef.current = null;
+      }
+      if (callRelayWaitTimerRef.current !== null) {
+        window.clearTimeout(callRelayWaitTimerRef.current);
+        callRelayWaitTimerRef.current = null;
+      }
       stopRingtone();
       if (callTimerRef.current !== null) {
         window.clearInterval(callTimerRef.current);
@@ -909,16 +950,136 @@ export default function App() {
     [setPersistentIncomingCall]
   );
 
-  // Pasang listener stream/close/error pada panggilan keluar (dipakai saat awal memanggil & saat re-dial setelah lawan bangun)
+  // Pantau ICE RTCPeerConnection panggilan:
+  // - Deteksi Direct P2P vs TURN Relay untuk label UI
+  // - Jika iceConnectionState === 'failed' | 'disconnected' atau tidak mencapai 'connected' dalam 4 detik setelah negosiasi dimulai,
+  //   otomatis restart ICE / beralih ke mode relai (iceTransportPolicy: 'relay') untuk menembus AP Isolation / Hairpin NAT hotspot.
+  const monitorMediaCallIce = useCallback(
+    (callId: string, mediaCall: MediaConnection, startedWithRelay = false, startWatchdogNow = false) => {
+      if (callIceWatchdogRef.current !== null) {
+        window.clearTimeout(callIceWatchdogRef.current);
+        callIceWatchdogRef.current = null;
+      }
+
+      let watchdogStarted = false;
+      const updateTransportLabel = async () => {
+        if (callRuntimeRef.current?.callId !== callId || callRuntimeRef.current.mediaCall !== mediaCall) {
+          return;
+        }
+        const mode = await inspectMediaCallTransport(mediaCall, startedWithRelay);
+        if (callRuntimeRef.current?.callId !== callId || callRuntimeRef.current.mediaCall !== mediaCall) {
+          return;
+        }
+        if (mode) {
+          setActiveCallUI((prev) => (prev ? { ...prev, connectionMode: mode } : null));
+        }
+      };
+
+      const startFourSecondWatchdog = () => {
+        if (watchdogStarted || startedWithRelay) return;
+        watchdogStarted = true;
+        if (callIceWatchdogRef.current !== null) {
+          window.clearTimeout(callIceWatchdogRef.current);
+        }
+        callIceWatchdogRef.current = window.setTimeout(() => {
+          callIceWatchdogRef.current = null;
+          const rt = callRuntimeRef.current;
+          if (!rt || rt.callId !== callId || rt.mediaCall !== mediaCall) return;
+          const pcNow = getMediaCallPeerConnection(mediaCall);
+          const state = pcNow?.iceConnectionState;
+          if (state !== 'connected' && state !== 'completed') {
+            try {
+              pcNow?.restartIce?.();
+            } catch {
+              // ignore
+            }
+            upgradeActiveCallToRelayRef.current(
+              callId,
+              `ICE tidak connected dalam 4 detik (state: ${state || 'unknown'})`
+            );
+          } else {
+            void updateTransportLabel();
+          }
+        }, 4000);
+      };
+
+      const attachPcListeners = () => {
+        const pc = getMediaCallPeerConnection(mediaCall);
+        if (!pc) return false;
+
+        const handleIceStateChange = () => {
+          const rt = callRuntimeRef.current;
+          if (!rt || rt.callId !== callId || rt.mediaCall !== mediaCall) {
+            pc.removeEventListener('iceconnectionstatechange', handleIceStateChange);
+            return;
+          }
+          const iceState = pc.iceConnectionState;
+          if (iceState === 'checking') {
+            startFourSecondWatchdog();
+          } else if (iceState === 'connected' || iceState === 'completed') {
+            if (callIceWatchdogRef.current !== null) {
+              window.clearTimeout(callIceWatchdogRef.current);
+              callIceWatchdogRef.current = null;
+            }
+            void updateTransportLabel();
+          } else if (iceState === 'failed' || iceState === 'disconnected') {
+            if (callIceWatchdogRef.current !== null) {
+              window.clearTimeout(callIceWatchdogRef.current);
+              callIceWatchdogRef.current = null;
+            }
+            try {
+              pc.restartIce?.();
+            } catch {
+              // ignore
+            }
+            if (!startedWithRelay) {
+              upgradeActiveCallToRelayRef.current(callId, `iceConnectionState === ${iceState}`);
+            }
+          }
+        };
+
+        pc.addEventListener('iceconnectionstatechange', handleIceStateChange);
+
+        if (pc.iceConnectionState === 'connected' || pc.iceConnectionState === 'completed') {
+          void updateTransportLabel();
+        } else if (pc.iceConnectionState === 'checking' || startWatchdogNow) {
+          startFourSecondWatchdog();
+        }
+        return true;
+      };
+
+      if (!attachPcListeners()) {
+        // PeerJS kadang menginisialisasi mediaCall.peerConnection pada microtask berikutnya
+        window.setTimeout(() => {
+          if (callRuntimeRef.current?.callId === callId && callRuntimeRef.current.mediaCall === mediaCall) {
+            attachPcListeners();
+            if (startWatchdogNow) startFourSecondWatchdog();
+          }
+        }, 120);
+      } else if (startWatchdogNow) {
+        startFourSecondWatchdog();
+      }
+    },
+    []
+  );
+
+  // Pasang listener stream/close/error pada panggilan keluar (dipakai saat awal memanggil & saat re-dial / TURN Relay fallback)
   const bindOutgoingMediaCall = useCallback(
-    (callId: string, mediaCall: MediaConnection) => {
+    (callId: string, mediaCall: MediaConnection, startedWithRelay = false) => {
+      monitorMediaCallIce(callId, mediaCall, startedWithRelay, false);
+
       mediaCall.on('stream', (remoteStream) => {
         if (callRuntimeRef.current?.callId !== callId) return;
         if (unansweredCallTimerRef.current !== null) {
           window.clearTimeout(unansweredCallTimerRef.current);
           unansweredCallTimerRef.current = null;
         }
+        if (callRelayWaitTimerRef.current !== null) {
+          window.clearTimeout(callRelayWaitTimerRef.current);
+          callRelayWaitTimerRef.current = null;
+        }
         stopRingtone();
+        isSpeakerOnRef.current = true;
         attachRemoteCallAudioStream(remoteStream);
         if (!callRuntimeRef.current.connectedAt) {
           callRuntimeRef.current.connectedAt = Date.now();
@@ -932,8 +1093,25 @@ export default function App() {
           }, 1000);
         }
         setActiveCallUI((prev) =>
-          prev ? { ...prev, phase: 'connected', remoteStream } : null
+          prev
+            ? {
+                ...prev,
+                phase: 'connected',
+                isSpeakerOn: true,
+                remoteStream,
+                connectionMode: startedWithRelay ? 'relay' : prev.connectionMode || 'connecting',
+              }
+            : null
         );
+        void inspectMediaCallTransport(mediaCall, startedWithRelay).then((mode) => {
+          if (
+            mode &&
+            callRuntimeRef.current?.callId === callId &&
+            callRuntimeRef.current.mediaCall === mediaCall
+          ) {
+            setActiveCallUI((prev) => (prev ? { ...prev, connectionMode: mode } : null));
+          }
+        });
       });
 
       mediaCall.on('close', () => {
@@ -950,13 +1128,97 @@ export default function App() {
           callRuntimeRef.current?.callId === callId &&
           callRuntimeRef.current.mediaCall === mediaCall
         ) {
+          if (!startedWithRelay && !callRuntimeRef.current.relayFallbackUsed) {
+            upgradeActiveCallToRelayRef.current(callId, 'MediaConnection error');
+            return;
+          }
           showToast('Panggilan tidak dapat tersambung.');
           finalizeCall('missed');
         }
       });
     },
-    [finalizeCall, showToast]
+    [attachRemoteCallAudioStream, finalizeCall, monitorMediaCallIce, showToast]
   );
+
+  // Auto-fallback panggilan aktif ke TURN Relay (iceTransportPolicy: 'relay') untuk menembus AP Isolation / Hairpin NAT hotspot
+  const upgradeActiveCallToRelay = useCallback(
+    (callId: string, reason: string) => {
+      const rt = callRuntimeRef.current;
+      const me = profileRef.current;
+      const manager = peerManagerRef.current;
+      if (!rt || !me || !manager || rt.callId !== callId) return;
+      if (rt.relayFallbackUsed || rt.startedWithRelay) return;
+      if (!rt.localStream) return;
+
+      console.warn(`[WattappsAU WebRTC Call] ${reason} — beralih otomatis ke TURN Relay...`);
+      rt.relayFallbackUsed = true;
+      manager.markPeerRelayPreferred(rt.peerId);
+      setActiveCallUI((prev) =>
+        prev ? { ...prev, connectionMode: 'reconnecting_relay' } : null
+      );
+      showToast('Jalur P2P terhambat hotspot — beralih otomatis ke TURN Relay...', 3000, 'warning');
+
+      const initiateRelayCall = () => {
+        const currentRt = callRuntimeRef.current;
+        if (!currentRt || currentRt.callId !== callId || !currentRt.localStream) return;
+        const relayCall = manager.startMediaCall(
+          currentRt.peerId,
+          currentRt.localStream,
+          {
+            callId: currentRt.callId,
+            callType: currentRt.callType,
+            isVideo: currentRt.callType === 'video',
+            callerName: me.name,
+            callerAvatar: me.avatar,
+            forceRelay: true,
+            isRelayReconnect: true,
+          },
+          true
+        );
+        if (relayCall) {
+          const oldCall = currentRt.mediaCall;
+          currentRt.mediaCall = relayCall;
+          currentRt.startedWithRelay = true;
+          bindOutgoingMediaCall(currentRt.callId, relayCall, true);
+          try {
+            oldCall.close();
+          } catch {
+            // ignore
+          }
+        }
+      };
+
+      if (rt.direction === 'outgoing') {
+        initiateRelayCall();
+      } else {
+        // Minta penelepon melakukan re-dial TURN Relay; jika tidak datang dalam 1.6 detik, penerima mengambil alih inisiasi TURN Relay
+        manager.sendPacket(rt.peerId, {
+          kind: 'CALL_SIGNAL',
+          action: 'relay_fallback',
+          callId: rt.callId,
+          callType: rt.callType,
+          fromId: me.id,
+          fromName: me.name,
+          fromAvatar: me.avatar,
+        });
+        if (callRelayWaitTimerRef.current !== null) {
+          window.clearTimeout(callRelayWaitTimerRef.current);
+        }
+        callRelayWaitTimerRef.current = window.setTimeout(() => {
+          callRelayWaitTimerRef.current = null;
+          if (
+            callRuntimeRef.current?.callId === callId &&
+            !callRuntimeRef.current.startedWithRelay
+          ) {
+            initiateRelayCall();
+          }
+        }, 1600);
+      }
+    },
+    [bindOutgoingMediaCall, showToast]
+  );
+
+  upgradeActiveCallToRelayRef.current = upgradeActiveCallToRelay;
 
   // Incoming PeerJS DataChannel packet handler
   const handleIncomingPacket = useCallback(
@@ -1321,6 +1583,44 @@ export default function App() {
             showToast(`${rt.peerName} sedang dalam panggilan lain`);
             finalizeCall('missed');
           } else if (
+            packet.action === 'relay_fallback' &&
+            rt &&
+            rt.peerId === fromId &&
+            rt.localStream &&
+            !rt.startedWithRelay
+          ) {
+            // Lawan meminta perpindahan ke TURN Relay untuk menembus AP Isolation / Hairpin NAT hotspot
+            rt.relayFallbackUsed = true;
+            peerManagerRef.current?.markPeerRelayPreferred(fromId);
+            setActiveCallUI((prev) =>
+              prev ? { ...prev, connectionMode: 'reconnecting_relay' } : null
+            );
+            const relayCall = peerManagerRef.current?.startMediaCall(
+              fromId,
+              rt.localStream,
+              {
+                callId: rt.callId,
+                callType: rt.callType,
+                isVideo: rt.callType === 'video',
+                callerName: me.name,
+                callerAvatar: me.avatar,
+                forceRelay: true,
+                isRelayReconnect: true,
+              },
+              true
+            );
+            if (relayCall) {
+              const oldCall = rt.mediaCall;
+              rt.mediaCall = relayCall;
+              rt.startedWithRelay = true;
+              bindOutgoingMediaCall(rt.callId, relayCall, true);
+              try {
+                oldCall.close();
+              } catch {
+                // ignore
+              }
+            }
+          } else if (
             (packet.action === 'ringing' || packet.action === 'accept') &&
             rt &&
             rt.direction === 'outgoing' &&
@@ -1329,22 +1629,31 @@ export default function App() {
             rt.localStream
           ) {
             // Penerima baru bangun dari latar belakang / zombie socket: kirim ulang MediaConnection segar
-            const freshCall = peerManagerRef.current?.startMediaCall(fromId, rt.localStream, {
-              callId: rt.callId,
-              callType: rt.callType,
-              isVideo: rt.callType === 'video',
-              callerName: me.name,
-              callerAvatar: me.avatar,
-            });
+            const useRelay = Boolean(
+              rt.startedWithRelay || peerManagerRef.current?.isPeerRelayPreferred(fromId)
+            );
+            const freshCall = peerManagerRef.current?.startMediaCall(
+              fromId,
+              rt.localStream,
+              {
+                callId: rt.callId,
+                callType: rt.callType,
+                isVideo: rt.callType === 'video',
+                callerName: me.name,
+                callerAvatar: me.avatar,
+              },
+              useRelay
+            );
             if (freshCall) {
               const oldCall = rt.mediaCall;
               rt.mediaCall = freshCall;
+              rt.startedWithRelay = useRelay;
               try {
                 oldCall.close();
               } catch {
                 // ignore
               }
-              bindOutgoingMediaCall(rt.callId, freshCall);
+              bindOutgoingMediaCall(rt.callId, freshCall, useRelay);
             }
           }
           break;
@@ -1371,6 +1680,85 @@ export default function App() {
       // Ekstrak ID 6 digit murni (hilangkan prefix 'WA6-' atau 'WattappsAU-')
       const cleanId = fromFullPeerId(mediaCall.peer);
 
+      const meta = (mediaCall.metadata || {}) as {
+        callId?: string;
+        callType?: CallType;
+        isVideo?: boolean;
+        callerName?: string;
+        callerAvatar?: string;
+        forceRelay?: boolean;
+        isRelayReconnect?: boolean;
+      };
+
+      // Kasus khusus: Upgrade otomatis panggilan aktif ke jalur TURN Relay (menembus AP Isolation / Hairpin NAT hotspot)
+      const activeRt = callRuntimeRef.current;
+      if (
+        activeRt &&
+        meta.isRelayReconnect &&
+        activeRt.peerId === cleanId &&
+        (!meta.callId || activeRt.callId === meta.callId)
+      ) {
+        if (callRelayWaitTimerRef.current !== null) {
+          window.clearTimeout(callRelayWaitTimerRef.current);
+          callRelayWaitTimerRef.current = null;
+        }
+        const existingLocalStream = activeRt.localStream;
+        const oldCall = activeRt.mediaCall;
+        const activeCallId = activeRt.callId;
+        activeRt.mediaCall = mediaCall;
+        activeRt.relayFallbackUsed = true;
+        activeRt.startedWithRelay = true;
+
+        void (async () => {
+          const streamToUse =
+            existingLocalStream || (await getCallLocalStream(activeRt.callType).catch(() => null));
+          if (!streamToUse || callRuntimeRef.current?.callId !== activeCallId) return;
+          callRuntimeRef.current.localStream = streamToUse;
+
+          stopRingtone();
+          isSpeakerOnRef.current = true;
+
+          mediaCall.on('stream', (remoteStream) => {
+            if (callRuntimeRef.current?.callId !== activeCallId) return;
+            attachRemoteCallAudioStream(remoteStream);
+            setActiveCallUI((prev) =>
+              prev
+                ? { ...prev, phase: 'connected', isSpeakerOn: true, remoteStream, connectionMode: 'relay' }
+                : null
+            );
+          });
+
+          mediaCall.on('close', () => {
+            if (
+              callRuntimeRef.current?.callId === activeCallId &&
+              callRuntimeRef.current.mediaCall === mediaCall
+            ) {
+              finalizeCall();
+            }
+          });
+
+          mediaCall.on('error', () => {
+            if (
+              callRuntimeRef.current?.callId === activeCallId &&
+              callRuntimeRef.current.mediaCall === mediaCall
+            ) {
+              finalizeCall();
+            }
+          });
+
+          peerManagerRef.current?.answerMediaCall(mediaCall, streamToUse, true);
+          monitorMediaCallIce(activeCallId, mediaCall, true, true);
+          setActiveCallUI((prev) => (prev ? { ...prev, connectionMode: 'relay' } : null));
+
+          try {
+            if (oldCall !== mediaCall) oldCall.close();
+          } catch {
+            // ignore
+          }
+        })();
+        return;
+      }
+
       // If already in a call, reply busy
       if (callRuntimeRef.current) {
         peerManagerRef.current?.sendPacket(cleanId, {
@@ -1395,20 +1783,13 @@ export default function App() {
       pauseKeepAliveForCall();
       pendingCallRef.current = null;
 
-      const meta = (mediaCall.metadata || {}) as {
-        callId?: string;
-        callType?: CallType;
-        isVideo?: boolean;
-        callerName?: string;
-        callerAvatar?: string;
-      };
-
       const existingContact = contactsRef.current.find((c) => c.id === cleanId);
       const callerName = existingContact?.name?.trim() || `ID: ${cleanId}`;
       const callerAvatar = existingContact?.avatar || meta.callerAvatar || '';
       const isVideo = Boolean(meta.isVideo ?? meta.callType === 'video');
       const callType: CallType = isVideo ? 'video' : 'audio';
       const callId = meta.callId || generateUid('call');
+      const incomingForceRelay = Boolean(meta.forceRelay);
 
       // Jika pengguna sudah menekan "Angkat" pada pop-up pendingCall saat kembali dari latar belakang, langsung jawab!
       const awaitingAnswer = awaitingMediaCallAnswerRef.current;
@@ -1417,6 +1798,7 @@ export default function App() {
         awaitingMediaCallAnswerRef.current = null;
         setPersistentIncomingCall(null);
         stopRingtone();
+        isSpeakerOnRef.current = true;
 
         callRuntimeRef.current = {
           callId,
@@ -1430,13 +1812,25 @@ export default function App() {
           startedAt: Date.now(),
           connectedAt: Date.now(),
           facingMode: 'user',
+          startedWithRelay: incomingForceRelay,
         };
 
-        // Pasang listener stream/close/error SEBELUM memanggil mediaCall.answer() agar stream awal tidak terlewat
+        // Pasang listener stream/close/error SEBELUM memanggil answerMediaCall() agar stream awal tidak terlewat
         mediaCall.on('stream', (remoteStream) => {
           if (callRuntimeRef.current?.callId !== callId) return;
+          stopRingtone();
+          isSpeakerOnRef.current = true;
           attachRemoteCallAudioStream(remoteStream);
-          setActiveCallUI((prev) => (prev ? { ...prev, remoteStream } : null));
+          setActiveCallUI((prev) => (prev ? { ...prev, isSpeakerOn: true, remoteStream } : null));
+          void inspectMediaCallTransport(mediaCall, incomingForceRelay).then((mode) => {
+            if (
+              mode &&
+              callRuntimeRef.current?.callId === callId &&
+              callRuntimeRef.current.mediaCall === mediaCall
+            ) {
+              setActiveCallUI((prev) => (prev ? { ...prev, connectionMode: mode } : null));
+            }
+          });
         });
 
         mediaCall.on('close', () => {
@@ -1457,7 +1851,12 @@ export default function App() {
           }
         });
 
-        mediaCall.answer(awaitingAnswer.localStream);
+        peerManagerRef.current?.answerMediaCall(
+          mediaCall,
+          awaitingAnswer.localStream,
+          incomingForceRelay
+        );
+        monitorMediaCallIce(callId, mediaCall, incomingForceRelay, true);
 
         setActiveCallUI({
           callId,
@@ -1470,6 +1869,7 @@ export default function App() {
           isMuted: false,
           isCameraOff: !isVideo,
           isSpeakerOn: true,
+          connectionMode: incomingForceRelay ? 'relay' : 'connecting',
           localStream: awaitingAnswer.localStream,
           remoteStream: null,
         });
@@ -1508,6 +1908,7 @@ export default function App() {
         startedAt: Date.now(),
         connectedAt: null,
         facingMode: 'user',
+        startedWithRelay: incomingForceRelay,
       };
 
       setShowMainMenu(false);
@@ -3322,14 +3723,20 @@ export default function App() {
 
     try {
       const localStream = await getCallLocalStream(callType);
+      const preferRelay = manager.isPeerRelayPreferred(peerId);
 
-      const mediaCall = manager.startMediaCall(peerId, localStream, {
-        callId,
-        callType,
-        isVideo: callType === 'video',
-        callerName: profile.name,
-        callerAvatar: profile.avatar,
-      });
+      const mediaCall = manager.startMediaCall(
+        peerId,
+        localStream,
+        {
+          callId,
+          callType,
+          isVideo: callType === 'video',
+          callerName: profile.name,
+          callerAvatar: profile.avatar,
+        },
+        preferRelay
+      );
 
       if (!mediaCall) {
         localStream.getTracks().forEach((t) => t.stop());
@@ -3351,10 +3758,11 @@ export default function App() {
         startedAt: Date.now(),
         connectedAt: null,
         facingMode: 'user',
+        startedWithRelay: preferRelay,
       };
 
-      // Pasang listener stream/close/error segera setelah peer.call() agar audio remote tidak terlewat
-      bindOutgoingMediaCall(callId, mediaCall);
+      // Pasang listener stream/close/error & monitor ICE segera setelah peer.call() agar audio remote tidak terlewat
+      bindOutgoingMediaCall(callId, mediaCall, preferRelay);
 
       setActiveCallUI({
         callId,
@@ -3367,6 +3775,7 @@ export default function App() {
         isMuted: false,
         isCameraOff: callType !== 'video',
         isSpeakerOn: true,
+        connectionMode: preferRelay ? 'relay' : 'connecting',
         localStream,
         remoteStream: null,
       });
@@ -3435,17 +3844,47 @@ export default function App() {
         rt.localStream = localStream;
         rt.connectedAt = Date.now();
 
-        // Pasang listener stream SEBELUM memanggil rt.mediaCall.answer(localStream)
+        // Pasang listener stream SEBELUM memanggil answerMediaCall(localStream)
+        const useRelay = Boolean(
+          rt.startedWithRelay || peerManagerRef.current?.isPeerRelayPreferred(rt.peerId)
+        );
         rt.mediaCall.on('stream', (remoteStream) => {
           if (callRuntimeRef.current?.callId !== rt.callId) return;
+          stopRingtone();
+          isSpeakerOnRef.current = true;
           attachRemoteCallAudioStream(remoteStream);
-          setActiveCallUI((prev) => (prev ? { ...prev, remoteStream } : null));
+          setActiveCallUI((prev) =>
+            prev ? { ...prev, isSpeakerOn: true, remoteStream } : null
+          );
+          void inspectMediaCallTransport(rt.mediaCall, useRelay).then((mode) => {
+            if (
+              mode &&
+              callRuntimeRef.current?.callId === rt.callId &&
+              callRuntimeRef.current.mediaCall === rt.mediaCall
+            ) {
+              setActiveCallUI((prev) => (prev ? { ...prev, connectionMode: mode } : null));
+            }
+          });
         });
 
-        rt.mediaCall.answer(localStream);
+        if (peerManagerRef.current) {
+          peerManagerRef.current.answerMediaCall(rt.mediaCall, localStream, useRelay);
+        } else {
+          rt.mediaCall.answer(localStream);
+          ensureLocalAudioTracksAttached(rt.mediaCall, localStream);
+        }
+        monitorMediaCallIce(rt.callId, rt.mediaCall, useRelay, true);
 
         setActiveCallUI((prev) =>
-          prev ? { ...prev, phase: 'connected', localStream } : null
+          prev
+            ? {
+                ...prev,
+                phase: 'connected',
+                isSpeakerOn: true,
+                connectionMode: useRelay ? 'relay' : 'connecting',
+                localStream,
+              }
+            : null
         );
 
         if (callTimerRef.current !== null) {
@@ -3683,6 +4122,7 @@ export default function App() {
       isSpeakerOnRef.current = nextSpeaker;
       const audioEl = remoteCallAudioRef.current;
       if (audioEl) {
+        audioEl.volume = 1.0;
         audioEl.muted = !nextSpeaker;
         if (nextSpeaker && audioEl.srcObject) {
           void audioEl.play().catch(() => {});
@@ -3690,6 +4130,65 @@ export default function App() {
       }
       return { ...prev, isSpeakerOn: nextSpeaker };
     });
+  };
+
+  // Tombol pemulih suara di layar panggilan:
+  // Hentikan dering tersisa, paksa speaker aktif + volume 1.0 + remoteAudio.play(),
+  // pastikan track mikrofon lokal aktif, dan restart ICE / alihkan ke TURN Relay bila jalur media macet.
+  const handleRefreshCallAudio = () => {
+    const rt = callRuntimeRef.current;
+    stopRingtone();
+    isSpeakerOnRef.current = true;
+    setActiveCallUI((prev) => (prev ? { ...prev, isSpeakerOn: true } : null));
+
+    if (rt?.localStream && !activeCallUI?.isMuted) {
+      ensureLocalAudioTracksAttached(rt.mediaCall, rt.localStream);
+    }
+
+    const remoteStream = rt?.remoteStream || activeCallUI?.remoteStream || null;
+    const audioEl = remoteCallAudioRef.current;
+    if (audioEl) {
+      if (remoteStream && audioEl.srcObject !== remoteStream) {
+        attachRemoteCallAudioStream(remoteStream);
+      } else if (audioEl.srcObject) {
+        audioEl.volume = 1.0;
+        audioEl.muted = false;
+        void audioEl.play().catch(() => {});
+      }
+    }
+
+    if (rt) {
+      const pc = getMediaCallPeerConnection(rt.mediaCall);
+      const iceState = pc?.iceConnectionState;
+      if (
+        !rt.startedWithRelay &&
+        !rt.relayFallbackUsed &&
+        (iceState === 'failed' || iceState === 'disconnected' || iceState === 'checking' || !remoteStream)
+      ) {
+        try {
+          pc?.restartIce?.();
+        } catch {
+          // ignore
+        }
+        upgradeActiveCallToRelay(rt.callId, 'Manual Refresh Audio / Speaker');
+        return;
+      }
+
+      if (pc && (iceState === 'failed' || iceState === 'disconnected')) {
+        try {
+          pc.restartIce?.();
+        } catch {
+          // ignore
+        }
+      }
+      void inspectMediaCallTransport(rt.mediaCall, Boolean(rt.startedWithRelay)).then((mode) => {
+        if (mode && callRuntimeRef.current?.callId === rt.callId) {
+          setActiveCallUI((prev) => (prev ? { ...prev, connectionMode: mode } : null));
+        }
+      });
+    }
+
+    showToast('Audio & speaker panggilan disegarkan');
   };
 
   // Toggle Mode Siaga (Service Worker + Auto-Reconnect PeerJS + Screen Wake Lock tanpa membajak fokus audio Android/Bluetooth)
@@ -4398,6 +4897,7 @@ export default function App() {
           onToggleCamera={handleToggleCamera}
           onSwitchCamera={handleSwitchCamera}
           onToggleSpeaker={handleToggleSpeaker}
+          onRefreshAudio={handleRefreshCallAudio}
         />
       )}
 
@@ -4454,6 +4954,7 @@ export default function App() {
 
       {/* Elemen audio panggilan WebRTC persisten agar suara remoteStream selalu terdengar jelas tanpa terputus */}
       <audio
+        id="remoteAudio"
         ref={remoteCallAudioRef}
         autoPlay
         playsInline

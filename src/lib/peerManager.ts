@@ -89,6 +89,104 @@ export const ICE_SERVERS: RTCIceServer[] = [
   },
 ];
 
+export function createCallRTCConfiguration(forceRelay = false): RTCConfiguration {
+  return {
+    iceServers: ICE_SERVERS,
+    iceCandidatePoolSize: 10,
+    iceTransportPolicy: forceRelay ? 'relay' : 'all',
+    bundlePolicy: 'max-bundle',
+    rtcpMuxPolicy: 'require',
+  };
+}
+
+export function getMediaCallPeerConnection(mediaCall: MediaConnection | null | undefined): RTCPeerConnection | null {
+  if (!mediaCall) return null;
+  const internal = mediaCall as unknown as {
+    peerConnection?: RTCPeerConnection;
+    _pc?: RTCPeerConnection;
+  };
+  return internal.peerConnection || internal._pc || null;
+}
+
+export function ensureLocalAudioTracksAttached(
+  mediaCall: MediaConnection,
+  localStream: MediaStream
+): void {
+  localStream.getAudioTracks().forEach((track) => {
+    track.enabled = true;
+  });
+
+  const pc = getMediaCallPeerConnection(mediaCall);
+  if (!pc || typeof pc.getSenders !== 'function' || typeof pc.addTrack !== 'function') return;
+
+  try {
+    const existingSenders = pc.getSenders();
+    localStream.getAudioTracks().forEach((audioTrack) => {
+      const alreadyAdded = existingSenders.some(
+        (sender) => sender.track && (sender.track.id === audioTrack.id || sender.track.kind === 'audio')
+      );
+      if (!alreadyAdded) {
+        pc.addTrack(audioTrack, localStream);
+      }
+    });
+  } catch {
+    // PeerJS may have already added transceivers/tracks during offer/answer creation
+  }
+}
+
+export async function inspectMediaCallTransport(
+  mediaCall: MediaConnection,
+  fallbackRelay = false
+): Promise<'direct' | 'relay' | null> {
+  const pc = getMediaCallPeerConnection(mediaCall);
+  if (!pc) return fallbackRelay ? 'relay' : null;
+
+  let detected: 'direct' | 'relay' = fallbackRelay ? 'relay' : 'direct';
+  if (typeof pc.getStats === 'function') {
+    try {
+      const stats = await pc.getStats();
+      const candidates = new Map<string, string>();
+      let selectedPair: { localCandidateId?: string; remoteCandidateId?: string } | null = null;
+
+      stats.forEach((report) => {
+        const r = report as Record<string, unknown>;
+        if (r.type === 'local-candidate' || r.type === 'remote-candidate') {
+          if (typeof r.id === 'string' && typeof r.candidateType === 'string') {
+            candidates.set(r.id, r.candidateType);
+          }
+        } else if (r.type === 'candidate-pair') {
+          const isSelected =
+            r.selected === true ||
+            (r.nominated === true && r.state === 'succeeded') ||
+            r.state === 'succeeded';
+          if (isSelected) {
+            selectedPair = {
+              localCandidateId:
+                typeof r.localCandidateId === 'string' ? r.localCandidateId : undefined,
+              remoteCandidateId:
+                typeof r.remoteCandidateId === 'string' ? r.remoteCandidateId : undefined,
+            };
+          }
+        }
+      });
+
+      if (selectedPair) {
+        const pair = selectedPair as { localCandidateId?: string; remoteCandidateId?: string };
+        const localType = pair.localCandidateId ? candidates.get(pair.localCandidateId) : undefined;
+        const remoteType = pair.remoteCandidateId ? candidates.get(pair.remoteCandidateId) : undefined;
+        if (localType === 'relay' || remoteType === 'relay') {
+          detected = 'relay';
+        } else if (localType || remoteType) {
+          detected = 'direct';
+        }
+      }
+    } catch {
+      // fallback to policy-based value
+    }
+  }
+  return detected;
+}
+
 export interface ReassembledFileTransfer {
   fileId: string;
   messageId?: string;
@@ -1961,20 +2059,75 @@ export class WA6PeerManager {
     }
   }
 
+  public markPeerRelayPreferred(rawTargetId: string): void {
+    const cleanId = normalizePeerId(rawTargetId);
+    if (cleanId) {
+      this.relayPreferredPeers.add(cleanId);
+    }
+  }
+
+  public isPeerRelayPreferred(rawTargetId: string): boolean {
+    const cleanId = normalizePeerId(rawTargetId);
+    return cleanId ? this.relayPreferredPeers.has(cleanId) : false;
+  }
+
   public startMediaCall(
     rawTargetId: string,
     stream: MediaStream,
-    metadata: Record<string, unknown>
+    metadata: Record<string, unknown>,
+    forceRelay = false
   ): MediaConnection | null {
     const targetSixDigitId = normalizePeerId(rawTargetId);
     if (!this.peer || this.peer.destroyed || !this.peer.open || !targetSixDigitId) return null;
-    const useRelay = this.relayPreferredPeers.has(targetSixDigitId);
+
+    // Pastikan seluruh track audio mikrofon aktif sebelum createOffer()
+    stream.getAudioTracks().forEach((track) => {
+      track.enabled = true;
+    });
+
+    if (forceRelay) {
+      this.relayPreferredPeers.add(targetSixDigitId);
+    }
+    const useRelay = forceRelay || this.relayPreferredPeers.has(targetSixDigitId);
     this.applyPeerIcePolicy(useRelay);
     try {
-      return this.peer.call(toFullPeerId(targetSixDigitId), stream, { metadata });
+      const mediaCall = this.peer.call(toFullPeerId(targetSixDigitId), stream, {
+        metadata: {
+          ...metadata,
+          forceRelay: useRelay,
+        },
+      });
+      if (mediaCall) {
+        ensureLocalAudioTracksAttached(mediaCall, stream);
+      }
+      return mediaCall;
     } catch (err) {
       console.error('Failed to initiate media call:', err);
       return null;
+    } finally {
+      this.applyPeerIcePolicy(false);
+    }
+  }
+
+  public answerMediaCall(
+    mediaCall: MediaConnection,
+    stream: MediaStream,
+    forceRelay = false
+  ): void {
+    // Pastikan seluruh track audio mikrofon aktif sebelum createAnswer()
+    stream.getAudioTracks().forEach((track) => {
+      track.enabled = true;
+    });
+
+    const peerSixId = fromFullPeerId(mediaCall.peer);
+    if (forceRelay && peerSixId) {
+      this.relayPreferredPeers.add(peerSixId);
+    }
+    const useRelay = forceRelay || (peerSixId ? this.relayPreferredPeers.has(peerSixId) : false);
+    this.applyPeerIcePolicy(useRelay);
+    try {
+      mediaCall.answer(stream);
+      ensureLocalAudioTracksAttached(mediaCall, stream);
     } finally {
       this.applyPeerIcePolicy(false);
     }
