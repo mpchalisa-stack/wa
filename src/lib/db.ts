@@ -63,10 +63,13 @@ export function getSavedTheme(): ThemeMode {
   try {
     const stored = localStorage.getItem(THEME_KEY);
     if (stored === 'dark' || stored === 'light') return stored;
+    if (typeof window !== 'undefined' && window.matchMedia('(prefers-color-scheme: dark)').matches) {
+      return 'dark';
+    }
   } catch {
     // ignore
   }
-  return 'dark';
+  return 'light';
 }
 
 export function saveTheme(theme: ThemeMode): void {

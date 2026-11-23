@@ -1,7 +1,6 @@
 import React, { useEffect, useMemo, useRef, useState } from 'react';
 import { Mic, Pause, Play } from 'lucide-react';
 import { formatDuration } from '../lib/media';
-import { activateActiveMediaSession, releaseActiveMediaSession } from '../lib/standby';
 import { Avatar } from './Avatar';
 
 interface VoiceNoteBubbleProps {
@@ -41,7 +40,6 @@ export const VoiceNoteBubble: React.FC<VoiceNoteBubbleProps> = ({
 
   useEffect(() => {
     const audio = new Audio(audioSrc);
-    audio.preload = 'metadata';
     audioRef.current = audio;
 
     const onLoaded = () => {
@@ -50,30 +48,20 @@ export const VoiceNoteBubble: React.FC<VoiceNoteBubbleProps> = ({
       }
     };
     const onTimeUpdate = () => setCurrentTime(audio.currentTime);
-    const onPause = () => {
-      setIsPlaying(false);
-      releaseActiveMediaSession('vox');
-    };
     const onEnded = () => {
       setIsPlaying(false);
       setCurrentTime(0);
-      releaseActiveMediaSession('vox');
     };
 
     audio.addEventListener('loadedmetadata', onLoaded);
     audio.addEventListener('timeupdate', onTimeUpdate);
-    audio.addEventListener('pause', onPause);
     audio.addEventListener('ended', onEnded);
 
     return () => {
       audio.pause();
       audio.removeEventListener('loadedmetadata', onLoaded);
       audio.removeEventListener('timeupdate', onTimeUpdate);
-      audio.removeEventListener('pause', onPause);
       audio.removeEventListener('ended', onEnded);
-      audio.removeAttribute('src');
-      audio.load();
-      releaseActiveMediaSession('vox');
     };
   }, [audioSrc]);
 
@@ -83,23 +71,13 @@ export const VoiceNoteBubble: React.FC<VoiceNoteBubbleProps> = ({
     if (isPlaying) {
       audio.pause();
       setIsPlaying(false);
-      releaseActiveMediaSession('vox');
     } else {
       audio.playbackRate = rate;
       try {
         await audio.play();
         setIsPlaying(true);
-        activateActiveMediaSession({
-          mode: 'vox',
-          statusText: 'Memutar Pesan Suara',
-          peerName: senderName,
-          onEndOrPause: () => {
-            audioRef.current?.pause();
-          },
-        });
       } catch {
         setIsPlaying(false);
-        releaseActiveMediaSession('vox');
       }
     }
   };

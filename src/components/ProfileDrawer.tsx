@@ -5,12 +5,14 @@ import { UserProfile } from '../types';
 import { PRESET_AVATARS, compressImageFile, formatSixDigitId } from '../lib/media';
 import { getNtfyTopic } from '../lib/ntfy';
 import { getNotificationPermissionState, requestNotificationPermission } from '../lib/standby';
+import { isNativeCapacitor } from '../lib/nativeAndroid';
 import { Avatar } from './Avatar';
 import { PWAInstallButton } from './PWAInstallButton';
 
 interface ProfileDrawerProps {
   profile: UserProfile;
   firebaseUserEmail?: string | null;
+  nativeFcmToken?: string;
   onSignInFirebase?: () => Promise<void>;
   onSignOutFirebase?: () => Promise<void>;
   onUpdateProfile: (updated: UserProfile) => void;
@@ -22,6 +24,7 @@ interface ProfileDrawerProps {
 export const ProfileDrawer: React.FC<ProfileDrawerProps> = ({
   profile,
   firebaseUserEmail,
+  nativeFcmToken,
   onSignInFirebase,
   onSignOutFirebase,
   onUpdateProfile,
@@ -309,7 +312,7 @@ export const ProfileDrawer: React.FC<ProfileDrawerProps> = ({
               <div className="flex items-center gap-2">
                 <Bell className="w-4 h-4 text-[#008069] dark:text-[#00A884] shrink-0" />
                 <span className="text-xs font-semibold text-[#008069] dark:text-[#00A884]">
-                  Notifikasi Latar Belakang Senyap (ntfy)
+                  Notifikasi Latar Belakang &amp; Dering (ntfy)
                 </span>
               </div>
               {notifPerm === 'granted' ? (
@@ -328,7 +331,7 @@ export const ProfileDrawer: React.FC<ProfileDrawerProps> = ({
             </div>
 
             <p className="text-xs text-[#54656F] dark:text-[#8696A0] leading-relaxed">
-              Agar tetap menerima pemberitahuan saat tab peramban ditutup, Anda dapat menautkan topik terenkripsi berikut melalui aplikasi <strong className="text-[#111B21] dark:text-[#E9EDEF]">ntfy</strong>:
+              Agar HP tetap berdering keras saat ada panggilan/pesan masuk meski browser Chrome ditutup rapat 100%, pasang aplikasi gratis <strong className="text-[#111B21] dark:text-[#E9EDEF]">ntfy</strong> di Play Store lalu subscribe ke topik terenkripsi Anda:
             </p>
 
             <div className="flex items-center gap-2 rounded-xl bg-[#F0F2F5] dark:bg-[#202C33] px-3 py-2.5 border border-black/5 dark:border-white/10">
@@ -346,29 +349,29 @@ export const ProfileDrawer: React.FC<ProfileDrawerProps> = ({
             </div>
 
             <ol className="text-[11.5px] text-[#54656F] dark:text-[#8696A0] space-y-1 list-decimal list-inside">
-              <li>Pasang aplikasi <strong className="text-[#111B21] dark:text-[#E9EDEF]">ntfy</strong> (gratis, tanpa login) bila diperlukan.</li>
-              <li>Tekan ikon <strong className="text-[#111B21] dark:text-[#E9EDEF]">+</strong> lalu tempel nama topik di atas.</li>
-              <li>Sinyal dikirim terenkripsi AES-256-GCM saat peramban tidak aktif.</li>
+              <li>Pasang aplikasi <strong className="text-[#111B21] dark:text-[#E9EDEF]">ntfy</strong> (gratis, tanpa login) dari Google Play Store.</li>
+              <li>Tekan ikon <strong className="text-[#111B21] dark:text-[#E9EDEF]">+</strong> lalu tempel nama topik di atas dan aktifkan notifikasi prioritas tinggi.</li>
+              <li>Sinyal dikirim terenkripsi AES-256-GCM saat perangkat Anda offline.</li>
             </ol>
           </div>
 
-          {/* Firebase Cloud Sync (Web PWA Firestore Wake Queue) Section */}
+          {/* Firebase Cloud Push (FCM & Firestore Wake Queue) Section */}
           <div className="mt-3 bg-white dark:bg-[#111B21] px-6 py-5 border-y border-black/5 dark:border-white/5 space-y-3">
             <div className="flex items-center justify-between gap-2">
               <div className="flex items-center gap-2">
                 <Cloud className="w-4 h-4 text-[#008069] dark:text-[#00A884] shrink-0" />
                 <span className="text-xs font-semibold text-[#008069] dark:text-[#00A884]">
-                  Sinkronisasi Sinyal Web (Firestore)
+                  Sinkronisasi Push Android &amp; Firestore (FCM)
                 </span>
               </div>
               <span className="text-[11px] font-semibold text-[#54656F] dark:text-[#8696A0] inline-flex items-center gap-1">
                 <Smartphone className="w-3 h-3" />
-                Web PWA
+                {isNativeCapacitor() ? 'Android APK' : 'Web PWA'}
               </span>
             </div>
 
             <p className="text-xs text-[#54656F] dark:text-[#8696A0] leading-relaxed">
-              Hubungkan akun Google (opsional) untuk menerima sinyal bangun panggilan dan pesan secara senyap melalui Cloud Firestore di peramban web.
+              Hubungkan akun Google (opsional) untuk menyimpan token FCM perangkat ini dan menerima sinyal bangun panggilan/pesan secara instan melalui Cloud Firestore.
             </p>
 
             {firebaseUserEmail ? (
@@ -376,7 +379,7 @@ export const ProfileDrawer: React.FC<ProfileDrawerProps> = ({
                 <div className="flex items-center justify-between gap-2">
                   <div className="min-w-0">
                     <div className="text-xs font-semibold text-[#008069] dark:text-[#06CF9C]">
-                      Terhubung ke Cloud Sync
+                      Terhubung ke Cloud Push
                     </div>
                     <div className="text-xs text-[#111B21] dark:text-[#E9EDEF] truncate">
                       {firebaseUserEmail}
@@ -393,6 +396,11 @@ export const ProfileDrawer: React.FC<ProfileDrawerProps> = ({
                     </button>
                   )}
                 </div>
+                {nativeFcmToken && (
+                  <div className="text-[11px] font-mono text-[#54656F] dark:text-[#8696A0] truncate">
+                    Token FCM: {nativeFcmToken.slice(0, 28)}...
+                  </div>
+                )}
               </div>
             ) : (
               onSignInFirebase && (

@@ -64,7 +64,6 @@ import {
 import {
   initGlobalAudioUnlock,
   playMessagePop,
-  releaseAudioContextNow,
   startIncomingRingtone,
   startOutgoingRingback,
   stopRingtone,
@@ -74,19 +73,33 @@ import {
   disableStandbyMode,
   dismissIncomingCallNotification,
   enableStandbyMode,
+  isKeepAliveActuallyPlaying,
   pauseKeepAliveForCall,
-  releaseActiveMediaSession,
   requestNotificationPermission,
   resumeKeepAliveAfterCall,
   setStandbyExternalListener,
   showIncomingWebNotification,
 } from './lib/standby';
-import {
-  buildConversationScope,
-  decryptTextEnvelope,
-  encryptTextEnvelope,
-} from './lib/crypto';
+import type { User as FirebaseAuthUser } from 'firebase/auth';
 import { sendNtfyWakeSignal, subscribeNtfySignal } from './lib/ntfy';
+import {
+  acknowledgeFirestoreWakeSignal,
+  sendFirestoreWakeSignal,
+  signInWithGoogleForCloudPush,
+  signOutCloudPush,
+  subscribeFirebaseAuth,
+  subscribeFirestoreWakeSignals,
+  syncDeviceTokenToFirestore,
+} from './lib/firebase';
+import {
+  NativeNotificationActionEvent,
+  exitNativeApp,
+  getDevicePlatform,
+  isNativeCapacitor,
+  minimizeNativeApp,
+  registerNativeBackButtonHandler,
+} from './lib/nativeAndroid';
+import { startSafeNativePushAndServices } from './services/nativePush';
 import { estimateDataUrlBytes, formatSixDigitId, generateUid } from './lib/media';
 import { OnboardingScreen } from './components/OnboardingScreen';
 import { ChatList } from './components/ChatList';
@@ -223,6 +236,10 @@ export default function App() {
   const [activeCallUI, setActiveCallUI] = useState<ActiveCallUIState | null>(null);
   const [incomingCall, setIncomingCall] = useState<IncomingCallState | null>(null);
   const [incomingCallModalForceTick, setIncomingCallModalForceTick] = useState(0);
+
+  // Firebase Auth & Native Android FCM Token state (optional Cloud Push sync)
+  const [firebaseUser, setFirebaseUser] = useState<FirebaseAuthUser | null>(null);
+  const [nativeFcmToken, setNativeFcmToken] = useState<string>('');
 
   // Refs for fresh state inside PeerJS callbacks
   const peerManagerRef = useRef<WA6PeerManager | null>(null);
@@ -930,116 +947,85 @@ export default function App() {
             }
           }
 
-          // Dekripsi payload teks AES-256-GCM (transparan & kompatibel mundur) sebelum disimpan & ditampilkan
-          void (async () => {
-            let resolvedText = incomingMsg.text;
-            let resolvedReplyTo = incomingMsg.replyTo;
-            let isE2EE = Boolean(incomingMsg.e2ee);
+          // Idempotent insert (guard duplicates)
+          const alreadyExists = messagesRef.current.some((m) => m.id === incomingMsg.id);
+          if (!alreadyExists) {
+            const isViewingChat = activeChatIdRef.current === localChatId;
+            const savedMsg: ChatMessage = {
+              ...incomingMsg,
+              chatId: localChatId,
+              status: isViewingChat ? 'read' : 'delivered',
+            };
 
-            if (packet.encrypted) {
-              const scope = buildConversationScope({
-                isGroup: Boolean(incomingMsg.isGroup),
-                chatId: localChatId,
-                peerA: me.id,
-                peerB: fromId,
+            setMessages((prev) => {
+              if (prev.some((m) => m.id === savedMsg.id)) return prev;
+              return [...prev, savedMsg];
+            });
+            void dbSaveMessage(savedMsg);
+
+            if (isViewingChat) {
+              peerManagerRef.current?.sendPacket(fromId, {
+                kind: 'READ_ACK',
+                chatId: incomingMsg.isGroup ? localChatId : me.id,
+                messageIds: [incomingMsg.id],
+                fromId: me.id,
               });
-              const decrypted = await decryptTextEnvelope(packet.encrypted, scope);
-              if (decrypted) {
-                if (typeof decrypted.text === 'string') {
-                  resolvedText = decrypted.text;
-                }
-                if (resolvedReplyTo && typeof decrypted.replyText === 'string') {
-                  resolvedReplyTo = { ...resolvedReplyTo, text: decrypted.replyText };
-                }
-                isE2EE = true;
-              } else if (!resolvedText) {
-                resolvedText = '[Pesan terenkripsi AES-256 tidak dapat didekripsi]';
-              }
+            } else {
+              setUnreadCounts((prev) => ({
+                ...prev,
+                [localChatId]: (prev[localChatId] || 0) + 1,
+              }));
             }
 
-            // Idempotent insert (guard duplicates)
-            const alreadyExists = messagesRef.current.some((m) => m.id === incomingMsg.id);
-            if (!alreadyExists) {
-              const isViewingChat = activeChatIdRef.current === localChatId;
-              const savedMsg: ChatMessage = {
-                ...incomingMsg,
-                chatId: localChatId,
-                text: resolvedText,
-                replyTo: resolvedReplyTo,
-                e2ee: isE2EE,
-                status: isViewingChat ? 'read' : 'delivered',
-              };
+            // Putar nada notifikasi + getaran keras pada setiap pesan masuk
+            playMessagePop(true);
 
-              setMessages((prev) => {
-                if (prev.some((m) => m.id === savedMsg.id)) return prev;
-                return [...prev, savedMsg];
+            // Tampilkan Web Notification ala WhatsApp (penting saat tab/layar di latar belakang atau Mode Siaga)
+            if (!isViewingChat || document.hidden || standbyModeRef.current) {
+              const senderContact = contactsRef.current.find((c) => c.id === fromId);
+              const senderTitle =
+                incomingMsg.isGroup && packet.groupMeta
+                  ? `${packet.groupMeta.name} · ${incomingMsg.senderName}`
+                  : senderContact?.name?.trim() || incomingMsg.senderName || `ID: ${fromId}`;
+              const senderAvatar = senderContact?.avatar || '';
+              void showIncomingWebNotification({
+                title: senderTitle,
+                body:
+                  incomingMsg.type === 'image'
+                    ? incomingMsg.text
+                      ? `📷 Foto: ${incomingMsg.text}`
+                      : '📷 Foto'
+                    : incomingMsg.text || 'Pesan baru masuk',
+                icon: senderAvatar || '/icon-512.png',
+                tag: `msg-${incomingMsg.id}`,
+                data: {
+                  kind: 'message',
+                  chatId: localChatId,
+                  fromId,
+                  fromName: senderTitle,
+                  callerAvatar: senderAvatar,
+                },
+                onClick: () => {
+                  setActiveTab('chats');
+                  setActiveChatId(localChatId);
+                },
               });
-              void dbSaveMessage(savedMsg);
-
-              if (isViewingChat) {
-                peerManagerRef.current?.sendPacket(fromId, {
-                  kind: 'READ_ACK',
-                  chatId: incomingMsg.isGroup ? localChatId : me.id,
-                  messageIds: [incomingMsg.id],
-                  fromId: me.id,
-                });
-              } else {
-                setUnreadCounts((prev) => ({
-                  ...prev,
-                  [localChatId]: (prev[localChatId] || 0) + 1,
-                }));
-              }
-
-              // Putar nada notifikasi ringan (saat terlihat) + getar tanpa menahan fokus audio
-              playMessagePop(true);
-
-              // Tampilkan Web Notification ala WhatsApp (penting saat tab/layar di latar belakang atau Mode Siaga)
-              if (!isViewingChat || document.hidden || standbyModeRef.current) {
-                const senderContact = contactsRef.current.find((c) => c.id === fromId);
-                const senderTitle =
-                  incomingMsg.isGroup && packet.groupMeta
-                    ? `${packet.groupMeta.name} · ${incomingMsg.senderName}`
-                    : senderContact?.name?.trim() || incomingMsg.senderName || `ID: ${fromId}`;
-                const senderAvatar = senderContact?.avatar || '';
-                void showIncomingWebNotification({
-                  title: senderTitle,
-                  body:
-                    savedMsg.type === 'image'
-                      ? savedMsg.text
-                        ? `📷 Foto: ${savedMsg.text}`
-                        : '📷 Foto'
-                      : savedMsg.text || 'Pesan baru masuk',
-                  icon: senderAvatar || '/icon-512.png',
-                  tag: `msg-${savedMsg.id}`,
-                  data: {
-                    kind: 'message',
-                    chatId: localChatId,
-                    fromId,
-                    fromName: senderTitle,
-                    callerAvatar: senderAvatar,
-                  },
-                  onClick: () => {
-                    setActiveTab('chats');
-                    setActiveChatId(localChatId);
-                  },
-                });
-              }
             }
+          }
 
-            // Selalu kirim balik MSG_ACK & DELIVERY_ACK (termasuk jika retry duplikat) agar outbox pengirim bersih & Centang 2 biru
-            peerManagerRef.current?.sendPacket(fromId, {
-              kind: 'MSG_ACK',
-              messageId: incomingMsg.id,
-              chatId: incomingMsg.isGroup ? localChatId : me.id,
-              fromId: me.id,
-            });
-            peerManagerRef.current?.sendPacket(fromId, {
-              kind: 'DELIVERY_ACK',
-              messageId: incomingMsg.id,
-              chatId: incomingMsg.isGroup ? localChatId : me.id,
-              fromId: me.id,
-            });
-          })();
+          // Selalu kirim balik MSG_ACK & DELIVERY_ACK (termasuk jika retry duplikat) agar outbox pengirim bersih & Centang 2 biru
+          peerManagerRef.current?.sendPacket(fromId, {
+            kind: 'MSG_ACK',
+            messageId: incomingMsg.id,
+            chatId: incomingMsg.isGroup ? localChatId : me.id,
+            fromId: me.id,
+          });
+          peerManagerRef.current?.sendPacket(fromId, {
+            kind: 'DELIVERY_ACK',
+            messageId: incomingMsg.id,
+            chatId: incomingMsg.isGroup ? localChatId : me.id,
+            fromId: me.id,
+          });
           break;
         }
 
@@ -1588,26 +1574,6 @@ export default function App() {
         return;
       }
 
-      let resolvedCaption = meta.text;
-      let resolvedReplyTo = meta.replyTo;
-      if (meta.encrypted) {
-        const scope = buildConversationScope({
-          isGroup: Boolean(meta.isGroup),
-          chatId: localChatId,
-          peerA: me.id,
-          peerB: fromId,
-        });
-        const decrypted = await decryptTextEnvelope(meta.encrypted, scope);
-        if (decrypted) {
-          if (typeof decrypted.text === 'string') {
-            resolvedCaption = decrypted.text;
-          }
-          if (resolvedReplyTo && typeof decrypted.replyText === 'string') {
-            resolvedReplyTo = { ...resolvedReplyTo, text: decrypted.replyText };
-          }
-        }
-      }
-
       const isViewingChat = activeChatIdRef.current === localChatId;
       const savedMsg: ChatMessage = {
         id: meta.id,
@@ -1615,8 +1581,7 @@ export default function App() {
         senderId: meta.senderId,
         senderName: meta.senderName,
         type: meta.msgType,
-        text: resolvedCaption,
-        e2ee: Boolean(meta.encrypted || true),
+        text: meta.text,
         mediaData: transfer.dataUrl,
         fileName: transfer.fileName,
         fileSize: transfer.fileSize,
@@ -1624,7 +1589,7 @@ export default function App() {
         duration: meta.duration,
         timestamp: meta.timestamp,
         status: isViewingChat ? 'read' : 'delivered',
-        replyTo: resolvedReplyTo,
+        replyTo: meta.replyTo,
         isGroup: meta.isGroup,
       };
 
@@ -1712,53 +1677,7 @@ export default function App() {
     [markMessageConfirmedBlueTick]
   );
 
-  // Helper enkripsi AES-256-GCM & pengiriman satu paket pesan teks via PeerJS DataChannel
-  const sendEncryptedMessageToPeer = useCallback(
-    async (
-      msg: ChatMessage,
-      recipientId: string,
-      groupMeta?: PendingOutboxMessage['groupMeta']
-    ): Promise<boolean> => {
-      const manager = peerManagerRef.current;
-      const me = profileRef.current;
-      if (!manager || !me) return false;
-
-      const scope = buildConversationScope({
-        isGroup: Boolean(msg.isGroup),
-        chatId: msg.chatId,
-        peerA: me.id,
-        peerB: recipientId,
-      });
-
-      const encrypted = await encryptTextEnvelope(
-        {
-          text: msg.text,
-          replyText: msg.replyTo?.text,
-        },
-        scope
-      );
-
-      // Jika AES-256-GCM berhasil, jangan kirim plaintext pada wire packet
-      const wireMessage: ChatMessage = encrypted
-        ? {
-            ...msg,
-            text: undefined,
-            replyTo: msg.replyTo ? { ...msg.replyTo, text: '' } : undefined,
-            e2ee: true,
-          }
-        : { ...msg, e2ee: Boolean(msg.e2ee) };
-
-      return manager.sendPacket(recipientId, {
-        kind: 'MESSAGE',
-        message: wireMessage,
-        encrypted: encrypted ?? undefined,
-        groupMeta,
-      });
-    },
-    []
-  );
-
-  // Helper pengiriman satu pesan media via chunked WebRTC (caption ikut dienkripsi AES-256-GCM)
+  // Helper pengiriman satu pesan media via chunked WebRTC (dipakai saat kirim langsung & kuras antrean)
   const sendMediaMessageToPeer = useCallback(
     async (
       msg: ChatMessage,
@@ -1766,22 +1685,7 @@ export default function App() {
       groupMeta?: PendingOutboxMessage['groupMeta']
     ): Promise<boolean> => {
       const manager = peerManagerRef.current;
-      const me = profileRef.current;
-      if (!manager || !me || !msg.mediaData || msg.type === 'text') return false;
-
-      const scope = buildConversationScope({
-        isGroup: Boolean(msg.isGroup),
-        chatId: msg.chatId,
-        peerA: me.id,
-        peerB: recipientId,
-      });
-      const encryptedCaption = await encryptTextEnvelope(
-        {
-          text: msg.text,
-          replyText: msg.replyTo?.text,
-        },
-        scope
-      );
+      if (!manager || !msg.mediaData || msg.type === 'text') return false;
 
       return manager.sendFileChunkedAsync(
         recipientId,
@@ -1798,14 +1702,10 @@ export default function App() {
             senderId: msg.senderId,
             senderName: msg.senderName,
             msgType: msg.type as 'image' | 'video' | 'document' | 'voice',
-            text: encryptedCaption ? undefined : msg.text,
-            encrypted: encryptedCaption ?? undefined,
+            text: msg.text,
             duration: msg.duration,
             timestamp: msg.timestamp,
-            replyTo:
-              encryptedCaption && msg.replyTo
-                ? { ...msg.replyTo, text: '' }
-                : msg.replyTo,
+            replyTo: msg.replyTo,
             isGroup: msg.isGroup,
             groupMeta,
           },
@@ -1903,7 +1803,11 @@ export default function App() {
               break;
             }
           } else {
-            const sentNow = await sendEncryptedMessageToPeer(msg, recipientId, item.groupMeta);
+            const sentNow = peerManagerRef.current.sendPacket(recipientId, {
+              kind: 'MESSAGE',
+              message: msg,
+              groupMeta: item.groupMeta,
+            });
             if (!sentNow) {
               pendingLastAttemptRef.current.delete(item.id);
               break;
@@ -1921,7 +1825,7 @@ export default function App() {
         flushingPeersRef.current.delete(recipientId);
       }
     },
-    [removePendingEntry, sendMediaMessageToPeer, sendEncryptedMessageToPeer]
+    [removePendingEntry, sendMediaMessageToPeer]
   );
 
   // Initialize PeerJS whenever profile is ready and app is active
@@ -2290,12 +2194,22 @@ export default function App() {
       } else if (ui.activeTab !== 'chats') {
         setActiveTab('chats');
       } else {
-        // (c) Sudah di halaman utama daftar chat: JANGAN keluar & JANGAN hentikan audio latar belakang Mode Siaga
-        showToast(
-          'Tombol Back dikunci agar Mode Siaga tetap aktif. Tekan tombol Home (bulat) untuk ke layar utama HP, atau pilih menu ⋮ > Exit untuk keluar.',
-          4500,
-          'warning'
-        );
+        // (c) Sudah di halaman utama daftar chat:
+        // Pada Android Native (APK), kirim aplikasi ke latar belakang seperti WhatsApp agar Mode Siaga tetap hidup.
+        // Pada Web/Chrome, tahan halaman dan tampilkan peringatan.
+        if (isNativeCapacitor()) {
+          try {
+            void minimizeNativeApp();
+          } catch (err) {
+            console.error('[App] minimizeNativeApp error:', err);
+          }
+        } else {
+          showToast(
+            'Tombol Back dikunci agar Mode Siaga tetap aktif. Tekan tombol Home (bulat) untuk ke layar utama HP, atau pilih menu ⋮ > Exit untuk keluar.',
+            4500,
+            'warning'
+          );
+        }
       }
     };
 
@@ -2303,12 +2217,272 @@ export default function App() {
     window.addEventListener('touchstart', trapBackButton, { passive: true });
     window.addEventListener('popstate', handlePopState);
 
+    let removeNativeBack: (() => void) | null = null;
+    if (isNativeCapacitor()) {
+      try {
+        void registerNativeBackButtonHandler(() => {
+          try {
+            if (isExitedRef.current) return;
+            const ui = backGuardStateRef.current;
+            if (ui.hasCallModal || callRuntimeRef.current || incomingCallRef.current || pendingCallRef.current) {
+              handleRejectCallRef.current();
+            } else if (ui.lightboxMedia) {
+              setLightboxMedia(null);
+            } else if (ui.cameraPurpose) {
+              setCameraPurpose(null);
+            } else if (ui.showResetConfirm) {
+              setShowResetConfirm(false);
+            } else if (ui.showMainMenu) {
+              setShowMainMenu(false);
+            } else if (ui.showProfileDrawer) {
+              setShowProfileDrawer(false);
+            } else if (ui.showShareAppModal) {
+              setShowShareAppModal(false);
+            } else if (ui.showNewChatModal) {
+              setShowNewChatModal(false);
+            } else if (ui.showNewGroupModal) {
+              setShowNewGroupModal(false);
+            } else if (ui.searchOpen) {
+              setSearchOpen(false);
+              setSearchQuery('');
+            } else if (ui.activeChatId) {
+              setActiveChatId(null);
+            } else if (ui.activeTab !== 'chats') {
+              setActiveTab('chats');
+            } else {
+              void minimizeNativeApp();
+            }
+          } catch (err) {
+            console.error('[App] Native back button callback error:', err);
+          }
+        })
+          .then((cleanup) => {
+            removeNativeBack = cleanup;
+          })
+          .catch((err) => {
+            console.error('[App] registerNativeBackButtonHandler error:', err);
+          });
+      } catch (err) {
+        console.error('[App] Native back button setup error:', err);
+      }
+    }
+
     return () => {
       window.removeEventListener('pointerdown', trapBackButton);
       window.removeEventListener('touchstart', trapBackButton);
       window.removeEventListener('popstate', handlePopState);
+      try {
+        if (removeNativeBack) removeNativeBack();
+      } catch (err) {
+        console.error('[App] Remove native back listener error:', err);
+      }
     };
   }, [isExited, showToast, finalizeCall]);
+
+  // Inisialisasi Capacitor Android Native secara aman & non-blocking setelah React render (anti force-close Android 14/15/16)
+  useEffect(() => {
+    if (!isNativeCapacitor() || isExited) return;
+
+    const handleNativeAction = (ev: NativeNotificationActionEvent) => {
+      try {
+        if (ev.actionId === 'reject_call') {
+          handleRejectCallRef.current({
+            callerId: ev.callerId,
+            callerName: ev.callerName,
+            callId: ev.callId,
+            callType: ev.callType,
+          });
+          return;
+        }
+
+        if (ev.actionId === 'accept_call') {
+          forceShowIncomingCallModal({
+            callerId: ev.callerId,
+            callerName: ev.callerName,
+            callId: ev.callId,
+            callType: ev.callType,
+            isVideo: ev.isVideo,
+          });
+          void wakeAndSyncPeer();
+          void handleAcceptCallRef.current(true);
+          return;
+        }
+
+        if (ev.kind === 'call') {
+          forceShowIncomingCallModal({
+            callerId: ev.callerId,
+            callerName: ev.callerName,
+            callId: ev.callId,
+            callType: ev.callType,
+            isVideo: ev.isVideo,
+          });
+          void wakeAndSyncPeer();
+          return;
+        }
+
+        const targetChat = ev.chatId || ev.callerId;
+        if (targetChat) {
+          const cleanId = fromFullPeerId(targetChat);
+          setActiveTab('chats');
+          setActiveChatId(cleanId);
+          activeChatIdRef.current = cleanId;
+          void wakeAndSyncPeer();
+        }
+      } catch (err) {
+        console.error('[App] handleNativeAction error:', err);
+      }
+    };
+
+    try {
+      return startSafeNativePushAndServices({
+        standbyEnabled: standbyModeRef.current,
+        onToken: (token) => {
+          setNativeFcmToken(token);
+        },
+        onNotificationAction: handleNativeAction,
+        onPushReceived: (payload) => {
+          try {
+            if (payload.kind === 'call' && payload.callerId) {
+              pauseKeepAliveForCall();
+              startIncomingRingtone();
+              forceShowIncomingCallModal({
+                callerId: payload.callerId,
+                callerName: payload.callerName,
+                callId: payload.callId,
+                callType: payload.callType,
+                isVideo: payload.isVideo,
+              });
+            }
+            void wakeAndSyncPeer();
+          } catch (err) {
+            console.error('[App] onPushReceived error:', err);
+          }
+        },
+        onAppStateChange: (isActive) => {
+          try {
+            if (isActive) {
+              void wakeAndSyncPeer();
+              if (incomingCallRef.current && isIncomingCallStillActive(incomingCallRef.current)) {
+                forceShowIncomingCallModal();
+              }
+            }
+          } catch (err) {
+            console.error('[App] onAppStateChange error:', err);
+          }
+        },
+      });
+    } catch (err) {
+      console.error('[App] startSafeNativePushAndServices error:', err);
+      return undefined;
+    }
+  }, [isExited, wakeAndSyncPeer, forceShowIncomingCallModal, isIncomingCallStillActive]);
+
+  // Sinkronisasi opsional Firebase Auth & Cloud Firestore (FCM Token + Antrean Sinyal Bangun)
+  useEffect(() => {
+    const unsubscribe = subscribeFirebaseAuth((user) => {
+      setFirebaseUser(user);
+    });
+    return () => unsubscribe();
+  }, []);
+
+  useEffect(() => {
+    if (!firebaseUser || !firebaseUser.emailVerified || !profile?.id || isExited) return;
+    void syncDeviceTokenToFirestore({
+      peerId: profile.id,
+      displayName: profile.name,
+      fcmToken: nativeFcmToken,
+      platform: getDevicePlatform(),
+      standbyEnabled: standbyMode,
+    }).catch((err) => {
+      console.warn('[WattappsAU Firebase] Device token sync skipped:', err);
+    });
+  }, [firebaseUser, profile?.id, profile?.name, nativeFcmToken, standbyMode, isExited]);
+
+  useEffect(() => {
+    if (!firebaseUser || !profile?.id || isExited) return;
+
+    const unsubscribe = subscribeFirestoreWakeSignals((signal) => {
+      void acknowledgeFirestoreWakeSignal(signal.signalId).catch(() => {});
+
+      const cleanId = fromFullPeerId(signal.senderPeerId);
+      const existingContact = contactsRef.current.find((c) => c.id === cleanId);
+      const callerName = existingContact?.name?.trim() || signal.senderName || `ID: ${cleanId}`;
+      const callerAvatar = existingContact?.avatar || '';
+
+      if (signal.type === 'INCOMING_CALL') {
+        const callId = signal.callId || generateUid('call');
+        if (!callRuntimeRef.current && pendingCallRef.current?.callId !== callId) {
+          pauseKeepAliveForCall();
+          startIncomingRingtone();
+          const isVideo = signal.callType === 'video';
+          const pending: PendingIncomingCall = {
+            callId,
+            peerId: cleanId,
+            peerName: callerName,
+            peerAvatar: callerAvatar,
+            callType: isVideo ? 'video' : 'audio',
+            receivedAt: Date.now(),
+          };
+          pendingCallRef.current = pending;
+          presentPendingCallModal(pending);
+          showIncomingWebNotification({
+            title: callerName,
+            body: isVideo ? 'Panggilan video WattappsAU' : 'Panggilan suara WattappsAU',
+            icon: callerAvatar || '/icon-512.png',
+            tag: `wattapps-call-${cleanId}`,
+            isCall: true,
+            data: {
+              action: 'ANSWER_CALL',
+              kind: 'call',
+              callerId: cleanId,
+              callerName,
+              callerAvatar,
+              fromId: cleanId,
+              fromName: callerName,
+              callId,
+              callType: pending.callType,
+              isVideo,
+            },
+            onClick: () => {
+              forceShowIncomingCallModal({
+                callerId: cleanId,
+                callerName,
+                callId,
+                callType: pending.callType,
+                isVideo,
+              });
+            },
+          });
+        }
+        peerManagerRef.current?.ensureConnection(cleanId, true);
+      } else if (signal.type === 'NEW_MSG') {
+        const isViewing = activeChatIdRef.current === cleanId;
+        if (!isViewing || document.hidden || standbyModeRef.current) {
+          playMessagePop(true);
+          showIncomingWebNotification({
+            title: callerName,
+            body: 'Pesan baru masuk',
+            icon: callerAvatar || '/icon-512.png',
+            tag: `fs-msg-${signal.signalId}`,
+            data: {
+              kind: 'message',
+              chatId: cleanId,
+              fromId: cleanId,
+              fromName: callerName,
+              callerAvatar,
+            },
+            onClick: () => {
+              setActiveTab('chats');
+              setActiveChatId(cleanId);
+            },
+          });
+        }
+        peerManagerRef.current?.ensureConnection(cleanId, false);
+      }
+    });
+
+    return () => unsubscribe();
+  }, [firebaseUser, profile?.id, isExited, presentPendingCallModal, forceShowIncomingCallModal]);
 
   // Buka ruang chat targetId & tampilkan modal Panggilan Masuk (Angkat/Tolak) dari URL parameter atau postMessage SW
   const applyNotificationTarget = useCallback(
@@ -2700,7 +2874,6 @@ export default function App() {
         transferProgress: isMediaMessage ? 0 : undefined,
         transferWaitingPeer: isMediaMessage && !allRecipientsOnline ? true : undefined,
         isGroup: Boolean(target.isGroup),
-        e2ee: true,
         ...payload,
         fileSize: computedSize,
       };
@@ -2740,7 +2913,7 @@ export default function App() {
 
       if (!manager) return;
 
-      // Untuk setiap penerima: kirim langsung (terenkripsi AES-256-GCM) jika Online, atau biarkan di antrean pendingMessages jika Offline
+      // Untuk setiap penerima: kirim langsung jika Online, atau biarkan di antrean pendingMessages jika Offline
       recipients.forEach((recipientId) => {
         const entryId = `${msg.id}:${recipientId}`;
         if (manager.isPeerOnline(recipientId)) {
@@ -2748,21 +2921,31 @@ export default function App() {
           if (isMediaMessage && msg.mediaData && msg.type !== 'text') {
             void sendMediaMessageToPeer(msg, recipientId, groupMeta);
           } else {
-            void sendEncryptedMessageToPeer(msg, recipientId, groupMeta);
+            manager.sendPacket(recipientId, {
+              kind: 'MESSAGE',
+              message: msg,
+              groupMeta,
+            });
           }
         } else {
-          // Penerima Offline: simpan di outboxMessages & kirim sinyal bangun terenkripsi via ntfy.sh (tanpa polling loop)
+          // Penerima Offline: simpan di outboxMessages & kirim sinyal bangun terenkripsi via ntfy.sh + Firestore (jika aktif)
           void sendNtfyWakeSignal({
             targetId: recipientId,
             type: 'NEW_MSG',
             fromId: me.id,
             fromName: me.name,
           });
+          void sendFirestoreWakeSignal({
+            recipientPeerId: recipientId,
+            senderPeerId: me.id,
+            senderName: me.name,
+            type: 'NEW_MSG',
+          }).catch(() => {});
           manager.ensureConnection(recipientId, false);
         }
       });
     },
-    [sendMediaMessageToPeer, sendEncryptedMessageToPeer]
+    [sendMediaMessageToPeer]
   );
 
   // Typing signal
@@ -3001,7 +3184,7 @@ export default function App() {
     // Hentikan otomatis Silent Audio Keep-Alive sebelum mengakses mikrofon/speaker panggilan
     pauseKeepAliveForCall();
 
-    // Kirim sinyal bangun prioritas via ntfy.sh (menjamin lawan bangun walau socket lama sedang tidur/zombie)
+    // Kirim sinyal bangun prioritas via ntfy.sh & Firestore (menjamin lawan bangun walau socket lama sedang tidur/zombie)
     void sendNtfyWakeSignal({
       targetId: peerId,
       type: 'INCOMING_CALL',
@@ -3010,6 +3193,14 @@ export default function App() {
       callType,
       callId,
     });
+    void sendFirestoreWakeSignal({
+      recipientPeerId: peerId,
+      senderPeerId: profile.id,
+      senderName: profile.name,
+      type: 'INCOMING_CALL',
+      callType,
+      callId,
+    }).catch(() => {});
 
     if (!manager.isPeerOnline(peerId)) {
       showToast(`Sinyal bangun panggilan dikirim ke ${peerName} via ntfy`);
@@ -3387,22 +3578,26 @@ export default function App() {
     setActiveCallUI((prev) => (prev ? { ...prev, isSpeakerOn: !prev.isSpeakerOn } : null));
   };
 
-  // Toggle Mode Siaga (Service Worker + Auto-Reconnect PeerJS + Screen Wake Lock tanpa membajak fokus audio Android/Bluetooth)
+  // Toggle Mode Siaga (Background Media Keep-Alive + Media Session Lock Screen + Screen Wake Lock)
   const handleToggleStandby = useCallback(async () => {
-    if (standbyModeRef.current) {
+    // Jika Mode Siaga sudah aktif DAN aliran audio penjaga sudah benar-benar berjalan, matikan
+    if (standbyModeRef.current && isKeepAliveActuallyPlaying()) {
       await disableStandbyMode();
       setStandbyMode(false);
       showToast('Mode Siaga dinonaktifkan');
       return;
     }
 
+    // Jalankan await audio.play() langsung di dalam event klik user agar kartu Media Session layar kunci muncul
     const res = await enableStandbyMode();
     setStandbyMode(true);
 
-    if (res.wakeLockActive) {
-      showToast('Mode Siaga Aktif · PeerJS & Service Worker siaga tanpa mengganggu fokus audio');
+    if (res.audioKeepAliveActive) {
+      showToast('Mode Siaga Aktif · Saluran latar & kartu layar kunci aktif');
+    } else if (res.wakeLockActive) {
+      showToast('Mode Siaga Aktif · Layar & koneksi P2P tetap terjaga');
     } else {
-      showToast('Mode Siaga Aktif · Koneksi P2P & notifikasi siaga tanpa mengganggu audio perangkat');
+      showToast('Mode Siaga Aktif · Koneksi P2P tetap siaga');
     }
   }, [showToast]);
 
@@ -3423,7 +3618,7 @@ export default function App() {
     setProfile(null);
   };
 
-  // Keluar aplikasi secara resmi (matikan Mode Siaga, lepas AudioContext & Media Session, lalu putus koneksi)
+  // Keluar aplikasi secara resmi (matikan Mode Siaga, hentikan audio latar belakang, bersihkan Media Session & putus koneksi)
   const handleExitApp = useCallback(async () => {
     setShowMainMenu(false);
     setShowProfileDrawer(false);
@@ -3444,8 +3639,21 @@ export default function App() {
     standbyModeRef.current = false;
     setStandbyMode(false);
     await disableStandbyMode();
-    releaseActiveMediaSession();
-    releaseAudioContextNow();
+
+    // Pastikan elemen audio penjaga & Media Session benar-benar berhenti
+    try {
+      const keepAliveEl = document.getElementById('keepalive-audio') as HTMLAudioElement | null;
+      if (keepAliveEl) {
+        keepAliveEl.pause();
+        keepAliveEl.currentTime = 0;
+      }
+      if ('mediaSession' in navigator) {
+        navigator.mediaSession.playbackState = 'none';
+        navigator.mediaSession.metadata = null;
+      }
+    } catch {
+      // ignore
+    }
 
     isHistoryTrapped = false;
     isExitedRef.current = true;
@@ -3454,6 +3662,16 @@ export default function App() {
     setPeerState('disconnected');
     setOnlinePeers({});
     setIsExited(true);
+
+    // Pada aplikasi Android Native (Capacitor APK), tutup proses aplikasi secara bersih
+    if (isNativeCapacitor()) {
+      try {
+        await exitNativeApp();
+      } catch (err) {
+        console.error('[App] exitNativeApp error:', err);
+      }
+      return;
+    }
 
     // Coba tutup jendela/tab aplikasi (didukung di PWA/window tertentu)
     try {
@@ -3500,20 +3718,20 @@ export default function App() {
     return <OnboardingScreen onComplete={handleCompleteOnboarding} />;
   }
 
-  // Layar Istirahat / Offline setelah pengguna memilih menu Exit (Dark-Mode Command-Center: Navy/Slate + Cyan/Gold)
+  // Layar Istirahat / Offline setelah pengguna memilih menu Exit
   if (isExited) {
     return (
-      <div className="h-dvh w-full flex flex-col items-center justify-center bg-[#070d16] text-slate-100 px-6 text-center">
-        <div className="w-full max-w-sm rounded-3xl bg-[#0f172a] border border-cyan-500/20 p-7 shadow-[0_20px_60px_rgba(0,0,0,0.6)] flex flex-col items-center">
+      <div className="h-dvh w-full flex flex-col items-center justify-center bg-[#0B141A] text-[#E9EDEF] px-6 text-center">
+        <div className="w-full max-w-sm rounded-3xl bg-[#111B21] border border-white/10 p-7 shadow-2xl flex flex-col items-center">
           <div className="relative mb-5">
-            <AppLogo size={76} className="opacity-80 grayscale-[25%] ring-2 ring-cyan-400/35" />
-            <span className="absolute -bottom-1 -right-1 w-7 h-7 rounded-full bg-slate-900 border-2 border-amber-400/60 flex items-center justify-center">
-              <Power className="w-3.5 h-3.5 text-amber-400" />
+            <AppLogo size={76} className="opacity-75 grayscale-[35%] ring-4 ring-white/10" />
+            <span className="absolute -bottom-1 -right-1 w-7 h-7 rounded-full bg-[#233138] border-2 border-[#111B21] flex items-center justify-center">
+              <Power className="w-3.5 h-3.5 text-orange-400" />
             </span>
           </div>
 
-          <span className="inline-flex items-center gap-1.5 px-3 py-1 rounded-full bg-amber-500/15 border border-amber-400/35 text-amber-300 text-[11px] font-semibold tracking-wide">
-            <span className="w-2 h-2 rounded-full bg-amber-400" />
+          <span className="inline-flex items-center gap-1.5 px-3 py-1 rounded-full bg-orange-500/15 border border-orange-400/30 text-orange-300 text-[11px] font-semibold tracking-wide">
+            <span className="w-2 h-2 rounded-full bg-orange-400" />
             Offline · Mode Siaga Nonaktif
           </span>
 
@@ -3521,15 +3739,15 @@ export default function App() {
             WattappsAU Telah Berhenti
           </h1>
 
-          <p className="mt-2.5 text-sm text-slate-400 leading-relaxed">
-            Layanan siaga, sesi media, AudioContext, dan koneksi P2P telah dilepas sepenuhnya. Aplikasi ini sekarang aman untuk ditutup.
+          <p className="mt-2.5 text-sm text-[#8696A0] leading-relaxed">
+            Layanan siaga latar belakang, audio penjaga, dan koneksi P2P telah dimatikan sepenuhnya. Aplikasi ini sekarang aman untuk ditutup.
           </p>
 
           <div className="mt-6 w-full flex flex-col gap-2.5">
             <button
               type="button"
               onClick={() => void handleReopenApp()}
-              className="w-full h-11 rounded-xl bg-cyan-400 hover:bg-cyan-300 text-slate-950 text-sm font-bold transition-colors cursor-pointer"
+              className="w-full h-11 rounded-xl bg-[#00A884] hover:bg-[#06CF9C] text-[#111B21] text-sm font-bold transition-colors cursor-pointer"
             >
               Buka Kembali WattappsAU
             </button>
@@ -3542,7 +3760,7 @@ export default function App() {
                   // ignore
                 }
               }}
-              className="w-full h-10 rounded-xl bg-white/5 hover:bg-white/10 text-slate-300 text-xs font-semibold transition-colors cursor-pointer"
+              className="w-full h-10 rounded-xl bg-white/5 hover:bg-white/10 text-[#AEBAC1] text-xs font-semibold transition-colors cursor-pointer"
             >
               Tutup Jendela / Swipe Keluar
             </button>
@@ -3553,15 +3771,15 @@ export default function App() {
   }
 
   return (
-    <div className="h-dvh w-full flex bg-[#F0F2F5] dark:bg-[#070d16] overflow-hidden relative">
-      {/* LEFT SIDEBAR (Full-width on mobile when no chat active; fixed 380px-420px split-pane on desktop) */}
+    <div className="h-dvh w-full flex bg-[#F0F2F5] dark:bg-[#0B141A] overflow-hidden relative">
+      {/* LEFT SIDEBAR (Full-width on mobile when no chat active; fixed 390px-420px split-pane on desktop) */}
       <aside
-        className={`w-full md:w-[380px] lg:w-[420px] h-full flex flex-col bg-white dark:bg-[#0b1320] border-r border-black/10 dark:border-cyan-500/15 shrink-0 ${
+        className={`w-full md:w-[380px] lg:w-[420px] h-full flex flex-col bg-white dark:bg-[#111B21] border-r border-black/10 dark:border-white/10 shrink-0 ${
           activeContact ? 'hidden md:flex' : 'flex'
         }`}
       >
-        {/* Top Command-Center Header (Navy/Slate + Neon Cyan & Gold Accents in Dark Mode) */}
-        <header className="bg-[#008069] dark:bg-[#0f172a] dark:border-b dark:border-cyan-500/15 text-white shrink-0 pt-safe">
+        {/* Top WhatsApp Header (#008069 Light / #1F2C34 Dark) */}
+        <header className="bg-[#008069] dark:bg-[#1F2C34] text-white shrink-0 pt-safe">
           {searchOpen ? (
             <div className="h-[58px] px-3 flex items-center gap-2">
               <button
@@ -3645,19 +3863,19 @@ export default function App() {
                   onClick={() => void handleToggleStandby()}
                   className={`h-8 px-2 mr-0.5 rounded-full inline-flex items-center gap-1 text-[11px] font-semibold transition-all cursor-pointer border ${
                     standbyMode
-                      ? 'bg-cyan-500/15 border-cyan-400/65 text-cyan-200 shadow-[0_0_12px_rgba(34,211,238,0.28)]'
+                      ? 'bg-[#25D366]/20 border-[#25D366]/70 text-[#D9FDD3] shadow-[0_0_12px_rgba(37,211,102,0.35)]'
                       : 'bg-white/10 border-white/15 text-white/90 hover:bg-white/20'
                   }`}
                   title={
                     standbyMode
-                      ? 'Mode Siaga AKTIF (Service Worker & Auto-Reconnect tanpa mengganggu fokus audio)'
-                      : 'Aktifkan Mode Siaga untuk menjaga koneksi P2P & notifikasi'
+                      ? 'Mode Siaga Latar Belakang AKTIF (ketuk untuk matikan)'
+                      : 'Aktifkan Mode Siaga Latar Belakang agar koneksi P2P tetap hidup saat layar terkunci'
                   }
-                  aria-label="Mode Siaga"
+                  aria-label="Mode Siaga Latar Belakang"
                   aria-pressed={standbyMode}
                 >
                   {standbyMode ? (
-                    <ShieldCheck className="w-3.5 h-3.5 shrink-0 text-amber-400" />
+                    <ShieldCheck className="w-3.5 h-3.5 shrink-0 text-[#25D366] animate-pulse" />
                   ) : (
                     <Shield className="w-3.5 h-3.5 shrink-0" />
                   )}
@@ -3818,20 +4036,20 @@ export default function App() {
             </div>
           )}
 
-          {/* 3 Main Navigation Tabs: Chat · Status · Panggilan */}
+          {/* 3 Main WhatsApp Navigation Tabs: Chat · Status · Panggilan */}
           <nav className="grid grid-cols-3 text-sm font-semibold">
             <button
               type="button"
               onClick={() => setActiveTab('chats')}
               className={`h-11 flex items-center justify-center gap-1.5 border-b-[3px] transition-colors cursor-pointer ${
                 activeTab === 'chats'
-                  ? 'border-white dark:border-cyan-400 text-white dark:text-cyan-300'
-                  : 'border-transparent text-white/70 dark:text-slate-400 hover:text-white'
+                  ? 'border-white dark:border-[#00A884] text-white dark:text-[#00A884]'
+                  : 'border-transparent text-white/70 dark:text-[#8696A0] hover:text-white'
               }`}
             >
               <span>Chat</span>
               {totalUnreadChats > 0 && (
-                <span className="min-w-[18px] h-[18px] px-1 rounded-full bg-white dark:bg-amber-400 text-[#008069] dark:text-slate-950 text-[10.5px] font-bold flex items-center justify-center tabular-nums">
+                <span className="min-w-[18px] h-[18px] px-1 rounded-full bg-white dark:bg-[#00A884] text-[#008069] dark:text-[#111B21] text-[10.5px] font-bold flex items-center justify-center tabular-nums">
                   {totalUnreadChats}
                 </span>
               )}
@@ -3842,13 +4060,13 @@ export default function App() {
               onClick={() => setActiveTab('status')}
               className={`h-11 flex items-center justify-center gap-1.5 border-b-[3px] transition-colors cursor-pointer ${
                 activeTab === 'status'
-                  ? 'border-white dark:border-cyan-400 text-white dark:text-cyan-300'
-                  : 'border-transparent text-white/70 dark:text-slate-400 hover:text-white'
+                  ? 'border-white dark:border-[#00A884] text-white dark:text-[#00A884]'
+                  : 'border-transparent text-white/70 dark:text-[#8696A0] hover:text-white'
               }`}
             >
               <span>Status</span>
               {hasUnviewedStatus && (
-                <span className="w-2 h-2 rounded-full bg-amber-400" />
+                <span className="w-2 h-2 rounded-full bg-[#25D366]" />
               )}
             </button>
 
@@ -3857,8 +4075,8 @@ export default function App() {
               onClick={() => setActiveTab('calls')}
               className={`h-11 flex items-center justify-center gap-1.5 border-b-[3px] transition-colors cursor-pointer ${
                 activeTab === 'calls'
-                  ? 'border-white dark:border-cyan-400 text-white dark:text-cyan-300'
-                  : 'border-transparent text-white/70 dark:text-slate-400 hover:text-white'
+                  ? 'border-white dark:border-[#00A884] text-white dark:text-[#00A884]'
+                  : 'border-transparent text-white/70 dark:text-[#8696A0] hover:text-white'
               }`}
             >
               <span>Panggilan</span>
@@ -4004,6 +4222,26 @@ export default function App() {
       {showProfileDrawer && (
         <ProfileDrawer
           profile={profile}
+          firebaseUserEmail={firebaseUser?.email ?? null}
+          nativeFcmToken={nativeFcmToken}
+          onSignInFirebase={async () => {
+            try {
+              const user = await signInWithGoogleForCloudPush();
+              if (user) {
+                showToast(`Cloud Push Firestore aktif (${user.email})`);
+              }
+            } catch {
+              showToast('Login Google dibatalkan atau gagal.');
+            }
+          }}
+          onSignOutFirebase={async () => {
+            try {
+              await signOutCloudPush();
+              showToast('Koneksi Cloud Push Firestore diputus.');
+            } catch {
+              showToast('Gagal memutus koneksi Cloud Push.');
+            }
+          }}
           onUpdateProfile={handleUpdateProfile}
           onOpenShareApp={() => {
             setShowProfileDrawer(false);

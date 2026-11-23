@@ -1,7 +1,7 @@
 self.addEventListener('install', () => self.skipWaiting());
 self.addEventListener('activate', (e) => e.waitUntil(clients.claim()));
 
-const CACHE_NAME = 'wattappsau-pwa-cache-v9';
+const CACHE_NAME = 'wattappsau-pwa-cache-v7';
 const CORE_ASSETS = [
   '/',
   '/index.html',
@@ -107,26 +107,7 @@ function buildNotificationTargetUrl(senderId, eventType, extra) {
 
 self.addEventListener('message', (event) => {
   const msg = event.data;
-  if (!msg) return;
-
-  if (msg.type === 'DISMISS_CALL_NOTIFICATIONS') {
-    const peerId = msg.peerId || '';
-    event.waitUntil(
-      self.registration.getNotifications().then((list) => {
-        for (const notif of list) {
-          const matchesPeer = peerId && notif.tag === 'wattapps-call-' + peerId;
-          const isAnyCall =
-            (notif.tag && notif.tag.startsWith('wattapps-call-')) || notif.tag === 'wattappsau-call';
-          if (matchesPeer || (!peerId && isAnyCall) || isAnyCall) {
-            notif.close();
-          }
-        }
-      })
-    );
-    return;
-  }
-
-  if (msg.type !== 'SHOW_NOTIFICATION') return;
+  if (!msg || msg.type !== 'SHOW_NOTIFICATION') return;
 
   const senderId =
     msg.senderId ||
@@ -157,29 +138,29 @@ self.addEventListener('message', (event) => {
         : 'Panggilan suara WattappsAU'
       : msg.body || 'Pesan baru masuk';
 
-  const isCall = eventType === 'call';
-
   event.waitUntil(
     self.registration.showNotification(notifTitle, {
       body: notifBody,
       icon,
       badge: '/icon-512.png',
-      tag: isCall
-        ? 'wattapps-call-' + (senderId || 'active')
-        : msg.tag || 'wattapps-chat-' + (senderId || Date.now()),
-      timestamp: Date.now(),
-      renotify: isCall,
-      requireInteraction: isCall,
-      silent: !isCall,
-      actions: isCall
-        ? [
-            { action: 'reject_call', title: 'Tolak' },
-            { action: 'accept_call', title: 'Jawab' },
-          ]
-        : [{ action: 'open_chat', title: 'Balas / Buka Chat' }],
+      tag:
+        eventType === 'call'
+          ? 'wattapps-call-' + (senderId || 'active')
+          : msg.tag || 'wattapps-chat-' + (senderId || Date.now()),
+      renotify: eventType === 'call',
+      requireInteraction: eventType === 'call',
+      vibrate: eventType === 'call' ? [1000, 500, 1000, 500, 1000] : [200, 100, 200],
+      silent: false,
+      actions:
+        eventType === 'call'
+          ? [
+              { action: 'reject_call', title: 'Tolak' },
+              { action: 'accept_call', title: 'Jawab' },
+            ]
+          : [{ action: 'open_chat', title: 'Balas / Buka Chat' }],
       data: Object.assign({}, msg.data || {}, {
-        action: isCall ? 'ANSWER_CALL' : 'OPEN_CHAT',
-        kind: isCall ? 'call' : 'message',
+        action: eventType === 'call' ? 'ANSWER_CALL' : 'OPEN_CHAT',
+        kind: eventType === 'call' ? 'call' : 'message',
         callerId: senderId,
         callerName,
         callType: isVideo ? 'video' : 'audio',
@@ -222,29 +203,28 @@ self.addEventListener('push', (event) => {
         : 'Panggilan suara WattappsAU'
       : payload.body || 'Pesan baru masuk';
 
-  const isCall = eventType === 'call';
-
   event.waitUntil(
     self.registration.showNotification(notifTitle, {
       body: notifBody,
       icon,
       badge: '/icon-512.png',
-      tag: isCall
-        ? 'wattapps-call-' + (senderId || 'active')
-        : payload.tag || 'push-chat-' + senderId,
-      timestamp: Date.now(),
-      renotify: isCall,
-      requireInteraction: isCall,
-      silent: !isCall,
-      actions: isCall
-        ? [
-            { action: 'reject_call', title: 'Tolak' },
-            { action: 'accept_call', title: 'Jawab' },
-          ]
-        : [{ action: 'open_chat', title: 'Balas / Buka Chat' }],
+      tag:
+        eventType === 'call'
+          ? 'wattapps-call-' + (senderId || 'active')
+          : payload.tag || 'push-chat-' + senderId,
+      renotify: eventType === 'call',
+      requireInteraction: eventType === 'call',
+      vibrate: eventType === 'call' ? [1000, 500, 1000, 500, 1000] : [200, 100, 200],
+      actions:
+        eventType === 'call'
+          ? [
+              { action: 'reject_call', title: 'Tolak' },
+              { action: 'accept_call', title: 'Jawab' },
+            ]
+          : [{ action: 'open_chat', title: 'Balas / Buka Chat' }],
       data: Object.assign({}, payload, {
-        action: isCall ? 'ANSWER_CALL' : 'OPEN_CHAT',
-        kind: isCall ? 'call' : 'message',
+        action: eventType === 'call' ? 'ANSWER_CALL' : 'OPEN_CHAT',
+        kind: eventType === 'call' ? 'call' : 'message',
         callerId: senderId,
         callerName,
         callType: isVideo ? 'video' : 'audio',
@@ -303,29 +283,23 @@ self.addEventListener('notificationclick', (event) => {
     encodeURIComponent(callType) +
     (data.callId ? '&callId=' + encodeURIComponent(data.callId) : '');
 
-  // 2. Tombol "Jawab" pada notifikasi panggilan: fokus/buka aplikasi ke halaman panggilan & angkat otomatis jika izin siap
+  // 2. Tombol "Jawab" pada notifikasi panggilan: buka/fokuskan aplikasi & angkat jika izin sudah siap
   if (action === 'accept_call') {
     const autoAcceptUrl = callOpenUrl + '&autoAccept=1';
     event.waitUntil(
       clients.matchAll({ type: 'window', includeUncontrolled: true }).then((windowClients) => {
-        const matched =
-          windowClients.find((c) => c.url && c.url.startsWith(self.location.origin)) ||
-          windowClients[0];
-        if (matched) {
-          matched.postMessage({
-            type: 'ACCEPT_INCOMING_CALL_FROM_NOTIFICATION',
-            callerId,
-            callerName,
-            callId: data.callId,
-            callType,
-            isVideo,
-            url: autoAcceptUrl,
-            data,
-          });
-          if ('focus' in matched) {
-            return matched.focus().catch(() =>
-              clients.openWindow ? clients.openWindow(autoAcceptUrl) : undefined
-            );
+        for (const client of windowClients) {
+          if ('focus' in client) {
+            client.postMessage({
+              type: 'ACCEPT_INCOMING_CALL_FROM_NOTIFICATION',
+              callerId,
+              callerName,
+              callId: data.callId,
+              callType,
+              isVideo,
+              data,
+            });
+            return client.focus();
           }
         }
         if (clients.openWindow) {
@@ -337,7 +311,7 @@ self.addEventListener('notificationclick', (event) => {
     return;
   }
 
-  // 3. Ketuk notifikasi panggilan atau pesan: otomatis fokuskan / buka aplikasi ke halaman panggilan atau ruang chat
+  // 3. Ketuk badan notifikasi panggilan atau tombol "Balas / Buka Chat" / badan notifikasi pesan
   const targetUrl =
     action === 'open_chat'
       ? data.url || buildNotificationTargetUrl(callerId, 'chat', data)
@@ -347,32 +321,26 @@ self.addEventListener('notificationclick', (event) => {
 
   event.waitUntil(
     clients.matchAll({ type: 'window', includeUncontrolled: true }).then((windowClients) => {
-      const matched =
-        windowClients.find((c) => c.url && c.url.startsWith(self.location.origin)) ||
-        windowClients[0];
-      if (matched) {
-        if (isCallNotification && action !== 'open_chat') {
-          matched.postMessage({
-            type: 'TRIGGER_INCOMING_CALL_UI',
-            callerId,
-            callerName,
-            callId: data.callId,
-            callType,
-            isVideo,
-            url: callOpenUrl,
-            data,
-          });
-        } else {
-          matched.postMessage({
-            type: 'OPEN_TARGET',
-            url: targetUrl,
-            data,
-          });
-        }
-        if ('focus' in matched) {
-          return matched.focus().catch(() =>
-            clients.openWindow ? clients.openWindow(targetUrl) : undefined
-          );
+      for (const client of windowClients) {
+        if ('focus' in client) {
+          if (isCallNotification && action !== 'open_chat') {
+            client.postMessage({
+              type: 'TRIGGER_INCOMING_CALL_UI',
+              callerId,
+              callerName,
+              callId: data.callId,
+              callType,
+              isVideo,
+              data,
+            });
+          } else {
+            client.postMessage({
+              type: 'OPEN_TARGET',
+              url: targetUrl,
+              data,
+            });
+          }
+          return client.focus();
         }
       }
       if (clients.openWindow) {

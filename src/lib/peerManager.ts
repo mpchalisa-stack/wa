@@ -491,9 +491,6 @@ export class WA6PeerManager {
       debug: 0,
       config: {
         iceServers: ICE_SERVERS,
-        // Enkripsi end-to-end bawaan WebRTC (DTLS/SRTP) untuk seluruh aliran audio/video & DataChannel
-        bundlePolicy: 'max-bundle',
-        rtcpMuxPolicy: 'require',
       },
     });
 
@@ -522,7 +519,6 @@ export class WA6PeerManager {
     peer.on('close', () => {
       if (this.destroyed) return;
       this.callbacks.onStatusChange('disconnected');
-      this.scheduleReconnect();
     });
 
     peer.on('error', (err) => {
