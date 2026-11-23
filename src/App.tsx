@@ -1934,6 +1934,12 @@ export default function App() {
       onStatusChange: (state, errMsg) => {
         setPeerState(state);
         setPeerError(errMsg);
+        syncPeerMediaSession({
+          peerState: state,
+          standbyEnabled: standbyModeRef.current,
+          peerId: profileRef.current?.id || profile.id,
+          isExited: isExitedRef.current,
+        });
         if (state === 'online') {
           // Proactively handshake known 1:1 contacts to establish presence
           contactsRef.current
@@ -1998,11 +2004,13 @@ export default function App() {
 
     document.addEventListener('visibilitychange', handleVisibilityOrNetworkRefresh);
     window.addEventListener('online', handleVisibilityOrNetworkRefresh);
+    window.addEventListener('offline', handleVisibilityOrNetworkRefresh);
     window.addEventListener('focus', handleVisibilityOrNetworkRefresh);
 
     return () => {
       document.removeEventListener('visibilitychange', handleVisibilityOrNetworkRefresh);
       window.removeEventListener('online', handleVisibilityOrNetworkRefresh);
+      window.removeEventListener('offline', handleVisibilityOrNetworkRefresh);
       window.removeEventListener('focus', handleVisibilityOrNetworkRefresh);
     };
   }, [profile?.id, peerState, standbyMode, isExited, onlineContactsCount]);

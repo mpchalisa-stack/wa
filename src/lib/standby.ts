@@ -68,30 +68,18 @@ function resolvePublicAssetUrl(assetPath: string): string {
 
 /**
  * Daftar artwork resmi WattappsAU dari folder /public untuk kartu MediaMetadata layar kunci.
- * Menggunakan logo SWA BHUWANA PAKSA & ikon aplikasi dari folder public dengan URL absolut.
+ * Menggunakan logo resmi yang diunggah (/assets/aistudio/1792503945296_954409ac.jpg) pada seluruh
+ * ukuran standar agar Chromium/Android tidak memilih ikon lama saat seleksi ukuran ideal.
  */
 function buildAppMediaArtwork(): MediaImage[] {
+  const emblemUrl = resolvePublicAssetUrl('/assets/aistudio/1792503945296_954409ac.jpg');
   return [
-    {
-      src: resolvePublicAssetUrl('/assets/aistudio/1792503945296_954409ac.jpg'),
-      sizes: '2048x2048',
-      type: 'image/jpeg',
-    },
-    {
-      src: resolvePublicAssetUrl('/icon-512.png'),
-      sizes: '512x512',
-      type: 'image/png',
-    },
-    {
-      src: resolvePublicAssetUrl('/pwa-512x512.png'),
-      sizes: '512x512',
-      type: 'image/png',
-    },
-    {
-      src: resolvePublicAssetUrl('/pwa-192x192.png'),
-      sizes: '192x192',
-      type: 'image/png',
-    },
+    { src: emblemUrl, sizes: '96x96', type: 'image/jpeg' },
+    { src: emblemUrl, sizes: '128x128', type: 'image/jpeg' },
+    { src: emblemUrl, sizes: '192x192', type: 'image/jpeg' },
+    { src: emblemUrl, sizes: '256x256', type: 'image/jpeg' },
+    { src: emblemUrl, sizes: '384x384', type: 'image/jpeg' },
+    { src: emblemUrl, sizes: '512x512', type: 'image/jpeg' },
   ];
 }
 
@@ -172,13 +160,23 @@ function clearAllMediaSessionHandlers(): void {
       // ignore unsupported actions
     }
   }
+  const extraActions = ['hangup', 'togglemicrophone', 'togglecamera', 'skipad'];
+  for (const extra of extraActions) {
+    try {
+      (
+        navigator.mediaSession as MediaSession & {
+          setActionHandler: (action: string, handler: (() => void) | null) => void;
+        }
+      ).setActionHandler(extra, null);
+    } catch {
+      // ignore unsupported actions
+    }
+  }
+  // Hapus progress bar / scrubber durasi media agar tidak tampil seperti pemutar musik
   try {
-    // Beberapa versi Chromium mendukung action 'hangup' untuk panggilan WebRTC
-    (
-      navigator.mediaSession as MediaSession & {
-        setActionHandler: (action: string, handler: (() => void) | null) => void;
-      }
-    ).setActionHandler('hangup', null);
+    if (typeof navigator.mediaSession.setPositionState === 'function') {
+      navigator.mediaSession.setPositionState();
+    }
   } catch {
     // ignore
   }
@@ -283,7 +281,8 @@ export function clearPeerMediaSession(): void {
 }
 
 /**
- * Mengaktifkan Media Session secara terkontrol HANYA saat panggilan aktif atau transmisi VOX berlangsung.
+ * Memperbarui MediaMetadata selama panggilan aktif atau transmisi VOX berlangsung
+ * tanpa mendaftarkan tombol kontrol pemutar audio HP (play/pause/skip/seek).
  */
 export function activateActiveMediaSession(options: ActiveMediaSessionOptions): void {
   activeMediaSessionMode = options.mode;
@@ -291,6 +290,9 @@ export function activateActiveMediaSession(options: ActiveMediaSessionOptions): 
 
   try {
     if (typeof navigator === 'undefined' || !('mediaSession' in navigator)) return;
+
+    // Pastikan seluruh kontrol pemutar audio HP (play/pause/stop/next/prev/seek) tetap kosong
+    clearAllMediaSessionHandlers();
 
     if (typeof MediaMetadata !== 'undefined') {
       const albumText = options.peerName
@@ -305,34 +307,7 @@ export function activateActiveMediaSession(options: ActiveMediaSessionOptions): 
       });
     }
 
-    clearAllMediaSessionHandlers();
-
-    if (options.onEndOrPause) {
-      const handler = options.onEndOrPause;
-      try {
-        navigator.mediaSession.setActionHandler('pause', handler);
-      } catch {
-        // ignore
-      }
-      try {
-        navigator.mediaSession.setActionHandler('stop', handler);
-      } catch {
-        // ignore
-      }
-      if (options.mode === 'call') {
-        try {
-          (
-            navigator.mediaSession as MediaSession & {
-              setActionHandler: (action: string, cb: (() => void) | null) => void;
-            }
-          ).setActionHandler('hangup', handler);
-        } catch {
-          // ignore
-        }
-      }
-    }
-
-    navigator.mediaSession.playbackState = 'playing';
+    navigator.mediaSession.playbackState = 'none';
   } catch {
     // ignore on unsupported browsers
   }
