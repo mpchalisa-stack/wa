@@ -13,6 +13,7 @@ export interface AndroidBridgeInterface {
   getFcmToken?: () => string | null | undefined;
   showIncomingCall?: (sender: string, body?: string) => void;
   showIncomingMessage?: (sender: string, body: string) => void;
+  setCallAudioMode?: (inCall: boolean) => void;
 }
 
 declare global {
@@ -348,6 +349,19 @@ export function triggerAndroidBridgeIncomingMessage(sender: string, body: string
         (body || 'Pesan baru masuk').trim().slice(0, MAX_BODY_LENGTH)
       );
     }
+  } catch {
+    // ignore bridge error
+  }
+}
+
+/**
+ * Mengaktifkan atau menonaktifkan mode audio panggilan native Android WebView
+ * (AudioManager MODE_IN_COMMUNICATION + speaker routing) melalui `window.AndroidBridge?.setCallAudioMode?.(inCall)`.
+ */
+export function setAndroidBridgeCallAudioMode(inCall: boolean): void {
+  if (typeof window === 'undefined') return;
+  try {
+    window.AndroidBridge?.setCallAudioMode?.(inCall);
   } catch {
     // ignore bridge error
   }

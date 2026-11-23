@@ -35,6 +35,21 @@ export function getSharedAudioContext(): AudioContext | null {
 }
 
 /**
+ * Memastikan Web Audio API AudioContext dalam keadaan aktif (`resume()`)
+ * tepat saat tombol Panggil atau Jawab ditekan (User Gesture).
+ */
+export function resumeWebAudioContext(): void {
+  try {
+    const ctx = getSharedAudioContext();
+    if (ctx && ctx.state === 'suspended') {
+      void ctx.resume().catch(() => {});
+    }
+  } catch {
+    // ignore
+  }
+}
+
+/**
  * Menutup & melepas AudioContext sepenuhnya agar sistem Android dan perangkat Bluetooth
  * eksternal (misal headset VIVAN Sport X3) langsung mendapatkan kembali fokus audio normal.
  */

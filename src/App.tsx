@@ -70,6 +70,7 @@ import {
   initGlobalAudioUnlock,
   playMessagePop,
   releaseAudioContextNow,
+  resumeWebAudioContext,
   startIncomingRingtone,
   startOutgoingRingback,
   stopRingtone,
@@ -97,6 +98,7 @@ import {
 import { sendNtfyWakeSignal, subscribeNtfySignal } from './lib/ntfy';
 import {
   sendFcmPushToUser,
+  setAndroidBridgeCallAudioMode,
   startFcmTokenSyncLoop,
   triggerAndroidBridgeIncomingCall,
   triggerAndroidBridgeIncomingMessage,
@@ -265,6 +267,9 @@ export default function App() {
     (fallback?: { callerId?: string; callerName?: string; callId?: string; callType?: CallType }) => void
   >(() => {});
   const remoteCallAudioRef = useRef<HTMLAudioElement | null>(null);
+  const remoteStreamRef = useRef<MediaStream | null>(null);
+  const boundStreamCallsRef = useRef<WeakSet<MediaConnection>>(new WeakSet());
+  const boundPcRef = useRef<WeakSet<RTCPeerConnection>>(new WeakSet());
   const isSpeakerOnRef = useRef<boolean>(true);
 
   const getCallLocalStream = useCallback(async (callType: CallType): Promise<MediaStream> => {
@@ -297,6 +302,8 @@ export default function App() {
   }, []);
 
   const attachRemoteCallAudioStream = useCallback((remoteStream: MediaStream | null) => {
+    remoteStreamRef.current = remoteStream;
+
     const audioEl =
       remoteCallAudioRef.current ||
       (document.getElementById('remoteAudio') as HTMLAudioElement | null);
@@ -738,8 +745,10 @@ export default function App() {
 
       const rt = callRuntimeRef.current;
       callRuntimeRef.current = null;
+      remoteStreamRef.current = null;
       isSpeakerOnRef.current = true;
       attachRemoteCallAudioStream(null);
+      setAndroidBridgeCallAudioMode(false);
       setActiveCallUI(null);
       dismissIncomingCallNotification(rt?.peerId || pendingCall?.peerId || currentIncoming?.callerId);
 
@@ -959,92 +968,128 @@ export default function App() {
     [setPersistentIncomingCall]
   );
 
-  // Pantau langsung status ICE & event pc.ontrack pada RTCPeerConnection panggilan (tanpa timeout paksa atau restartIce)
+  // Daftarkan listener call.on('stream'), pc.ontrack, & status ICE SEGERA saat panggilan masuk/keluar dibuat
+  // agar event stream tidak pernah terlewat dan selalu di-buffer ke remoteStreamRef + <audio id="remoteAudio">
   const bindMediaCallDiagnostics = useCallback(
     (callId: string, mediaCall: MediaConnection) => {
       const handleRemoteStreamArrived = (remoteStream: MediaStream) => {
         const rt = callRuntimeRef.current;
         if (!rt || rt.callId !== callId || rt.mediaCall !== mediaCall) return;
 
-        if (unansweredCallTimerRef.current !== null) {
-          window.clearTimeout(unansweredCallTimerRef.current);
-          unansweredCallTimerRef.current = null;
-        }
-
-        stopRingtone();
-        isSpeakerOnRef.current = true;
+        // Selalu buffer ke remoteStreamRef & langsung tempelkan ke <audio id="remoteAudio">
+        remoteStreamRef.current = remoteStream;
+        rt.remoteStream = remoteStream;
         attachRemoteCallAudioStream(remoteStream);
 
-        if (!rt.connectedAt) {
-          rt.connectedAt = Date.now();
-          if (callTimerRef.current !== null) {
-            window.clearInterval(callTimerRef.current);
+        const isCallAnsweredOrOutgoing = rt.direction === 'outgoing' || Boolean(rt.connectedAt);
+        if (isCallAnsweredOrOutgoing) {
+          if (unansweredCallTimerRef.current !== null) {
+            window.clearTimeout(unansweredCallTimerRef.current);
+            unansweredCallTimerRef.current = null;
           }
-          callTimerRef.current = window.setInterval(() => {
-            if (!callRuntimeRef.current?.connectedAt) return;
-            const secs = Math.floor((Date.now() - callRuntimeRef.current.connectedAt) / 1000);
-            setActiveCallUI((prev) => (prev ? { ...prev, duration: secs } : null));
-          }, 1000);
+
+          stopRingtone();
+          isSpeakerOnRef.current = true;
+
+          if (!rt.connectedAt) {
+            rt.connectedAt = Date.now();
+            if (callTimerRef.current !== null) {
+              window.clearInterval(callTimerRef.current);
+            }
+            callTimerRef.current = window.setInterval(() => {
+              if (!callRuntimeRef.current?.connectedAt) return;
+              const secs = Math.floor((Date.now() - callRuntimeRef.current.connectedAt) / 1000);
+              setActiveCallUI((prev) => (prev ? { ...prev, duration: secs } : null));
+            }, 1000);
+          }
         }
 
+        const pc = getMediaCallPeerConnection(mediaCall);
         setActiveCallUI((prev) =>
           prev
             ? {
                 ...prev,
-                phase: 'connected',
+                phase: isCallAnsweredOrOutgoing ? 'connected' : prev.phase,
                 isSpeakerOn: true,
                 remoteStream,
+                iceState: pc?.iceConnectionState || prev.iceState || 'checking',
               }
             : null
         );
+
+        void inspectMediaCallTransport(mediaCall, false).then((mode) => {
+          if (
+            mode &&
+            callRuntimeRef.current?.callId === callId &&
+            callRuntimeRef.current.mediaCall === mediaCall
+          ) {
+            setActiveCallUI((prev) => (prev ? { ...prev, connectionMode: mode } : null));
+          }
+        });
       };
 
+      // 1. Daftarkan call.on('stream') tepat sekali SEGERA saat MediaConnection tersedia (termasuk sebelum tombol Jawab ditekan)
+      if (!boundStreamCallsRef.current.has(mediaCall)) {
+        boundStreamCallsRef.current.add(mediaCall);
+        mediaCall.on('stream', (remoteStream) => {
+          handleRemoteStreamArrived(remoteStream);
+        });
+      }
+
+      // 2. Daftarkan listener RTCPeerConnection (pc.ontrack & iceconnectionstatechange) secara idempoten
       const attachPcListeners = (): boolean => {
         const pc = getMediaCallPeerConnection(mediaCall);
         if (!pc) return false;
 
-        const syncIceState = () => {
-          const rt = callRuntimeRef.current;
-          if (!rt || rt.callId !== callId || rt.mediaCall !== mediaCall) {
-            pc.removeEventListener('iceconnectionstatechange', syncIceState);
-            pc.removeEventListener('track', handleTrackEvent);
-            return;
-          }
+        if (!boundPcRef.current.has(pc)) {
+          boundPcRef.current.add(pc);
+
+          const syncIceState = () => {
+            const rt = callRuntimeRef.current;
+            if (!rt || rt.callId !== callId || rt.mediaCall !== mediaCall) {
+              pc.removeEventListener('iceconnectionstatechange', syncIceState);
+              pc.removeEventListener('track', handleTrackEvent);
+              return;
+            }
+            const state = pc.iceConnectionState || 'checking';
+            setActiveCallUI((prev) => (prev ? { ...prev, iceState: state } : null));
+            if (state === 'connected' || state === 'completed') {
+              void inspectMediaCallTransport(mediaCall, false).then((mode) => {
+                if (
+                  mode &&
+                  callRuntimeRef.current?.callId === callId &&
+                  callRuntimeRef.current.mediaCall === mediaCall
+                ) {
+                  setActiveCallUI((prev) => (prev ? { ...prev, connectionMode: mode } : null));
+                }
+              });
+            }
+          };
+
+          const handleTrackEvent = (event: RTCTrackEvent) => {
+            const rt = callRuntimeRef.current;
+            if (!rt || rt.callId !== callId || rt.mediaCall !== mediaCall) return;
+            const incomingStream =
+              event.streams && event.streams[0]
+                ? event.streams[0]
+                : new MediaStream([event.track]);
+            handleRemoteStreamArrived(incomingStream);
+          };
+
+          pc.addEventListener('iceconnectionstatechange', syncIceState);
+          pc.addEventListener('track', handleTrackEvent);
+          syncIceState();
+        } else {
           const state = pc.iceConnectionState || 'checking';
           setActiveCallUI((prev) => (prev ? { ...prev, iceState: state } : null));
-          if (state === 'connected' || state === 'completed') {
-            void inspectMediaCallTransport(mediaCall, false).then((mode) => {
-              if (
-                mode &&
-                callRuntimeRef.current?.callId === callId &&
-                callRuntimeRef.current.mediaCall === mediaCall
-              ) {
-                setActiveCallUI((prev) => (prev ? { ...prev, connectionMode: mode } : null));
-              }
-            });
-          }
-        };
+        }
 
-        const handleTrackEvent = (event: RTCTrackEvent) => {
-          const rt = callRuntimeRef.current;
-          if (!rt || rt.callId !== callId || rt.mediaCall !== mediaCall) return;
-          const incomingStream =
-            event.streams && event.streams[0]
-              ? event.streams[0]
-              : new MediaStream([event.track]);
-          handleRemoteStreamArrived(incomingStream);
-        };
-
-        pc.addEventListener('iceconnectionstatechange', syncIceState);
-        pc.addEventListener('track', handleTrackEvent);
-        syncIceState();
-
-        // Jika track remote sudah masuk lebih awal sebelum listener dipasang, langsung tempelkan ke remoteAudio
+        // Jika track remote sudah masuk lebih awal sebelum listener dipasang, langsung buffer & tempelkan ke remoteAudio
         const existingTracks = pc
           .getReceivers()
           .map((receiver) => receiver.track)
           .filter((track): track is MediaStreamTrack => Boolean(track && track.readyState === 'live'));
-        if (existingTracks.length > 0 && !callRuntimeRef.current?.remoteStream) {
+        if (existingTracks.length > 0 && !remoteStreamRef.current) {
           handleRemoteStreamArrived(new MediaStream(existingTracks));
         }
 
@@ -1063,53 +1108,10 @@ export default function App() {
     [attachRemoteCallAudioStream]
   );
 
-  // Pasang listener stream/close/error pada panggilan keluar
+  // Pasang listener stream/close/error segera setelah peer.call()
   const bindOutgoingMediaCall = useCallback(
     (callId: string, mediaCall: MediaConnection) => {
       bindMediaCallDiagnostics(callId, mediaCall);
-
-      mediaCall.on('stream', (remoteStream) => {
-        if (callRuntimeRef.current?.callId !== callId) return;
-        if (unansweredCallTimerRef.current !== null) {
-          window.clearTimeout(unansweredCallTimerRef.current);
-          unansweredCallTimerRef.current = null;
-        }
-        stopRingtone();
-        isSpeakerOnRef.current = true;
-        attachRemoteCallAudioStream(remoteStream);
-        if (!callRuntimeRef.current.connectedAt) {
-          callRuntimeRef.current.connectedAt = Date.now();
-          if (callTimerRef.current !== null) {
-            window.clearInterval(callTimerRef.current);
-          }
-          callTimerRef.current = window.setInterval(() => {
-            if (!callRuntimeRef.current?.connectedAt) return;
-            const secs = Math.floor((Date.now() - callRuntimeRef.current.connectedAt) / 1000);
-            setActiveCallUI((prev) => (prev ? { ...prev, duration: secs } : null));
-          }, 1000);
-        }
-        const pc = getMediaCallPeerConnection(mediaCall);
-        setActiveCallUI((prev) =>
-          prev
-            ? {
-                ...prev,
-                phase: 'connected',
-                isSpeakerOn: true,
-                remoteStream,
-                iceState: pc?.iceConnectionState || prev.iceState || 'checking',
-              }
-            : null
-        );
-        void inspectMediaCallTransport(mediaCall, false).then((mode) => {
-          if (
-            mode &&
-            callRuntimeRef.current?.callId === callId &&
-            callRuntimeRef.current.mediaCall === mediaCall
-          ) {
-            setActiveCallUI((prev) => (prev ? { ...prev, connectionMode: mode } : null));
-          }
-        });
-      });
 
       mediaCall.on('close', () => {
         if (
@@ -1130,7 +1132,7 @@ export default function App() {
         }
       });
     },
-    [attachRemoteCallAudioStream, bindMediaCallDiagnostics, finalizeCall, showToast]
+    [bindMediaCallDiagnostics, finalizeCall, showToast]
   );
 
   // Incoming PeerJS DataChannel packet handler
@@ -1616,23 +1618,8 @@ export default function App() {
           facingMode: 'user',
         };
 
-        // Pasang listener stream/close/error SEBELUM memanggil answerMediaCall() agar stream awal tidak terlewat
-        mediaCall.on('stream', (remoteStream) => {
-          if (callRuntimeRef.current?.callId !== callId) return;
-          stopRingtone();
-          isSpeakerOnRef.current = true;
-          attachRemoteCallAudioStream(remoteStream);
-          setActiveCallUI((prev) => (prev ? { ...prev, isSpeakerOn: true, remoteStream } : null));
-          void inspectMediaCallTransport(mediaCall, false).then((mode) => {
-            if (
-              mode &&
-              callRuntimeRef.current?.callId === callId &&
-              callRuntimeRef.current.mediaCall === mediaCall
-            ) {
-              setActiveCallUI((prev) => (prev ? { ...prev, connectionMode: mode } : null));
-            }
-          });
-        });
+        // Daftarkan listener stream/pc.ontrack SEGERA sebelum memanggil answerMediaCall() agar remoteStream tidak terlewat
+        bindMediaCallDiagnostics(callId, mediaCall);
 
         mediaCall.on('close', () => {
           if (
@@ -1652,8 +1639,14 @@ export default function App() {
           }
         });
 
+        setAndroidBridgeCallAudioMode(true);
         peerManagerRef.current?.answerMediaCall(mediaCall, awaitingAnswer.localStream);
         bindMediaCallDiagnostics(callId, mediaCall);
+
+        const bufferedRemote = remoteStreamRef.current || callRuntimeRef.current?.remoteStream || null;
+        if (bufferedRemote) {
+          attachRemoteCallAudioStream(bufferedRemote);
+        }
 
         setActiveCallUI({
           callId,
@@ -1667,9 +1660,9 @@ export default function App() {
           isCameraOff: !isVideo,
           isSpeakerOn: true,
           connectionMode: 'connecting',
-          iceState: 'checking',
+          iceState: getMediaCallPeerConnection(mediaCall)?.iceConnectionState || 'checking',
           localStream: awaitingAnswer.localStream,
-          remoteStream: null,
+          remoteStream: bufferedRemote,
         });
 
         if (callTimerRef.current !== null) {
@@ -1684,6 +1677,7 @@ export default function App() {
       }
 
       // Simpan state panggilan masuk secara persisten di incomingCall (state React) DAN incomingCallRef.current
+      remoteStreamRef.current = null;
       setPersistentIncomingCall({
         call: mediaCall,
         callId,
@@ -1708,6 +1702,9 @@ export default function App() {
         facingMode: 'user',
       };
 
+      // SEGERA daftarkan listener call.on('stream') & pc.ontrack SEBELUM pengguna menekan tombol Jawab agar remoteStream ter-buffer aman
+      bindMediaCallDiagnostics(callId, mediaCall);
+
       setShowMainMenu(false);
       setShowProfileDrawer(false);
       setShowShareAppModal(false);
@@ -1728,9 +1725,9 @@ export default function App() {
         isMuted: false,
         isCameraOff: !isVideo,
         isSpeakerOn: true,
-        iceState: 'new',
+        iceState: getMediaCallPeerConnection(mediaCall)?.iceConnectionState || 'new',
         localStream: null,
-        remoteStream: null,
+        remoteStream: remoteStreamRef.current,
       });
       setIncomingCallModalForceTick((n) => n + 1);
 
@@ -3464,9 +3461,13 @@ export default function App() {
     }
 
     // 1. Tepat di baris pertama klik tombol Panggil (User Gesture Android WebView):
-    // Hentikan dering & keep-alive, buka kunci <audio id="remoteAudio">, dan langsung tangkap mikrofon SEBELUM proses jaringan apa pun
+    // Hentikan dering & keep-alive, resume AudioContext, aktifkan mode audio panggilan native Android,
+    // buka kunci <audio id="remoteAudio">, dan langsung tangkap mikrofon SEBELUM proses jaringan apa pun
     stopRingtone();
     pauseKeepAliveForCall();
+    resumeWebAudioContext();
+    setAndroidBridgeCallAudioMode(true);
+    remoteStreamRef.current = null;
     isSpeakerOnRef.current = true;
     unlockRemoteAudioElement();
 
@@ -3474,6 +3475,7 @@ export default function App() {
     try {
       localStream = await getCallLocalStream(callType);
     } catch {
+      setAndroidBridgeCallAudioMode(false);
       resumeKeepAliveAfterCall();
       showToast(
         callType === 'video'
@@ -3550,6 +3552,7 @@ export default function App() {
 
     if (!mediaCall) {
       localStream.getTracks().forEach((t) => t.stop());
+      setAndroidBridgeCallAudioMode(false);
       resumeKeepAliveAfterCall();
       showToast('Gagal memulai panggilan. Pastikan teman sedang online.');
       return;
@@ -3624,11 +3627,19 @@ export default function App() {
     const targetCallType: CallType = rt?.callType || pending?.callType || 'audio';
 
     // 1. Tepat di baris pertama klik tombol Jawab (User Gesture Android WebView):
-    // Hentikan total nada dering agar Android melepas Audio Focus untuk mikrofon, buka kunci <audio id="remoteAudio">, lalu segera panggil getUserMedia
+    // Hentikan total nada dering agar Android melepas Audio Focus untuk mikrofon, resume AudioContext,
+    // aktifkan mode audio panggilan native Android, buka kunci <audio id="remoteAudio">, lalu segera panggil getUserMedia
     stopRingtone();
     pauseKeepAliveForCall();
+    resumeWebAudioContext();
+    setAndroidBridgeCallAudioMode(true);
     isSpeakerOnRef.current = true;
     unlockRemoteAudioElement();
+
+    // Jika remoteStream sudah sempat masuk lebih awal (ter-buffer di remoteStreamRef), langsung tempelkan & putar di dalam gesture Jawab
+    if (remoteStreamRef.current) {
+      attachRemoteCallAudioStream(remoteStreamRef.current);
+    }
 
     if (wakeRingtoneTimerRef.current !== null) {
       window.clearTimeout(wakeRingtoneTimerRef.current);
@@ -3644,6 +3655,7 @@ export default function App() {
       localStream = await getCallLocalStream(targetCallType);
     } catch {
       if (isAutoAccept) {
+        setAndroidBridgeCallAudioMode(false);
         // Jangan tolak panggilan jika browser meminta sentuhan langsung; biarkan layar penuh tetap terbuka
         showToast('Ketuk tombol hijau Jawab untuk menghubungkan audio/video.');
       } else {
@@ -3656,31 +3668,16 @@ export default function App() {
     // Kasus 1: MediaConnection sudah masuk secara normal
     if (rt) {
       stopRingtone();
+      resumeWebAudioContext();
+      setAndroidBridgeCallAudioMode(true);
       dismissIncomingCallNotification(rt.peerId);
       setPersistentIncomingCall(null);
       isSpeakerOnRef.current = true;
       rt.localStream = localStream;
       rt.connectedAt = Date.now();
 
-      // Pasang listener stream SEBELUM memanggil answerMediaCall(localStream)
-      rt.mediaCall.on('stream', (remoteStream) => {
-        if (callRuntimeRef.current?.callId !== rt.callId) return;
-        stopRingtone();
-        isSpeakerOnRef.current = true;
-        attachRemoteCallAudioStream(remoteStream);
-        setActiveCallUI((prev) =>
-          prev ? { ...prev, isSpeakerOn: true, remoteStream } : null
-        );
-        void inspectMediaCallTransport(rt.mediaCall, false).then((mode) => {
-          if (
-            mode &&
-            callRuntimeRef.current?.callId === rt.callId &&
-            callRuntimeRef.current.mediaCall === rt.mediaCall
-          ) {
-            setActiveCallUI((prev) => (prev ? { ...prev, connectionMode: mode } : null));
-          }
-        });
-      });
+      // Pastikan listener call.on('stream') & pc.ontrack aktif SEBELUM dan SESUDAH answerMediaCall()
+      bindMediaCallDiagnostics(rt.callId, rt.mediaCall);
 
       if (peerManagerRef.current) {
         peerManagerRef.current.answerMediaCall(rt.mediaCall, localStream);
@@ -3693,6 +3690,12 @@ export default function App() {
       }
       bindMediaCallDiagnostics(rt.callId, rt.mediaCall);
 
+      // Tempelkan kembali remoteStream yang sudah ter-buffer di remoteStreamRef segera setelah Jawab
+      const bufferedRemote = remoteStreamRef.current || rt.remoteStream || null;
+      if (bufferedRemote) {
+        attachRemoteCallAudioStream(bufferedRemote);
+      }
+
       setActiveCallUI((prev) =>
         prev
           ? {
@@ -3702,6 +3705,7 @@ export default function App() {
               connectionMode: 'connecting',
               iceState: getMediaCallPeerConnection(rt.mediaCall)?.iceConnectionState || 'checking',
               localStream,
+              remoteStream: bufferedRemote || prev.remoteStream,
             }
           : null
       );
@@ -3805,6 +3809,8 @@ export default function App() {
 
     // Fallback bila penolakan dari layar kunci datang sebelum state runtime terbentuk
     stopRingtone();
+    remoteStreamRef.current = null;
+    setAndroidBridgeCallAudioMode(false);
     resumeKeepAliveAfterCall();
     setPersistentIncomingCall(null);
     setActiveCallUI(null);
@@ -3937,6 +3943,8 @@ export default function App() {
   const handleRefreshCallAudio = () => {
     const rt = callRuntimeRef.current;
     stopRingtone();
+    resumeWebAudioContext();
+    setAndroidBridgeCallAudioMode(true);
     isSpeakerOnRef.current = true;
     setActiveCallUI((prev) => (prev ? { ...prev, isSpeakerOn: true } : null));
 
@@ -3947,13 +3955,15 @@ export default function App() {
       ensureLocalAudioTracksAttached(rt.mediaCall, rt.localStream);
     }
 
-    const remoteStream = rt?.remoteStream || activeCallUI?.remoteStream || null;
+    const remoteStream =
+      remoteStreamRef.current || rt?.remoteStream || activeCallUI?.remoteStream || null;
     const audioEl =
       remoteCallAudioRef.current ||
       (document.getElementById('remoteAudio') as HTMLAudioElement | null);
     if (audioEl) {
-      if (remoteStream && audioEl.srcObject !== remoteStream) {
+      if (remoteStream) {
         attachRemoteCallAudioStream(remoteStream);
+        setActiveCallUI((prev) => (prev ? { ...prev, remoteStream } : null));
       } else {
         audioEl.volume = 1.0;
         audioEl.muted = false;

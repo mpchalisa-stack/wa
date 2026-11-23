@@ -69,6 +69,8 @@ export const CallOverlay: React.FC<CallOverlayProps> = ({
   const [logoImgFailed, setLogoImgFailed] = useState(false);
   const [avatarImgFailed, setAvatarImgFailed] = useState(false);
   const [micLevel, setMicLevel] = useState(0);
+  const [micTrackCount, setMicTrackCount] = useState(0);
+  const [remoteTrackCount, setRemoteTrackCount] = useState(0);
 
   // Reset animasi getar & paksa layar penuh setiap kali panggilan masuk baru / dipicu notifikasi
   useEffect(() => {
@@ -133,6 +135,29 @@ export const CallOverlay: React.FC<CallOverlayProps> = ({
       void localVideoRef.current.play().catch(() => {});
     }
   }, [call.localStream, call.isCameraOff]);
+
+  // Sinkronkan jumlah track audio lokal & remote secara real-time (termasuk saat addtrack/removetrack terjadi belakangan)
+  useEffect(() => {
+    const updateCounts = () => {
+      setMicTrackCount(call.localStream?.getAudioTracks().length ?? 0);
+      setRemoteTrackCount(call.remoteStream?.getAudioTracks().length ?? 0);
+    };
+    updateCounts();
+
+    const local = call.localStream;
+    const remote = call.remoteStream;
+    local?.addEventListener('addtrack', updateCounts);
+    local?.addEventListener('removetrack', updateCounts);
+    remote?.addEventListener('addtrack', updateCounts);
+    remote?.addEventListener('removetrack', updateCounts);
+
+    return () => {
+      local?.removeEventListener('addtrack', updateCounts);
+      local?.removeEventListener('removetrack', updateCounts);
+      remote?.removeEventListener('addtrack', updateCounts);
+      remote?.removeEventListener('removetrack', updateCounts);
+    };
+  }, [call.localStream, call.remoteStream]);
 
   // Meteran level suara mikrofon lokal real-time (hanya AnalyserNode, TIDAK disambungkan ke speaker agar bebas gema)
   useEffect(() => {
@@ -541,6 +566,11 @@ export const CallOverlay: React.FC<CallOverlayProps> = ({
                       : 'Siap'
                     : 'No Mic'}
                 </span>
+              </div>
+
+              <div className="text-[11px] font-mono text-slate-300/90 bg-black/30 border border-white/10 rounded-lg px-2.5 py-1 tracking-tight">
+                Mic Tracks: {micTrackCount} | Remote Tracks: {remoteTrackCount} | ICE:{' '}
+                {call.iceState || 'checking'}
               </div>
             </div>
           </div>
