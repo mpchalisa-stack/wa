@@ -94,7 +94,7 @@ import {
 import { sendNtfyWakeSignal, subscribeNtfySignal } from './lib/ntfy';
 import {
   sendFcmPushToUser,
-  syncAndroidFcmTokenToFirestore,
+  startFcmTokenSyncLoop,
   triggerAndroidBridgeIncomingCall,
   triggerAndroidBridgeIncomingMessage,
 } from './lib/fcmPush';
@@ -462,11 +462,10 @@ export default function App() {
     };
   }, [profile?.id, isExited]);
 
-  // Sinkronkan FCM Token dari AndroidBridge ke Firestore `device_tokens/{cleanUserId}`
-  // dengan pengecekan ulang setiap 5 detik selama 30 detik pertama setelah aplikasi dibuka
+  // Jalankan syncFcmToken() segera saat aplikasi dibuka dan setiap 5 detik setelah ID pengguna tersedia
   useEffect(() => {
     if (!profile?.id || isExited) return;
-    return syncAndroidFcmTokenToFirestore(profile.id);
+    return startFcmTokenSyncLoop(profile.id);
   }, [profile?.id, isExited]);
 
   // Release Wake Lock & silent audio on unmount
@@ -2967,13 +2966,40 @@ export default function App() {
           ? `📄 ${msg.fileName || 'Dokumen'}`
           : 'Pesan baru masuk');
 
-      recipients.forEach((recipientId) => {
-        void sendFcmPushToUser({
-          targetUserId: recipientId,
-          type: 'message',
-          sender: me.name,
-          body: fcmMessageBody,
-        });
+      const fcmSenderName = me.name?.trim() || me.id;
+      void Promise.all(
+        recipients.map((recipientId) =>
+          sendFcmPushToUser({
+            targetUserId: recipientId,
+            type: 'message',
+            sender: fcmSenderName,
+            body: fcmMessageBody,
+          })
+        )
+      ).then((results) => {
+        const failedApi = results.find((r) => !r.success && r.reason === 'api_error');
+        const missingToken = results.find((r) => !r.success && r.reason === 'token_not_found');
+        const firestoreErr = results.find((r) => !r.success && r.reason === 'firestore_error');
+
+        if (failedApi) {
+          showToast(
+            `Push notifikasi gagal (/api/push): ${failedApi.errorDetail || 'Server error'}`,
+            3200,
+            'warning'
+          );
+        } else if (missingToken) {
+          showToast(
+            `Notifikasi push belum aktif: perangkat tujuan belum mendaftarkan token FCM.`,
+            3200,
+            'warning'
+          );
+        } else if (firestoreErr) {
+          showToast(
+            `Gagal membaca token push tujuan dari Firestore.`,
+            3200,
+            'warning'
+          );
+        }
       });
 
       if (!manager) return;
@@ -3000,7 +3026,7 @@ export default function App() {
         }
       });
     },
-    [sendMediaMessageToPeer, sendEncryptedMessageToPeer]
+    [sendMediaMessageToPeer, sendEncryptedMessageToPeer, showToast]
   );
 
   // Typing signal
@@ -3244,8 +3270,30 @@ export default function App() {
     void sendFcmPushToUser({
       targetUserId: peerId,
       type: 'call',
-      sender: profile.name,
-      body: 'Panggilan masuk...',
+      sender: profile.name?.trim() || profile.id,
+      body: 'Panggilan Masuk WattappsAU',
+    }).then((result) => {
+      if (!result.success) {
+        if (result.reason === 'token_not_found') {
+          showToast(
+            `Push panggilan tidak terkirim: token FCM ${peerName} belum ditemukan di Firestore.`,
+            3200,
+            'warning'
+          );
+        } else if (result.reason === 'api_error') {
+          showToast(
+            `Gagal mengirim push panggilan (/api/push): ${result.errorDetail || 'Server error'}`,
+            3200,
+            'warning'
+          );
+        } else if (result.reason === 'firestore_error') {
+          showToast(
+            `Gagal mengambil token FCM ${peerName} dari Firestore.`,
+            3200,
+            'warning'
+          );
+        }
+      }
     });
 
     // Kirim sinyal bangun prioritas via ntfy.sh (menjamin lawan bangun walau socket lama sedang tidur/zombie)

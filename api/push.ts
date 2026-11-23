@@ -102,13 +102,13 @@ async function parseJsonBody(req: VercelRequest): Promise<Record<string, unknown
 export default async function handler(req: VercelRequest, res: VercelResponse): Promise<void> {
   if (req.method !== 'POST') {
     res.setHeader('Allow', 'POST');
-    sendJson(res, 405, { ok: false, error: 'Method Not Allowed' });
+    sendJson(res, 405, { success: false, ok: false, error: 'Method Not Allowed' });
     return;
   }
 
   const payload = await parseJsonBody(req);
   if (!payload) {
-    sendJson(res, 400, { ok: false, error: 'Invalid JSON request body' });
+    sendJson(res, 400, { success: false, ok: false, error: 'Invalid JSON request body' });
     return;
   }
 
@@ -123,17 +123,17 @@ export default async function handler(req: VercelRequest, res: VercelResponse): 
     rawToken.length > MAX_TOKEN_LENGTH ||
     /\s/.test(rawToken)
   ) {
-    sendJson(res, 400, { ok: false, error: 'Invalid targetToken' });
+    sendJson(res, 400, { success: false, ok: false, error: 'Invalid targetToken' });
     return;
   }
 
   if (!ALLOWED_PUSH_TYPES.has(rawType)) {
-    sendJson(res, 400, { ok: false, error: 'Invalid push type' });
+    sendJson(res, 400, { success: false, ok: false, error: 'Invalid push type' });
     return;
   }
 
   if (!rawSender || !rawBody) {
-    sendJson(res, 400, { ok: false, error: 'Missing sender or body' });
+    sendJson(res, 400, { success: false, ok: false, error: 'Missing sender or body' });
     return;
   }
 
@@ -146,6 +146,7 @@ export default async function handler(req: VercelRequest, res: VercelResponse): 
       token: rawToken,
       android: {
         priority: 'high',
+        ttl: 0,
       },
       data: {
         type: String(rawType),
@@ -154,11 +155,16 @@ export default async function handler(req: VercelRequest, res: VercelResponse): 
       },
     });
 
-    sendJson(res, 200, { ok: true, messageId });
+    sendJson(res, 200, { success: true, ok: true, messageId });
   } catch (error) {
     const code = error instanceof Error ? error.message : '';
     if (code === 'FCM_ADMIN_NOT_CONFIGURED') {
-      sendJson(res, 503, { ok: false, error: 'Push service is not configured on server' });
+      sendJson(res, 503, {
+        success: false,
+        ok: false,
+        code: 'FCM_ADMIN_NOT_CONFIGURED',
+        error: 'Push service is not configured on server',
+      });
       return;
     }
 
@@ -171,10 +177,20 @@ export default async function handler(req: VercelRequest, res: VercelResponse): 
       fcmCode === 'messaging/registration-token-not-registered' ||
       fcmCode === 'messaging/invalid-registration-token'
     ) {
-      sendJson(res, 410, { ok: false, error: 'Target token is no longer valid' });
+      sendJson(res, 410, {
+        success: false,
+        ok: false,
+        code: fcmCode,
+        error: 'Target token is no longer valid',
+      });
       return;
     }
 
-    sendJson(res, 502, { ok: false, error: 'Failed to deliver FCM push message' });
+    sendJson(res, 502, {
+      success: false,
+      ok: false,
+      code: fcmCode || 'FCM_SEND_FAILED',
+      error: 'Failed to deliver FCM push message',
+    });
   }
 }

@@ -8,7 +8,6 @@ import {
   Firestore,
 } from 'firebase/firestore';
 import fcmFirebaseConfig from '../../firebase-fcm-config.json';
-import { normalizePeerId } from './peerManager';
 
 export interface AndroidBridgeInterface {
   getFcmToken?: () => string | null | undefined;
@@ -31,16 +30,37 @@ export interface FcmPushRequest {
   body: string;
 }
 
+export interface FcmPushResult {
+  success: boolean;
+  reason?: 'invalid_target' | 'not_configured' | 'firestore_error' | 'token_not_found' | 'api_error';
+  errorDetail?: string;
+  statusCode?: number;
+}
+
 const FCM_APP_NAME = 'wattapps-fcm';
 const DEVICE_TOKENS_COLLECTION = 'device_tokens';
-const TOKEN_RETRY_INTERVAL_MS = 5000;
-const TOKEN_RETRY_DURATION_MS = 30000;
+const TOKEN_SYNC_INTERVAL_MS = 5000;
 const MAX_TOKEN_LENGTH = 512;
 const MAX_SENDER_LENGTH = 120;
 const MAX_BODY_LENGTH = 500;
 
 let fcmAppInstance: FirebaseApp | null = null;
 let fcmFirestoreInstance: Firestore | null = null;
+
+/**
+ * Normalisasi ID dokumen Firestore untuk koleksi `device_tokens`:
+ * menghapus spasi dan karakter pembatas path lalu mengubah ke lowercase (`id.trim().toLowerCase()`).
+ */
+export function normalizeFcmUserId(rawId: string): string {
+  const cleaned = (rawId || '')
+    .replace(/^WA6-/i, '')
+    .replace(/^WattappsAU-/i, '')
+    .replace(/\s+/g, '')
+    .replace(/[^a-zA-Z0-9_-]/g, '')
+    .trim()
+    .toLowerCase();
+  return cleaned.slice(0, 128);
+}
 
 function getFcmFirestore(): Firestore | null {
   if (fcmFirestoreInstance) return fcmFirestoreInstance;
@@ -100,132 +120,149 @@ async function testFcmFirestoreConnection(): Promise<void> {
 }
 void testFcmFirestoreConnection();
 
-function readAndroidFcmToken(): string {
-  if (typeof window === 'undefined') return '';
+/**
+ * Mengambil token FCM native dari `window.AndroidBridge?.getFcmToken?.()` dan menyimpannya ke
+ * Firestore `device_tokens/{cleanId}` dengan format `{ userId: cleanId, fcmToken: token, updatedAt: Date.now() }`.
+ */
+let lastSyncedSignature = '';
+
+export async function syncFcmToken(myUserId: string, forceWrite = false): Promise<boolean> {
+  if (typeof window === 'undefined') return false;
+  const cleanId = normalizeFcmUserId(myUserId);
+  if (!cleanId) return false;
+
+  let rawToken: string | null | undefined;
   try {
-    const fn = window.AndroidBridge?.getFcmToken;
-    if (typeof fn !== 'function') return '';
-    const raw = fn();
-    if (typeof raw !== 'string') return '';
-    const trimmed = raw.trim();
-    if (!trimmed || trimmed.length > MAX_TOKEN_LENGTH || /\s/.test(trimmed)) {
-      return '';
-    }
-    return trimmed;
+    rawToken = window.AndroidBridge?.getFcmToken?.();
   } catch {
-    return '';
+    return false;
+  }
+
+  const token = typeof rawToken === 'string' ? rawToken.trim() : '';
+  if (!token || token.length > MAX_TOKEN_LENGTH || /\s/.test(token)) {
+    return false;
+  }
+
+  const signature = `${cleanId}:${token}`;
+  if (!forceWrite && signature === lastSyncedSignature) {
+    return true;
+  }
+
+  const db = getFcmFirestore();
+  if (!db) return false;
+
+  const docPath = `${DEVICE_TOKENS_COLLECTION}/${cleanId}`;
+  try {
+    await setDoc(
+      doc(db, DEVICE_TOKENS_COLLECTION, cleanId),
+      {
+        userId: cleanId,
+        fcmToken: token,
+        updatedAt: Date.now(),
+      },
+      { merge: true }
+    );
+    lastSyncedSignature = signature;
+    return true;
+  } catch (error) {
+    logFcmFirestoreError('write', docPath, error);
+    return false;
   }
 }
 
 /**
- * Memeriksa window.AndroidBridge?.getFcmToken saat aplikasi dibuka dan ID pengguna siap.
- * Jika token tersedia, simpan ke Firestore `device_tokens/{cleanUserId}`.
- * Melakukan pengecekan ulang setiap 5 detik selama 30 detik pertama jika token baru selesai
- * di-generate oleh Android.
+ * Menjalankan `syncFcmToken()` segera saat aplikasi dibuka dan setiap 5 detik
+ * selama ID pengguna lokal tersedia agar token baru/rotasi dari Android selalu tersinkron.
  */
-export function syncAndroidFcmTokenToFirestore(rawUserId: string): () => void {
-  const cleanUserId = normalizePeerId(rawUserId);
-  if (!cleanUserId || typeof window === 'undefined') {
+export function startFcmTokenSyncLoop(myUserId: string): () => void {
+  const cleanId = normalizeFcmUserId(myUserId);
+  if (!cleanId || typeof window === 'undefined') {
     return () => {};
   }
 
   let cancelled = false;
-  let lastSavedToken = '';
-  let intervalId: number | null = null;
-  let stopTimeoutId: number | null = null;
-
-  const attemptSync = async (): Promise<void> => {
+  const runSync = (forceWrite = false) => {
     if (cancelled) return;
-    if (typeof window.AndroidBridge?.getFcmToken !== 'function') return;
-
-    const fcmToken = readAndroidFcmToken();
-    if (!fcmToken || fcmToken === lastSavedToken) return;
-
-    const db = getFcmFirestore();
-    if (!db) return;
-
-    const docPath = `${DEVICE_TOKENS_COLLECTION}/${cleanUserId}`;
-    try {
-      await setDoc(
-        doc(db, DEVICE_TOKENS_COLLECTION, cleanUserId),
-        {
-          userId: cleanUserId,
-          fcmToken,
-          updatedAt: Date.now(),
-        },
-        { merge: true }
-      );
-      lastSavedToken = fcmToken;
-    } catch (error) {
-      logFcmFirestoreError('write', docPath, error);
-    }
+    void syncFcmToken(cleanId, forceWrite);
   };
 
-  // Cek langsung pada saat mount / ID tersedia
-  void attemptSync();
+  // Sinkronisasi segera saat aplikasi dibuka & ID pengguna tersedia
+  runSync(true);
 
-  // Pengecekan ulang setiap 5 detik selama 30 detik pertama
-  intervalId = window.setInterval(() => {
-    void attemptSync();
-  }, TOKEN_RETRY_INTERVAL_MS);
-
-  stopTimeoutId = window.setTimeout(() => {
-    if (intervalId !== null) {
-      window.clearInterval(intervalId);
-      intervalId = null;
-    }
-    stopTimeoutId = null;
-  }, TOKEN_RETRY_DURATION_MS + 200);
+  // Periksa ulang setiap 5 detik selama aplikasi aktif
+  const intervalId = window.setInterval(() => {
+    runSync(false);
+  }, TOKEN_SYNC_INTERVAL_MS);
 
   return () => {
     cancelled = true;
-    if (intervalId !== null) {
-      window.clearInterval(intervalId);
-      intervalId = null;
-    }
-    if (stopTimeoutId !== null) {
-      window.clearTimeout(stopTimeoutId);
-      stopTimeoutId = null;
-    }
+    window.clearInterval(intervalId);
   };
 }
 
 /**
- * Mengambil token FCM tujuan dari Firestore `device_tokens/{cleanTargetUserId}`
- * lalu mengirim High-Priority Data Message melalui endpoint Vercel Serverless `POST /api/push`.
+ * Mengambil dokumen `device_tokens/{targetId.trim().toLowerCase()}` dari Firestore,
+ * lalu mengirim High-Priority Data Message FCM melalui `POST /api/push`.
  */
-export async function sendFcmPushToUser(params: FcmPushRequest): Promise<boolean> {
-  const cleanTargetUserId = normalizePeerId(params.targetUserId);
-  if (!cleanTargetUserId) return false;
+export async function sendFcmPushToUser(params: FcmPushRequest): Promise<FcmPushResult> {
+  const cleanTargetUserId = normalizeFcmUserId(params.targetUserId);
+  if (!cleanTargetUserId) {
+    return {
+      success: false,
+      reason: 'invalid_target',
+      errorDetail: 'ID tujuan tidak valid',
+    };
+  }
 
   const db = getFcmFirestore();
-  if (!db) return false;
+  if (!db) {
+    return {
+      success: false,
+      reason: 'not_configured',
+      errorDetail: 'Konfigurasi Firebase belum aktif',
+    };
+  }
 
   const docPath = `${DEVICE_TOKENS_COLLECTION}/${cleanTargetUserId}`;
   let targetToken = '';
 
   try {
     const snap = await getDoc(doc(db, DEVICE_TOKENS_COLLECTION, cleanTargetUserId));
-    if (!snap.exists()) return false;
+    if (!snap.exists()) {
+      return {
+        success: false,
+        reason: 'token_not_found',
+        errorDetail: `Token perangkat ${cleanTargetUserId} belum terdaftar`,
+      };
+    }
     const data = snap.data() as { fcmToken?: unknown } | undefined;
     if (typeof data?.fcmToken === 'string') {
       targetToken = data.fcmToken.trim();
     }
   } catch (error) {
     logFcmFirestoreError('get', docPath, error);
-    return false;
+    return {
+      success: false,
+      reason: 'firestore_error',
+      errorDetail: error instanceof Error ? error.message : 'Gagal membaca token tujuan dari Firestore',
+    };
   }
 
   if (!targetToken || targetToken.length > MAX_TOKEN_LENGTH || /\s/.test(targetToken)) {
-    return false;
+    return {
+      success: false,
+      reason: 'token_not_found',
+      errorDetail: `Token FCM perangkat ${cleanTargetUserId} kosong atau tidak valid`,
+    };
   }
 
   const safeType: FcmPushType = params.type === 'call' ? 'call' : 'message';
-  const safeSender = (params.sender || 'WattappsAU').trim().slice(0, MAX_SENDER_LENGTH) || 'WattappsAU';
+  const safeSender =
+    (params.sender || 'WattappsAU').trim().slice(0, MAX_SENDER_LENGTH) || 'WattappsAU';
+  const defaultBody =
+    safeType === 'call' ? 'Panggilan Masuk WattappsAU' : 'Pesan baru masuk';
   const safeBody =
-    (params.body || (safeType === 'call' ? 'Panggilan masuk...' : 'Pesan baru masuk'))
-      .trim()
-      .slice(0, MAX_BODY_LENGTH) || (safeType === 'call' ? 'Panggilan masuk...' : 'Pesan baru masuk');
+    (params.body || defaultBody).trim().slice(0, MAX_BODY_LENGTH) || defaultBody;
 
   try {
     const response = await fetch('/api/push', {
@@ -241,23 +278,56 @@ export async function sendFcmPushToUser(params: FcmPushRequest): Promise<boolean
         body: safeBody,
       }),
     });
-    return response.ok;
-  } catch {
-    return false;
+
+    let responseData: { success?: boolean; ok?: boolean; error?: string; code?: string } | null =
+      null;
+    try {
+      responseData = (await response.json()) as {
+        success?: boolean;
+        ok?: boolean;
+        error?: string;
+        code?: string;
+      };
+    } catch {
+      responseData = null;
+    }
+
+    if (response.ok && (responseData?.success === true || responseData?.ok === true)) {
+      return { success: true, statusCode: response.status };
+    }
+
+    return {
+      success: false,
+      reason: 'api_error',
+      statusCode: response.status,
+      errorDetail:
+        responseData?.error ||
+        responseData?.code ||
+        `HTTP ${response.status}`,
+    };
+  } catch (err) {
+    return {
+      success: false,
+      reason: 'api_error',
+      errorDetail: err instanceof Error ? err.message : 'Koneksi ke /api/push gagal',
+    };
   }
 }
 
 /**
  * Memicu notifikasi panggilan masuk melalui AndroidBridge saat aplikasi aktif di latar depan.
  */
-export function triggerAndroidBridgeIncomingCall(sender: string, body = 'Panggilan masuk...'): void {
+export function triggerAndroidBridgeIncomingCall(
+  sender: string,
+  body = 'Panggilan Masuk WattappsAU'
+): void {
   if (typeof window === 'undefined') return;
   try {
     const fn = window.AndroidBridge?.showIncomingCall;
     if (typeof fn === 'function') {
       fn(
         (sender || 'WattappsAU').trim().slice(0, MAX_SENDER_LENGTH),
-        (body || 'Panggilan masuk...').trim().slice(0, MAX_BODY_LENGTH)
+        (body || 'Panggilan Masuk WattappsAU').trim().slice(0, MAX_BODY_LENGTH)
       );
     }
   } catch {
