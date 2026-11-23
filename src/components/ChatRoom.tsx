@@ -46,12 +46,14 @@ import { Avatar } from './Avatar';
 import { VoiceNoteBubble } from './VoiceNoteBubble';
 import { LightboxMedia } from './MediaLightbox';
 import { activateActiveMediaSession, releaseActiveMediaSession } from '../lib/standby';
+import type { PeerTransportMode } from '../lib/peerManager';
 
 interface ChatRoomProps {
   profile: UserProfile;
   contact: Contact;
   messages: ChatMessage[];
   isPeerOnline: boolean;
+  peerTransport?: PeerTransportMode | null;
   typingUserName?: string;
   onBack: () => void;
   onSendText: (text: string, replyTo?: ReplyPreview) => void;
@@ -95,6 +97,7 @@ export const ChatRoom: React.FC<ChatRoomProps> = ({
   contact,
   messages,
   isPeerOnline,
+  peerTransport,
   typingUserName,
   onBack,
   onSendText,
@@ -460,7 +463,7 @@ export const ChatRoom: React.FC<ChatRoomProps> = ({
                 )}
               </div>
               <div
-                className={`text-xs truncate ${
+                className={`text-xs truncate leading-tight ${
                   typingUserName
                     ? 'text-[#D9FDD3] md:text-[#00A884] font-medium'
                     : 'text-white/80 md:text-[#667781] md:dark:text-[#8696A0]'
@@ -468,6 +471,17 @@ export const ChatRoom: React.FC<ChatRoomProps> = ({
               >
                 {statusSubtitle}
               </div>
+              {!contact.isGroup && isPeerOnline && peerTransport && (
+                <div
+                  className={`text-[10px] font-medium truncate leading-tight ${
+                    peerTransport === 'relay'
+                      ? 'text-amber-200 md:text-amber-600 md:dark:text-amber-400'
+                      : 'text-emerald-200 md:text-[#008069] md:dark:text-[#00A884]'
+                  }`}
+                >
+                  {peerTransport === 'relay' ? 'Terhubung Relay' : 'Terhubung P2P'}
+                </div>
+              )}
             </div>
           </button>
         </div>

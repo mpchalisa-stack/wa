@@ -57,9 +57,11 @@ import {
   saveUserProfile,
 } from './lib/db';
 import {
+  PeerTransportMode,
   ReassembledFileTransfer,
   WA6PeerManager,
   fromFullPeerId,
+  normalizePeerId,
 } from './lib/peerManager';
 import {
   initGlobalAudioUnlock,
@@ -220,6 +222,7 @@ export default function App() {
   const [peerState, setPeerState] = useState<PeerConnectionState>('connecting');
   const [peerError, setPeerError] = useState<string | undefined>();
   const [onlinePeers, setOnlinePeers] = useState<Record<string, boolean>>({});
+  const [peerTransports, setPeerTransports] = useState<Record<string, PeerTransportMode | null>>({});
   const [typingMap, setTypingMap] = useState<Record<string, string>>({});
 
   // Call UI & persistent Incoming Call state
@@ -417,7 +420,17 @@ export default function App() {
     let active = true;
     loadAllLocalData().then((data) => {
       if (!active) return;
-      setContacts(data.contacts);
+      const normalizedContacts = data.contacts.map((c) => {
+        if (c.isGroup) return c;
+        const cleanId = normalizePeerId(c.id);
+        if (cleanId && cleanId !== c.id) {
+          const updated = { ...c, id: cleanId };
+          void dbSaveContact(updated);
+          return updated;
+        }
+        return c;
+      });
+      setContacts(normalizedContacts);
       setMessages(data.messages);
       setStatuses(data.statuses);
       setCalls(data.calls);
@@ -2014,6 +2027,12 @@ export default function App() {
           return { ...prev, [sixId]: isOnline };
         });
       },
+      onPeerTransport: (sixId, transport) => {
+        setPeerTransports((prev) => {
+          if (prev[sixId] === transport) return prev;
+          return { ...prev, [sixId]: transport };
+        });
+      },
       onPeerReady: (sixId) => {
         void flushPendingForPeer(sixId);
       },
@@ -2768,8 +2787,13 @@ export default function App() {
   };
 
   // Add Contact / Open Chat
-  const handleAddContact = (sixDigitId: string, nickname?: string) => {
-    const existing = contacts.find((c) => c.id === sixDigitId);
+  const handleAddContact = (rawSixDigitId: string, nickname?: string) => {
+    const sixDigitId = normalizePeerId(rawSixDigitId);
+    if (!sixDigitId) {
+      showToast('ID kontak tidak valid.');
+      return;
+    }
+    const existing = contacts.find((c) => normalizePeerId(c.id) === sixDigitId);
     if (!existing) {
       const contact: Contact = {
         id: sixDigitId,
@@ -2780,7 +2804,7 @@ export default function App() {
       };
       upsertContact(contact);
     } else if (nickname) {
-      upsertContact({ ...existing, name: nickname });
+      upsertContact({ ...existing, id: sixDigitId, name: nickname });
     }
     setShowNewChatModal(false);
     setActiveTab('chats');
@@ -3141,8 +3165,9 @@ export default function App() {
   };
 
   // Start Outgoing Audio / Video Call
-  const handleStartCall = async (peerId: string, callType: CallType) => {
-    if (!profile) return;
+  const handleStartCall = async (rawPeerId: string, callType: CallType) => {
+    const peerId = normalizePeerId(rawPeerId);
+    if (!profile || !peerId) return;
     if (callRuntimeRef.current) {
       showToast('Anda sedang dalam panggilan aktif.');
       return;
@@ -3155,7 +3180,7 @@ export default function App() {
     }
 
     const callId = generateUid('call');
-    const contact = contacts.find((c) => c.id === peerId);
+    const contact = contacts.find((c) => normalizePeerId(c.id) === peerId);
     const peerName = contact?.name || `ID ${peerId}`;
     const peerAvatar = contact?.avatar || '';
 
@@ -3626,6 +3651,7 @@ export default function App() {
     peerManagerRef.current = null;
     setPeerState('disconnected');
     setOnlinePeers({});
+    setPeerTransports({});
     setIsExited(true);
 
     // Coba tutup jendela/tab aplikasi (didukung di PWA/window tertentu)
@@ -4094,6 +4120,9 @@ export default function App() {
             contact={activeContact}
             messages={activeChatMessages}
             isPeerOnline={Boolean(onlinePeers[activeContact.id])}
+            peerTransport={
+              activeContact.isGroup ? null : peerTransports[activeContact.id] ?? null
+            }
             typingUserName={typingMap[activeContact.id]}
             onBack={() => setActiveChatId(null)}
             onSendText={(txt, replyTo) =>

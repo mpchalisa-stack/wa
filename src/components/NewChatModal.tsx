@@ -247,14 +247,14 @@ export const NewChatModal: React.FC<NewChatModalProps> = ({
                 id="peer-6digit"
                 type="text"
                 inputMode="numeric"
-                maxLength={6}
+                maxLength={24}
                 value={peerId}
                 onChange={(e) => {
-                  const clean = e.target.value.replace(/\D/g, '').slice(0, 6);
+                  const clean = e.target.value.replace(/\s+/g, '').replace(/\D/g, '').slice(0, 6);
                   setPeerId(clean);
                   if (error) setError('');
                 }}
-                placeholder="Contoh: 482910"
+                placeholder="Contoh: 564009 atau 564 009"
                 autoFocus
                 className="w-full h-12 px-4 rounded-xl bg-[#F0F2F5] dark:bg-[#111B21] font-mono-id text-xl tracking-[0.25em] text-center font-bold text-[#111B21] dark:text-[#E9EDEF] placeholder:text-[#8696A0] placeholder:tracking-normal placeholder:font-sans placeholder:text-sm placeholder:font-normal border border-transparent focus:border-[#00A884] focus:outline-none"
               />

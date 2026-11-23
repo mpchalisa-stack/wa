@@ -463,72 +463,92 @@ export const CallOverlay: React.FC<CallOverlayProps> = ({
             </div>
           </div>
         ) : (
-          <div className="max-w-md mx-auto bg-[#1F2C34]/90 backdrop-blur-md rounded-3xl px-4 py-4 flex items-center justify-around shadow-2xl border border-white/10">
+          <div className="max-w-md mx-auto bg-[#1F2C34]/90 backdrop-blur-md rounded-3xl px-4 py-3.5 flex items-center justify-around shadow-2xl border border-white/10">
             {/* Speaker */}
-            <button
-              type="button"
-              onClick={onToggleSpeaker}
-              className={`w-12 h-12 rounded-full flex items-center justify-center transition-colors cursor-pointer ${
-                call.isSpeakerOn
-                  ? 'bg-white text-[#111B21]'
-                  : 'bg-white/10 text-white hover:bg-white/20'
-              }`}
-              title={call.isSpeakerOn ? 'Speaker Aktif' : 'Speaker Mati'}
-            >
-              {call.isSpeakerOn ? <Volume2 className="w-5 h-5" /> : <VolumeX className="w-5 h-5" />}
-            </button>
-
-            {/* Camera Toggle */}
-            {isVideo && (
+            <div className="flex flex-col items-center gap-1">
               <button
                 type="button"
-                onClick={onToggleCamera}
+                onClick={onToggleSpeaker}
                 className={`w-12 h-12 rounded-full flex items-center justify-center transition-colors cursor-pointer ${
-                  call.isCameraOff
+                  call.isSpeakerOn
                     ? 'bg-white text-[#111B21]'
                     : 'bg-white/10 text-white hover:bg-white/20'
                 }`}
-                title={call.isCameraOff ? 'Nyalakan Kamera' : 'Matikan Kamera'}
+                aria-label={call.isSpeakerOn ? 'Speaker Aktif' : 'Speaker Mati'}
+                title={call.isSpeakerOn ? 'Speaker Aktif' : 'Speaker Mati'}
               >
-                {call.isCameraOff ? <VideoOff className="w-5 h-5" /> : <Video className="w-5 h-5" />}
+                {call.isSpeakerOn ? <Volume2 className="w-5 h-5" /> : <VolumeX className="w-5 h-5" />}
               </button>
+              <span className="text-[11px] font-medium text-slate-200">Speaker</span>
+            </div>
+
+            {/* Camera Toggle */}
+            {isVideo && (
+              <div className="flex flex-col items-center gap-1">
+                <button
+                  type="button"
+                  onClick={onToggleCamera}
+                  className={`w-12 h-12 rounded-full flex items-center justify-center transition-colors cursor-pointer ${
+                    call.isCameraOff
+                      ? 'bg-white text-[#111B21]'
+                      : 'bg-white/10 text-white hover:bg-white/20'
+                  }`}
+                  aria-label={call.isCameraOff ? 'Nyalakan Kamera' : 'Matikan Kamera'}
+                  title={call.isCameraOff ? 'Nyalakan Kamera' : 'Matikan Kamera'}
+                >
+                  {call.isCameraOff ? <VideoOff className="w-5 h-5" /> : <Video className="w-5 h-5" />}
+                </button>
+                <span className="text-[11px] font-medium text-slate-200">Kamera</span>
+              </div>
             )}
 
             {/* Switch Front/Back Camera */}
             {isVideo && (
-              <button
-                type="button"
-                onClick={onSwitchCamera}
-                className="w-12 h-12 rounded-full bg-white/10 hover:bg-white/20 text-white flex items-center justify-center transition-colors cursor-pointer"
-                title="Ganti Kamera Depan/Belakang"
-              >
-                <RefreshCw className="w-5 h-5" />
-              </button>
+              <div className="flex flex-col items-center gap-1">
+                <button
+                  type="button"
+                  onClick={onSwitchCamera}
+                  className="w-12 h-12 rounded-full bg-white/10 hover:bg-white/20 text-white flex items-center justify-center transition-colors cursor-pointer"
+                  aria-label="Ganti Kamera Depan/Belakang"
+                  title="Ganti Kamera Depan/Belakang"
+                >
+                  <RefreshCw className="w-5 h-5" />
+                </button>
+                <span className="text-[11px] font-medium text-slate-200">Putar</span>
+              </div>
             )}
 
             {/* Mute Mic */}
-            <button
-              type="button"
-              onClick={onToggleMute}
-              className={`w-12 h-12 rounded-full flex items-center justify-center transition-colors cursor-pointer ${
-                call.isMuted
-                  ? 'bg-white text-[#111B21]'
-                  : 'bg-white/10 text-white hover:bg-white/20'
-              }`}
-              title={call.isMuted ? 'Nyalakan Mikrofon' : 'Bisukan Mikrofon'}
-            >
-              {call.isMuted ? <MicOff className="w-5 h-5" /> : <Mic className="w-5 h-5" />}
-            </button>
+            <div className="flex flex-col items-center gap-1">
+              <button
+                type="button"
+                onClick={onToggleMute}
+                className={`w-12 h-12 rounded-full flex items-center justify-center transition-colors cursor-pointer ${
+                  call.isMuted
+                    ? 'bg-white text-[#111B21]'
+                    : 'bg-white/10 text-white hover:bg-white/20'
+                }`}
+                aria-label={call.isMuted ? 'Nyalakan Mikrofon' : 'Bisukan Mikrofon'}
+                title={call.isMuted ? 'Nyalakan Mikrofon' : 'Bisukan Mikrofon'}
+              >
+                {call.isMuted ? <MicOff className="w-5 h-5" /> : <Mic className="w-5 h-5" />}
+              </button>
+              <span className="text-[11px] font-medium text-slate-200">Mikrofon</span>
+            </div>
 
             {/* End Call */}
-            <button
-              type="button"
-              onClick={onEnd}
-              className="w-14 h-12 rounded-full bg-rose-600 hover:bg-rose-500 text-white flex items-center justify-center shadow-lg active:scale-95 transition-transform cursor-pointer"
-              title="Akhiri Panggilan"
-            >
-              <PhoneOff className="w-5 h-5" />
-            </button>
+            <div className="flex flex-col items-center gap-1">
+              <button
+                type="button"
+                onClick={onEnd}
+                className="w-14 h-12 rounded-full bg-rose-600 hover:bg-rose-500 text-white flex items-center justify-center shadow-lg active:scale-95 transition-transform cursor-pointer"
+                aria-label="Akhiri Panggilan"
+                title="Akhiri Panggilan"
+              >
+                <PhoneOff className="w-5 h-5" />
+              </button>
+              <span className="text-[11px] font-medium text-rose-300">Akhiri</span>
+            </div>
           </div>
         )}
       </div>
