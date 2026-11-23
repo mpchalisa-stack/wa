@@ -56,8 +56,6 @@ export const ICE_SERVERS: RTCIceServer[] = [
   { urls: 'stun:stun.l.google.com:19302' },
   { urls: 'stun:stun1.l.google.com:19302' },
   { urls: 'stun:stun2.l.google.com:19302' },
-  { urls: 'stun:stun3.l.google.com:19302' },
-  { urls: 'stun:stun4.l.google.com:19302' },
   /*
   // CONTOH KONFIGURASI TURN SERVER (hapus komentar & isi kredensial Anda):
   {
@@ -279,7 +277,6 @@ export class WA6PeerManager {
   private wakeSyncInFlight = false;
   private heartbeatTimer: number | null = null;
   private reconnectTimer: number | null = null;
-  private reconnectAttempts = 0;
   private destroyed = false;
 
   constructor(profile: UserProfile, callbacks: PeerManagerCallbacks) {
@@ -492,10 +489,8 @@ export class WA6PeerManager {
     const fullId = toFullPeerId(this.profile.id);
     const peer = new Peer(fullId, {
       debug: 0,
-      pingInterval: 5000,
       config: {
         iceServers: ICE_SERVERS,
-        iceCandidatePoolSize: 4,
       },
     });
 
@@ -503,7 +498,6 @@ export class WA6PeerManager {
 
     peer.on('open', () => {
       if (this.destroyed) return;
-      this.reconnectAttempts = 0;
       this.callbacks.onStatusChange('online');
       this.startHeartbeatLoop();
     });
@@ -525,7 +519,6 @@ export class WA6PeerManager {
     peer.on('close', () => {
       if (this.destroyed) return;
       this.callbacks.onStatusChange('disconnected');
-      this.scheduleReconnect();
     });
 
     peer.on('error', (err) => {
@@ -589,18 +582,9 @@ export class WA6PeerManager {
 
   private scheduleReconnect(): void {
     if (this.destroyed || this.reconnectTimer !== null) return;
-    const delayMs = Math.min(
-      RECONNECT_COOLDOWN_MS,
-      3000 * Math.pow(2, Math.min(this.reconnectAttempts, 3))
-    );
-    this.reconnectAttempts += 1;
     this.reconnectTimer = window.setTimeout(() => {
       this.reconnectTimer = null;
       if (this.destroyed) return;
-      if (typeof navigator !== 'undefined' && navigator.onLine === false) {
-        this.scheduleReconnect();
-        return;
-      }
       if (this.peer && !this.peer.destroyed && this.peer.disconnected) {
         try {
           this.peer.reconnect();
@@ -610,7 +594,7 @@ export class WA6PeerManager {
       } else if (!this.peer || this.peer.destroyed) {
         this.connect();
       }
-    }, delayMs);
+    }, RECONNECT_COOLDOWN_MS);
   }
 
   private waitForPeerOpen(timeoutMs = 3500): Promise<boolean> {

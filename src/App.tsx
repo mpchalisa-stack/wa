@@ -9,6 +9,7 @@ import {
   MoreVertical,
   Power,
   QrCode,
+  RefreshCw,
   Search,
   Share2,
   Shield,
@@ -79,17 +80,7 @@ import {
   setStandbyExternalListener,
   showIncomingWebNotification,
 } from './lib/standby';
-import type { User as FirebaseAuthUser } from 'firebase/auth';
 import { sendNtfyWakeSignal, subscribeNtfySignal } from './lib/ntfy';
-import {
-  acknowledgeFirestoreWakeSignal,
-  sendFirestoreWakeSignal,
-  signInWithGoogleForCloudPush,
-  signOutCloudPush,
-  subscribeFirebaseAuth,
-  subscribeFirestoreWakeSignals,
-  syncDeviceTokenToFirestore,
-} from './lib/firebase';
 import { estimateDataUrlBytes, formatSixDigitId, generateUid } from './lib/media';
 import { OnboardingScreen } from './components/OnboardingScreen';
 import { ChatList } from './components/ChatList';
@@ -102,7 +93,7 @@ import { NewGroupModal } from './components/NewGroupModal';
 import { CameraModal } from './components/CameraModal';
 import { CallOverlay, ActiveCallUIState } from './components/CallOverlay';
 import { MediaLightbox, LightboxMedia } from './components/MediaLightbox';
-import { PWAInstallButton } from './components/PWAInstallButton';
+import { OfflineIndicator, PWAInstallButton } from './components/PWAInstallButton';
 import { ShareAppModal } from './components/ShareAppModal';
 import { AppLogo } from './components/AppLogo';
 
@@ -218,7 +209,7 @@ export default function App() {
 
   // PeerJS real-time state
   const [peerState, setPeerState] = useState<PeerConnectionState>('connecting');
-  const [, setPeerError] = useState<string | undefined>();
+  const [peerError, setPeerError] = useState<string | undefined>();
   const [onlinePeers, setOnlinePeers] = useState<Record<string, boolean>>({});
   const [typingMap, setTypingMap] = useState<Record<string, string>>({});
 
@@ -226,9 +217,6 @@ export default function App() {
   const [activeCallUI, setActiveCallUI] = useState<ActiveCallUIState | null>(null);
   const [incomingCall, setIncomingCall] = useState<IncomingCallState | null>(null);
   const [incomingCallModalForceTick, setIncomingCallModalForceTick] = useState(0);
-
-  // Firebase Auth state (optional Web Cloud Sync)
-  const [firebaseUser, setFirebaseUser] = useState<FirebaseAuthUser | null>(null);
 
   // Refs for fresh state inside PeerJS callbacks
   const peerManagerRef = useRef<WA6PeerManager | null>(null);
@@ -2090,18 +2078,12 @@ export default function App() {
       void wakeAndSyncPeer();
     };
 
-    const handleBrowserOnline = () => {
-      void wakeAndSyncPeer();
-    };
-
     document.addEventListener('visibilitychange', handleVisibilityChange);
     window.addEventListener('focus', handleWindowFocus);
-    window.addEventListener('online', handleBrowserOnline);
 
     return () => {
       document.removeEventListener('visibilitychange', handleVisibilityChange);
       window.removeEventListener('focus', handleWindowFocus);
-      window.removeEventListener('online', handleBrowserOnline);
     };
   }, [
     profile?.id,
@@ -2189,8 +2171,7 @@ export default function App() {
       } else if (ui.activeTab !== 'chats') {
         setActiveTab('chats');
       } else {
-        // (c) Sudah di halaman utama daftar chat:
-        // Tahan halaman agar Mode Siaga latar belakang 18 Hz tetap aktif & tampilkan panduan singkat.
+        // (c) Sudah di halaman utama daftar chat: JANGAN keluar & JANGAN hentikan audio latar belakang Mode Siaga
         showToast(
           'Tombol Back dikunci agar Mode Siaga tetap aktif. Tekan tombol Home (bulat) untuk ke layar utama HP, atau pilih menu ⋮ > Exit untuk keluar.',
           4500,
@@ -2209,113 +2190,6 @@ export default function App() {
       window.removeEventListener('popstate', handlePopState);
     };
   }, [isExited, showToast, finalizeCall]);
-
-  // Sinkronisasi opsional Firebase Auth & Cloud Firestore (Antrean Sinyal Bangun Web)
-  useEffect(() => {
-    const unsubscribe = subscribeFirebaseAuth((user) => {
-      setFirebaseUser(user);
-    });
-    return () => unsubscribe();
-  }, []);
-
-  useEffect(() => {
-    if (!firebaseUser || !firebaseUser.emailVerified || !profile?.id || isExited) return;
-    void syncDeviceTokenToFirestore({
-      peerId: profile.id,
-      displayName: profile.name,
-      fcmToken: '',
-      platform: 'web',
-      standbyEnabled: standbyMode,
-    }).catch((err) => {
-      console.warn('[WattappsAU Firebase] Device sync skipped:', err);
-    });
-  }, [firebaseUser, profile?.id, profile?.name, standbyMode, isExited]);
-
-  useEffect(() => {
-    if (!firebaseUser || !profile?.id || isExited) return;
-
-    const unsubscribe = subscribeFirestoreWakeSignals((signal) => {
-      void acknowledgeFirestoreWakeSignal(signal.signalId).catch(() => {});
-
-      const cleanId = fromFullPeerId(signal.senderPeerId);
-      const existingContact = contactsRef.current.find((c) => c.id === cleanId);
-      const callerName = existingContact?.name?.trim() || signal.senderName || `ID: ${cleanId}`;
-      const callerAvatar = existingContact?.avatar || '';
-
-      if (signal.type === 'INCOMING_CALL') {
-        const callId = signal.callId || generateUid('call');
-        if (!callRuntimeRef.current && pendingCallRef.current?.callId !== callId) {
-          pauseKeepAliveForCall();
-          startIncomingRingtone();
-          const isVideo = signal.callType === 'video';
-          const pending: PendingIncomingCall = {
-            callId,
-            peerId: cleanId,
-            peerName: callerName,
-            peerAvatar: callerAvatar,
-            callType: isVideo ? 'video' : 'audio',
-            receivedAt: Date.now(),
-          };
-          pendingCallRef.current = pending;
-          presentPendingCallModal(pending);
-          showIncomingWebNotification({
-            title: callerName,
-            body: isVideo ? 'Panggilan video WattappsAU' : 'Panggilan suara WattappsAU',
-            icon: callerAvatar || '/icon-512.png',
-            tag: `wattapps-call-${cleanId}`,
-            isCall: true,
-            data: {
-              action: 'ANSWER_CALL',
-              kind: 'call',
-              callerId: cleanId,
-              callerName,
-              callerAvatar,
-              fromId: cleanId,
-              fromName: callerName,
-              callId,
-              callType: pending.callType,
-              isVideo,
-            },
-            onClick: () => {
-              forceShowIncomingCallModal({
-                callerId: cleanId,
-                callerName,
-                callId,
-                callType: pending.callType,
-                isVideo,
-              });
-            },
-          });
-        }
-        peerManagerRef.current?.ensureConnection(cleanId, true);
-      } else if (signal.type === 'NEW_MSG') {
-        const isViewing = activeChatIdRef.current === cleanId;
-        if (!isViewing || document.hidden || standbyModeRef.current) {
-          playMessagePop(true);
-          showIncomingWebNotification({
-            title: callerName,
-            body: 'Pesan baru masuk',
-            icon: callerAvatar || '/icon-512.png',
-            tag: `fs-msg-${signal.signalId}`,
-            data: {
-              kind: 'message',
-              chatId: cleanId,
-              fromId: cleanId,
-              fromName: callerName,
-              callerAvatar,
-            },
-            onClick: () => {
-              setActiveTab('chats');
-              setActiveChatId(cleanId);
-            },
-          });
-        }
-        peerManagerRef.current?.ensureConnection(cleanId, false);
-      }
-    });
-
-    return () => unsubscribe();
-  }, [firebaseUser, profile?.id, isExited, presentPendingCallModal, forceShowIncomingCallModal]);
 
   // Buka ruang chat targetId & tampilkan modal Panggilan Masuk (Angkat/Tolak) dari URL parameter atau postMessage SW
   const applyNotificationTarget = useCallback(
@@ -2364,11 +2238,9 @@ export default function App() {
       setCameraPurpose(null);
       setLightboxMedia(null);
 
-      // (a) Jika ini adalah panggilan masuk (?incomingCall=... atau action=call/ANSWER_CALL), otomatis buka halaman Panggilan & Modal Layar Penuh
+      // (a) Jika ini adalah panggilan masuk (?incomingCall=... atau action=call/ANSWER_CALL), paksa tampilkan Modal Layar Penuh Panggilan Masuk
       if (action === 'call') {
         const isVideo = Boolean(extraData?.isVideo ?? callTypeParam === 'video');
-        setActiveTab('calls');
-        setActiveChatId(null);
         forceShowIncomingCallModal({
           callerId: targetId || undefined,
           callerName: nameParam || undefined,
@@ -2482,7 +2354,7 @@ export default function App() {
         return;
       }
 
-      // 2. Tombol "Jawab" pada notifikasi panggilan: otomatis buka halaman Panggilan, tampilkan layar penuh & angkat jika izin siap
+      // 2. Tombol "Jawab" pada notifikasi panggilan: buka modal layar penuh & langsung angkat jika izin sudah siap
       if (payload.type === 'ACCEPT_INCOMING_CALL_FROM_NOTIFICATION') {
         const isVideo = Boolean(
           payload.isVideo ||
@@ -2490,8 +2362,6 @@ export default function App() {
             payload.data?.isVideo ||
             payload.data?.callType === 'video'
         );
-        setActiveTab('calls');
-        setActiveChatId(null);
         forceShowIncomingCallModal({
           callerId: payload.callerId || payload.data?.callerId || payload.data?.fromId,
           callerName: payload.callerName || payload.data?.callerName || payload.data?.fromName,
@@ -2516,8 +2386,6 @@ export default function App() {
             payload.data?.isVideo ||
             payload.data?.callType === 'video'
         );
-        setActiveTab('calls');
-        setActiveChatId(null);
         forceShowIncomingCallModal({
           callerId: payload.callerId || payload.data?.callerId || payload.data?.fromId,
           callerName: payload.callerName || payload.data?.callerName || payload.data?.fromName,
@@ -2767,19 +2635,13 @@ export default function App() {
             });
           }
         } else {
-          // Penerima Offline: simpan di outboxMessages & kirim sinyal bangun terenkripsi via ntfy.sh + Firestore (jika aktif)
+          // Penerima Offline: simpan di outboxMessages & kirim sinyal bangun terenkripsi via ntfy.sh (tanpa polling loop)
           void sendNtfyWakeSignal({
             targetId: recipientId,
             type: 'NEW_MSG',
             fromId: me.id,
             fromName: me.name,
           });
-          void sendFirestoreWakeSignal({
-            recipientPeerId: recipientId,
-            senderPeerId: me.id,
-            senderName: me.name,
-            type: 'NEW_MSG',
-          }).catch(() => {});
           manager.ensureConnection(recipientId, false);
         }
       });
@@ -3023,7 +2885,7 @@ export default function App() {
     // Hentikan otomatis Silent Audio Keep-Alive sebelum mengakses mikrofon/speaker panggilan
     pauseKeepAliveForCall();
 
-    // Kirim sinyal bangun prioritas via ntfy.sh & Firestore (menjamin lawan bangun walau socket lama sedang tidur/zombie)
+    // Kirim sinyal bangun prioritas via ntfy.sh (menjamin lawan bangun walau socket lama sedang tidur/zombie)
     void sendNtfyWakeSignal({
       targetId: peerId,
       type: 'INCOMING_CALL',
@@ -3032,14 +2894,6 @@ export default function App() {
       callType,
       callId,
     });
-    void sendFirestoreWakeSignal({
-      recipientPeerId: peerId,
-      senderPeerId: profile.id,
-      senderName: profile.name,
-      type: 'INCOMING_CALL',
-      callType,
-      callId,
-    }).catch(() => {});
 
     if (!manager.isPeerOnline(peerId)) {
       showToast(`Sinyal bangun panggilan dikirim ke ${peerName} via ntfy`);
@@ -3417,8 +3271,9 @@ export default function App() {
     setActiveCallUI((prev) => (prev ? { ...prev, isSpeakerOn: !prev.isSpeakerOn } : null));
   };
 
-  // Toggle Mode Siaga (Audio Sub-Audible 18 Hz Web Audio tanpa widget layar kunci + Screen Wake Lock)
+  // Toggle Mode Siaga (Background Media Keep-Alive + Media Session Lock Screen + Screen Wake Lock)
   const handleToggleStandby = useCallback(async () => {
+    // Jika Mode Siaga sudah aktif DAN aliran audio penjaga sudah benar-benar berjalan, matikan
     if (standbyModeRef.current && isKeepAliveActuallyPlaying()) {
       await disableStandbyMode();
       setStandbyMode(false);
@@ -3426,11 +3281,12 @@ export default function App() {
       return;
     }
 
+    // Jalankan await audio.play() langsung di dalam event klik user agar kartu Media Session layar kunci muncul
     const res = await enableStandbyMode();
     setStandbyMode(true);
 
     if (res.audioKeepAliveActive) {
-      showToast('Mode Siaga Aktif · Audio sub-audible 18 Hz menjaga PeerJS tanpa widget layar kunci');
+      showToast('Mode Siaga Aktif · Saluran latar & kartu layar kunci aktif');
     } else if (res.wakeLockActive) {
       showToast('Mode Siaga Aktif · Layar & koneksi P2P tetap terjaga');
     } else {
@@ -3631,7 +3487,7 @@ export default function App() {
             </div>
           ) : (
             <div className="min-h-[60px] py-1.5 px-3 flex items-center justify-between gap-1.5">
-              {/* Brand */}
+              {/* Brand & PeerJS Live Status Indicator */}
               <div className="flex items-center gap-2 min-w-0 flex-1">
                 <button
                   type="button"
@@ -3648,6 +3504,39 @@ export default function App() {
                     </span>
                   </span>
                 </button>
+                <button
+                  type="button"
+                  onClick={() => {
+                    if (peerState !== 'online') {
+                      peerManagerRef.current?.connect();
+                      showToast('Menghubungkan ulang ke server PeerJS...');
+                    } else {
+                      setShowProfileDrawer(true);
+                    }
+                  }}
+                  title={peerError || `ID Anda: ${profile.id}`}
+                  className="inline-flex items-center gap-1 text-[11px] font-medium text-white/90 hover:text-white transition-colors whitespace-nowrap cursor-pointer shrink-0"
+                >
+                  <span
+                    className={`w-2 h-2 rounded-full shrink-0 ${
+                      peerState === 'online'
+                        ? 'bg-[#25D366]'
+                        : peerState === 'connecting'
+                        ? 'bg-amber-300 animate-pulse'
+                        : 'bg-rose-400'
+                    }`}
+                  />
+                  <span>
+                    {peerState === 'online'
+                      ? 'Online'
+                      : peerState === 'connecting'
+                      ? 'Menghubungkan...'
+                      : 'Terputus'}
+                  </span>
+                  {peerState === 'disconnected' || peerState === 'error' ? (
+                    <RefreshCw className="w-3 h-3" />
+                  ) : null}
+                </button>
               </div>
 
               {/* Right Icons: Mode Siaga / Anti-Sleep, Camera, Global Search, 3-Dot Menu */}
@@ -3655,21 +3544,21 @@ export default function App() {
                 <button
                   type="button"
                   onClick={() => void handleToggleStandby()}
-                  className={`h-8 px-2 mr-0.5 rounded-full inline-flex items-center gap-1 text-[11px] font-semibold transition-colors cursor-pointer border ${
+                  className={`h-8 px-2 mr-0.5 rounded-full inline-flex items-center gap-1 text-[11px] font-semibold transition-all cursor-pointer border ${
                     standbyMode
-                      ? 'bg-[#25D366]/15 border-[#25D366]/45 text-[#D9FDD3]'
+                      ? 'bg-[#25D366]/20 border-[#25D366]/70 text-[#D9FDD3] shadow-[0_0_12px_rgba(37,211,102,0.35)]'
                       : 'bg-white/10 border-white/15 text-white/90 hover:bg-white/20'
                   }`}
                   title={
                     standbyMode
-                      ? 'Mode Siaga Latar Belakang aktif (audio sub-audible 18 Hz)'
-                      : 'Aktifkan Mode Siaga Latar Belakang'
+                      ? 'Mode Siaga Latar Belakang AKTIF (ketuk untuk matikan)'
+                      : 'Aktifkan Mode Siaga Latar Belakang agar koneksi P2P tetap hidup saat layar terkunci'
                   }
                   aria-label="Mode Siaga Latar Belakang"
                   aria-pressed={standbyMode}
                 >
                   {standbyMode ? (
-                    <ShieldCheck className="w-3.5 h-3.5 shrink-0 text-[#25D366]" />
+                    <ShieldCheck className="w-3.5 h-3.5 shrink-0 text-[#25D366] animate-pulse" />
                   ) : (
                     <Shield className="w-3.5 h-3.5 shrink-0" />
                   )}
@@ -4016,25 +3905,6 @@ export default function App() {
       {showProfileDrawer && (
         <ProfileDrawer
           profile={profile}
-          firebaseUserEmail={firebaseUser?.email ?? null}
-          onSignInFirebase={async () => {
-            try {
-              const user = await signInWithGoogleForCloudPush();
-              if (user) {
-                showToast(`Cloud Push Firestore aktif (${user.email})`);
-              }
-            } catch {
-              showToast('Login Google dibatalkan atau gagal.');
-            }
-          }}
-          onSignOutFirebase={async () => {
-            try {
-              await signOutCloudPush();
-              showToast('Koneksi Cloud Push Firestore diputus.');
-            } catch {
-              showToast('Gagal memutus koneksi Cloud Push.');
-            }
-          }}
           onUpdateProfile={handleUpdateProfile}
           onOpenShareApp={() => {
             setShowProfileDrawer(false);
@@ -4171,6 +4041,8 @@ export default function App() {
           {toast}
         </div>
       )}
+
+      <OfflineIndicator />
     </div>
   );
 }
