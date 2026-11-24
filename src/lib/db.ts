@@ -31,19 +31,41 @@ interface StoredMediaRecord {
   createdAt: number;
 }
 
+export const LOCKED_USER_ID_KEY = 'wattapps_user_id';
+export const LOCKED_USER_NAME_KEY = 'wattapps_user_name';
+
 const PROFILE_KEY = 'wa6_user_profile_v1';
 const THEME_KEY = 'wa6_theme_mode_v1';
 const UNREAD_KEY = 'wa6_unread_counts_v1';
 const OUTBOX_KEY = 'outboxMessages';
 
-// Lightweight preferences only in localStorage (NEVER store chat messages or media in localStorage)
-export function getSavedProfile(): UserProfile | null {
+function sanitizeSixDigitId(raw: string | null | undefined): string | null {
+  if (!raw || typeof raw !== 'string') return null;
+  const cleaned = raw.replace(/\D/g, '').trim();
+  return /^\d{6}$/.test(cleaned) ? cleaned : null;
+}
+
+/**
+ * Membaca ID permanen perangkat yang terkunci di localStorage (`wattapps_user_id`).
+ * Sinkron agar selalu tersedia sebelum PeerJS, Firestore, atau FCM diinisialisasi.
+ */
+export function getLockedUserId(): string | null {
   try {
+    const direct = sanitizeSixDigitId(localStorage.getItem(LOCKED_USER_ID_KEY));
+    if (direct) return direct;
+
+    // Migrasi otomatis satu kali dari profil lama jika wattapps_user_id belum tertulis
     const raw = localStorage.getItem(PROFILE_KEY);
-    if (!raw) return null;
-    const parsed = JSON.parse(raw) as UserProfile;
-    if (parsed && typeof parsed.id === 'string' && /^\d{6}$/.test(parsed.id)) {
-      return parsed;
+    if (raw) {
+      const parsed = JSON.parse(raw) as Partial<UserProfile>;
+      const legacyId = sanitizeSixDigitId(parsed?.id);
+      if (legacyId) {
+        localStorage.setItem(LOCKED_USER_ID_KEY, legacyId);
+        if (typeof parsed?.name === 'string' && parsed.name.trim()) {
+          localStorage.setItem(LOCKED_USER_NAME_KEY, parsed.name.trim());
+        }
+        return legacyId;
+      }
     }
     return null;
   } catch {
@@ -51,11 +73,98 @@ export function getSavedProfile(): UserProfile | null {
   }
 }
 
-export function saveUserProfile(profile: UserProfile): void {
+export function getLockedUserName(): string | null {
   try {
-    localStorage.setItem(PROFILE_KEY, JSON.stringify(profile));
+    const direct = localStorage.getItem(LOCKED_USER_NAME_KEY)?.trim();
+    if (direct) return direct;
+
+    const raw = localStorage.getItem(PROFILE_KEY);
+    if (raw) {
+      const parsed = JSON.parse(raw) as Partial<UserProfile>;
+      const legacyName = typeof parsed?.name === 'string' ? parsed.name.trim() : '';
+      if (legacyName) {
+        localStorage.setItem(LOCKED_USER_NAME_KEY, legacyName);
+        return legacyName;
+      }
+    }
+    return null;
+  } catch {
+    return null;
+  }
+}
+
+// Lightweight preferences only in localStorage (NEVER store chat messages or media in localStorage)
+export function getSavedProfile(): UserProfile | null {
+  try {
+    const lockedId = getLockedUserId();
+    const lockedName = getLockedUserName();
+    const raw = localStorage.getItem(PROFILE_KEY);
+
+    if (raw) {
+      const parsed = JSON.parse(raw) as Partial<UserProfile>;
+      const resolvedId = lockedId || sanitizeSixDigitId(parsed?.id);
+      const resolvedName =
+        (typeof parsed?.name === 'string' ? parsed.name.trim() : '') || lockedName || '';
+
+      if (resolvedId && resolvedName) {
+        const syncedProfile: UserProfile = {
+          id: resolvedId,
+          name: resolvedName,
+          bio: typeof parsed?.bio === 'string' && parsed.bio.trim() ? parsed.bio : 'Ada',
+          avatar: typeof parsed?.avatar === 'string' && parsed.avatar ? parsed.avatar : 'preset-emerald',
+          createdAt: typeof parsed?.createdAt === 'number' ? parsed.createdAt : Date.now(),
+        };
+        localStorage.setItem(LOCKED_USER_ID_KEY, syncedProfile.id);
+        localStorage.setItem(LOCKED_USER_NAME_KEY, syncedProfile.name);
+        if (parsed?.id !== syncedProfile.id || parsed?.name !== syncedProfile.name) {
+          localStorage.setItem(PROFILE_KEY, JSON.stringify(syncedProfile));
+        }
+        return syncedProfile;
+      }
+    }
+
+    // Jika PROFILE_KEY terhapus tetapi wattapps_user_id & wattapps_user_name masih terkunci,
+    // pulihkan profil secara otomatis agar perangkat TIDAK pernah lupa identitas atau membuat ID acak baru.
+    if (lockedId && lockedName) {
+      const recoveredProfile: UserProfile = {
+        id: lockedId,
+        name: lockedName,
+        bio: 'Ada',
+        avatar: 'preset-emerald',
+        createdAt: Date.now(),
+      };
+      localStorage.setItem(PROFILE_KEY, JSON.stringify(recoveredProfile));
+      return recoveredProfile;
+    }
+
+    return null;
+  } catch {
+    return null;
+  }
+}
+
+export function saveUserProfile(profile: UserProfile): UserProfile {
+  try {
+    const existingLockedId = getLockedUserId();
+    const incomingId = sanitizeSixDigitId(profile.id);
+    // Kunci permanen: jika wattapps_user_id sudah ada di perangkat ini, JANGAN pernah timpa dengan ID acak baru
+    const authoritativeId = existingLockedId || incomingId || profile.id;
+    const cleanName =
+      profile.name.trim() || getLockedUserName() || `Pengguna ${authoritativeId}`;
+
+    const lockedProfile: UserProfile = {
+      ...profile,
+      id: authoritativeId,
+      name: cleanName,
+    };
+
+    localStorage.setItem(LOCKED_USER_ID_KEY, lockedProfile.id);
+    localStorage.setItem(LOCKED_USER_NAME_KEY, lockedProfile.name);
+    localStorage.setItem(PROFILE_KEY, JSON.stringify(lockedProfile));
+    return lockedProfile;
   } catch (err) {
     console.error('Failed to save profile:', err);
+    return profile;
   }
 }
 
@@ -402,6 +511,8 @@ export async function dbClearCalls(): Promise<void> {
 export async function resetAllLocalData(): Promise<void> {
   try {
     localStorage.removeItem(PROFILE_KEY);
+    localStorage.removeItem(LOCKED_USER_ID_KEY);
+    localStorage.removeItem(LOCKED_USER_NAME_KEY);
     localStorage.removeItem(UNREAD_KEY);
     localStorage.removeItem(OUTBOX_KEY);
     const db = await openDB();

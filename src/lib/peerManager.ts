@@ -396,11 +396,31 @@ export class WA6PeerManager {
   private wakeSyncInFlight = false;
   private heartbeatTimer: number | null = null;
   private reconnectTimer: number | null = null;
+  private batteryStandby = false;
   private destroyed = false;
 
   constructor(profile: UserProfile, callbacks: PeerManagerCallbacks) {
     this.profile = { ...profile, id: normalizePeerId(profile.id) };
     this.callbacks = callbacks;
+  }
+
+  /**
+   * Menghentikan interval polling heartbeat/presence berat saat mode standby hemat baterai aktif,
+   * tanpa memutus instance PeerJS maupun listener pesan/panggilan masuk.
+   */
+  public setBatteryStandby(enabled: boolean): void {
+    if (this.batteryStandby === enabled) return;
+    this.batteryStandby = enabled;
+    if (enabled) {
+      if (this.heartbeatTimer !== null) {
+        window.clearInterval(this.heartbeatTimer);
+        this.heartbeatTimer = null;
+      }
+      return;
+    }
+    if (!this.destroyed && this.peer && !this.peer.destroyed && this.peer.open) {
+      this.startHeartbeatLoop();
+    }
   }
 
   /**
@@ -892,9 +912,11 @@ export class WA6PeerManager {
   private startHeartbeatLoop(): void {
     if (this.heartbeatTimer !== null) {
       window.clearInterval(this.heartbeatTimer);
+      this.heartbeatTimer = null;
     }
+    if (this.batteryStandby || this.destroyed) return;
     this.heartbeatTimer = window.setInterval(() => {
-      if (this.destroyed) return;
+      if (this.destroyed || this.batteryStandby) return;
       if (typeof navigator !== 'undefined' && navigator.onLine === false) return;
 
       // (1) Jaga WebSocket signaling PeerJS tetap hidup (anti-idle timeout NAT/operator seluler)

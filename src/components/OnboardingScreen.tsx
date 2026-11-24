@@ -1,5 +1,5 @@
 import React, { useRef, useState } from 'react';
-import { Camera, RefreshCw, ShieldCheck, ArrowRight, Check } from 'lucide-react';
+import { Camera, Lock, RefreshCw, ShieldCheck, ArrowRight, Check } from 'lucide-react';
 import { UserProfile } from '../types';
 import {
   PRESET_AVATARS,
@@ -7,6 +7,7 @@ import {
   formatSixDigitId,
   generateSixDigitId,
 } from '../lib/media';
+import { getLockedUserId, getLockedUserName } from '../lib/db';
 import { Avatar } from './Avatar';
 import { AppLogo } from './AppLogo';
 
@@ -15,8 +16,11 @@ interface OnboardingScreenProps {
 }
 
 export const OnboardingScreen: React.FC<OnboardingScreenProps> = ({ onComplete }) => {
-  const [sixDigitId, setSixDigitId] = useState<string>(() => generateSixDigitId());
-  const [name, setName] = useState('');
+  const existingLockedId = getLockedUserId();
+  const [sixDigitId, setSixDigitId] = useState<string>(
+    () => existingLockedId || generateSixDigitId()
+  );
+  const [name, setName] = useState<string>(() => getLockedUserName() || '');
   const [bio, setBio] = useState('Ada');
   const [avatar, setAvatar] = useState<string>(PRESET_AVATARS[0].id);
   const [error, setError] = useState('');
@@ -40,8 +44,9 @@ export const OnboardingScreen: React.FC<OnboardingScreenProps> = ({ onComplete }
       setError('Masukkan nama tampilan Anda terlebih dahulu.');
       return;
     }
+    const authoritativeId = getLockedUserId() || sixDigitId;
     onComplete({
-      id: sixDigitId,
+      id: authoritativeId,
       name: trimmed,
       bio: bio.trim() || 'Ada',
       avatar,
@@ -77,25 +82,36 @@ export const OnboardingScreen: React.FC<OnboardingScreenProps> = ({ onComplete }
             </p>
           </div>
 
-          {/* Generated 6-Digit Unique ID Box */}
+          {/* Generated / Locked 6-Digit Unique ID Box */}
           <div className="mb-6 rounded-xl bg-[#F0F2F5] dark:bg-[#202C33] p-4 flex items-center justify-between gap-3">
             <div>
               <span className="block text-xs font-medium text-[#54656F] dark:text-[#8696A0]">
-                ID Unik 6 Digit Anda
+                {existingLockedId ? 'ID Permanen Perangkat Anda' : 'ID Unik 6 Digit Anda'}
               </span>
               <span className="font-mono-id text-2xl font-bold tracking-wider text-[#008069] dark:text-[#00A884]">
                 {formatSixDigitId(sixDigitId)}
               </span>
             </div>
-            <button
-              type="button"
-              onClick={() => setSixDigitId(generateSixDigitId())}
-              className="min-h-[44px] px-3 rounded-xl bg-white dark:bg-[#2A3942] border border-black/5 dark:border-white/10 text-xs font-semibold text-[#111B21] dark:text-[#E9EDEF] hover:bg-[#F5F6F6] dark:hover:bg-[#32434D] flex items-center gap-1.5 transition-colors cursor-pointer"
-              title="Acak ID 6 Digit baru"
-            >
-              <RefreshCw className="w-3.5 h-3.5" />
-              <span>Acak</span>
-            </button>
+            {existingLockedId ? (
+              <div className="min-h-[40px] px-3 rounded-xl bg-emerald-500/10 border border-emerald-500/30 text-xs font-semibold text-[#008069] dark:text-[#00A884] flex items-center gap-1.5">
+                <Lock className="w-3.5 h-3.5" />
+                <span>Terkunci</span>
+              </div>
+            ) : (
+              <button
+                type="button"
+                onClick={() => {
+                  if (!getLockedUserId()) {
+                    setSixDigitId(generateSixDigitId());
+                  }
+                }}
+                className="min-h-[44px] px-3 rounded-xl bg-white dark:bg-[#2A3942] border border-black/5 dark:border-white/10 text-xs font-semibold text-[#111B21] dark:text-[#E9EDEF] hover:bg-[#F5F6F6] dark:hover:bg-[#32434D] flex items-center gap-1.5 transition-colors cursor-pointer"
+                title="Acak ID 6 Digit baru"
+              >
+                <RefreshCw className="w-3.5 h-3.5" />
+                <span>Acak</span>
+              </button>
+            )}
           </div>
 
           {/* Avatar Picker & Photo Upload */}

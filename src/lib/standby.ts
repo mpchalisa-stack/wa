@@ -195,6 +195,21 @@ export async function syncConnectionWakeLock(connectionActive: boolean): Promise
 }
 
 /**
+ * Mode standby hemat baterai otomatis (setelah 5 menit tanpa interaksi dan tidak sedang menelepon):
+ * Melepas wakeLock dan menghentikan seluruh audio latar belakang / AudioContext idle
+ * agar layar perangkat dapat mati otomatis tanpa mematikan koneksi penerima notifikasi.
+ */
+export async function enterBackgroundBatteryStandby(): Promise<void> {
+  isConnectionWakeLockDesired = false;
+  await releaseScreenWakeLock();
+  purgeLegacyKeepAliveAudioElement();
+  if (activeMediaSessionMode === null) {
+    releaseActiveMediaSession();
+    releaseAudioContextNow();
+  }
+}
+
+/**
  * Membersihkan elemen audio legacy (keepalive-audio) jika masih ada di DOM
  * agar tidak pernah menahan audio focus Android.
  */

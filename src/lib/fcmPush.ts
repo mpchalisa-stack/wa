@@ -8,12 +8,14 @@ import {
   Firestore,
 } from 'firebase/firestore';
 import fcmFirebaseConfig from '../../firebase-fcm-config.json';
+import { LOCKED_USER_ID_KEY, LOCKED_USER_NAME_KEY } from './db';
 
 export interface AndroidBridgeInterface {
   getFcmToken?: () => string | null | undefined;
   showIncomingCall?: (sender: string, body?: string) => void;
   showIncomingMessage?: (sender: string, body: string) => void;
   setCallAudioMode?: (inCall: boolean) => void;
+  enterBatteryStandby?: () => void;
 }
 
 declare global {
@@ -38,9 +40,18 @@ export interface FcmPushResult {
   statusCode?: number;
 }
 
+export interface FirestorePeerIdentity {
+  userId: string;
+  displayName: string;
+  avatar?: string;
+  updatedAt?: number;
+}
+
 const FCM_APP_NAME = 'wattapps-fcm';
 const DEVICE_TOKENS_COLLECTION = 'device_tokens';
+const USERS_COLLECTION = 'users';
 const TOKEN_SYNC_INTERVAL_MS = 5000;
+const IDENTITY_CACHE_TTL_MS = 60000;
 const MAX_TOKEN_LENGTH = 512;
 const MAX_SENDER_LENGTH = 120;
 const MAX_BODY_LENGTH = 500;
@@ -48,9 +59,17 @@ const MAX_BODY_LENGTH = 500;
 let fcmAppInstance: FirebaseApp | null = null;
 let fcmFirestoreInstance: Firestore | null = null;
 
+interface CachedPeerIdentityEntry {
+  identity: FirestorePeerIdentity | null;
+  fetchedAt: number;
+}
+
+const peerIdentityCache = new Map<string, CachedPeerIdentityEntry>();
+const inFlightIdentityLookups = new Map<string, Promise<FirestorePeerIdentity | null>>();
+
 /**
- * Normalisasi ID dokumen Firestore untuk koleksi `device_tokens`:
- * menghapus spasi dan karakter pembatas path lalu mengubah ke lowercase (`id.trim().toLowerCase()`).
+ * Normalisasi ID dokumen Firestore untuk koleksi `device_tokens` & `users`:
+ * menghapus prefix & spasi lalu mengubah ke lowercase (`id.trim().toLowerCase()`).
  */
 export function normalizeFcmUserId(rawId: string): string {
   const cleaned = (rawId || '')
@@ -121,30 +140,168 @@ async function testFcmFirestoreConnection(): Promise<void> {
 }
 void testFcmFirestoreConnection();
 
+function extractRealDisplayName(data: Record<string, unknown> | undefined): string {
+  if (!data) return '';
+  const candidates = [data.displayName, data.name, data.userName, data.username];
+  for (const candidate of candidates) {
+    if (typeof candidate === 'string') {
+      const trimmed = candidate.trim();
+      if (
+        trimmed &&
+        !/^teman\s+\d+$/i.test(trimmed) &&
+        !/^id[:\s]+\d+$/i.test(trimmed) &&
+        !/^\d{6}$/.test(trimmed)
+      ) {
+        return trimmed.slice(0, MAX_SENDER_LENGTH);
+      }
+    }
+  }
+  return '';
+}
+
+/**
+ * Mengambil cache identitas lawan bicara dari Firestore secara sinkron (jika sudah pernah dimuat).
+ */
+export function getCachedPeerIdentity(rawPeerId: string): FirestorePeerIdentity | null {
+  const cleanId = normalizeFcmUserId(rawPeerId);
+  if (!cleanId) return null;
+  const entry = peerIdentityCache.get(cleanId);
+  return entry?.identity || null;
+}
+
+/**
+ * Mencocokkan identitas asli lawan bicara langsung dari koleksi Firestore `device_tokens` / `users`
+ * agar layar panggilan masuk/keluar dan chat selalu menampilkan nama asli pemilik ID tersebut.
+ */
+export async function fetchPeerIdentityFromFirestore(
+  rawPeerId: string,
+  options?: { forceRefresh?: boolean }
+): Promise<FirestorePeerIdentity | null> {
+  const cleanId = normalizeFcmUserId(rawPeerId);
+  if (!cleanId) return null;
+
+  const forceRefresh = Boolean(options?.forceRefresh);
+  const cached = peerIdentityCache.get(cleanId);
+  if (!forceRefresh && cached && Date.now() - cached.fetchedAt < IDENTITY_CACHE_TTL_MS) {
+    return cached.identity;
+  }
+
+  const existingFlight = inFlightIdentityLookups.get(cleanId);
+  if (existingFlight) {
+    return existingFlight;
+  }
+
+  const lookupPromise = (async (): Promise<FirestorePeerIdentity | null> => {
+    const db = getFcmFirestore();
+    if (!db) return cached?.identity || null;
+
+    let resolved: FirestorePeerIdentity | null = null;
+
+    // 1. Cek koleksi utama `device_tokens/{cleanId}`
+    try {
+      const tokenSnap = await getDoc(doc(db, DEVICE_TOKENS_COLLECTION, cleanId));
+      if (tokenSnap.exists()) {
+        const data = tokenSnap.data() as Record<string, unknown>;
+        const displayName = extractRealDisplayName(data);
+        if (displayName) {
+          resolved = {
+            userId: cleanId,
+            displayName,
+            avatar: typeof data.avatar === 'string' ? data.avatar : undefined,
+            updatedAt: typeof data.updatedAt === 'number' ? data.updatedAt : undefined,
+          };
+        }
+      }
+    } catch (error) {
+      logFcmFirestoreError('get', `${DEVICE_TOKENS_COLLECTION}/${cleanId}`, error);
+    }
+
+    // 2. Fallback cek koleksi `users/{cleanId}` jika nama belum ada di `device_tokens`
+    if (!resolved) {
+      try {
+        const userSnap = await getDoc(doc(db, USERS_COLLECTION, cleanId));
+        if (userSnap.exists()) {
+          const data = userSnap.data() as Record<string, unknown>;
+          const displayName = extractRealDisplayName(data);
+          if (displayName) {
+            resolved = {
+              userId: cleanId,
+              displayName,
+              avatar: typeof data.avatar === 'string' ? data.avatar : undefined,
+              updatedAt: typeof data.updatedAt === 'number' ? data.updatedAt : undefined,
+            };
+          }
+        }
+      } catch (error) {
+        logFcmFirestoreError('get', `${USERS_COLLECTION}/${cleanId}`, error);
+      }
+    }
+
+    peerIdentityCache.set(cleanId, {
+      identity: resolved,
+      fetchedAt: Date.now(),
+    });
+    return resolved;
+  })().finally(() => {
+    inFlightIdentityLookups.delete(cleanId);
+  });
+
+  inFlightIdentityLookups.set(cleanId, lookupPromise);
+  return lookupPromise;
+}
+
 /**
  * Mengambil token FCM native dari `window.AndroidBridge?.getFcmToken?.()` dan menyimpannya ke
- * Firestore `device_tokens/{cleanId}` dengan format `{ userId: cleanId, fcmToken: token, updatedAt: Date.now() }`.
+ * Firestore `device_tokens/{cleanId}` beserta nama tampilan pengguna.
+ * WAJIB memvalidasi kecocokan ID terhadap `localStorage.getItem('wattapps_user_id')` agar token
+ * perangkat ini tidak pernah menimpa dokumen milik pengguna/perangkat lain.
  */
 let lastSyncedSignature = '';
 
-export async function syncFcmToken(myUserId: string, forceWrite = false): Promise<boolean> {
+export async function syncFcmToken(
+  myUserId: string,
+  displayName?: string,
+  forceWrite = false
+): Promise<boolean> {
   if (typeof window === 'undefined') return false;
   const cleanId = normalizeFcmUserId(myUserId);
   if (!cleanId) return false;
+
+  // VALIDASI KETAT ANTI-TERTUKAR: pastikan ID sinkronisasi 100% cocok dengan wattapps_user_id di localStorage
+  let lockedLocalId = '';
+  let lockedLocalName = '';
+  try {
+    lockedLocalId = normalizeFcmUserId(localStorage.getItem(LOCKED_USER_ID_KEY) || '');
+    lockedLocalName = (localStorage.getItem(LOCKED_USER_NAME_KEY) || '').trim();
+  } catch {
+    return false;
+  }
+
+  if (!lockedLocalId || cleanId !== lockedLocalId) {
+    console.warn(
+      `[WattappsAU FCM] Sinkronisasi dibatalkan: ID "${cleanId}" tidak cocok dengan wattapps_user_id ("${lockedLocalId}").`
+    );
+    return false;
+  }
+
+  const resolvedName = ((displayName || lockedLocalName || '').trim()).slice(0, MAX_SENDER_LENGTH);
 
   let rawToken: string | null | undefined;
   try {
     rawToken = window.AndroidBridge?.getFcmToken?.();
   } catch {
-    return false;
+    rawToken = undefined;
   }
 
   const token = typeof rawToken === 'string' ? rawToken.trim() : '';
-  if (!token || token.length > MAX_TOKEN_LENGTH || /\s/.test(token)) {
+  const hasValidToken = Boolean(token && token.length <= MAX_TOKEN_LENGTH && !/\s/.test(token));
+
+  // Jika tidak ada token native DAN tidak ada nama tampilan untuk disinkronkan, lewati penulisan
+  if (!hasValidToken && !resolvedName) {
     return false;
   }
 
-  const signature = `${cleanId}:${token}`;
+  const signature = `${cleanId}:${hasValidToken ? token : 'no-token'}:${resolvedName}`;
   if (!forceWrite && signature === lastSyncedSignature) {
     return true;
   }
@@ -152,18 +309,44 @@ export async function syncFcmToken(myUserId: string, forceWrite = false): Promis
   const db = getFcmFirestore();
   if (!db) return false;
 
+  const now = Date.now();
+  const tokenPayload: Record<string, unknown> = {
+    userId: cleanId,
+    updatedAt: now,
+  };
+  if (hasValidToken) {
+    tokenPayload.fcmToken = token;
+  }
+  if (resolvedName) {
+    tokenPayload.displayName = resolvedName;
+    tokenPayload.name = resolvedName;
+  }
+
   const docPath = `${DEVICE_TOKENS_COLLECTION}/${cleanId}`;
   try {
-    await setDoc(
-      doc(db, DEVICE_TOKENS_COLLECTION, cleanId),
-      {
-        userId: cleanId,
-        fcmToken: token,
-        updatedAt: Date.now(),
-      },
-      { merge: true }
-    );
+    await setDoc(doc(db, DEVICE_TOKENS_COLLECTION, cleanId), tokenPayload, { merge: true });
     lastSyncedSignature = signature;
+
+    // Sinkronkan juga profil nama ke koleksi `users/{cleanId}` (best-effort) agar pencocokan identitas selalu konsisten
+    if (resolvedName) {
+      peerIdentityCache.set(cleanId, {
+        identity: { userId: cleanId, displayName: resolvedName, updatedAt: now },
+        fetchedAt: now,
+      });
+      void setDoc(
+        doc(db, USERS_COLLECTION, cleanId),
+        {
+          userId: cleanId,
+          displayName: resolvedName,
+          name: resolvedName,
+          updatedAt: now,
+        },
+        { merge: true }
+      ).catch(() => {
+        // Abaikan jika rules koleksi users bersifat opsional di proyek eksternal
+      });
+    }
+
     return true;
   } catch (error) {
     logFcmFirestoreError('write', docPath, error);
@@ -173,9 +356,9 @@ export async function syncFcmToken(myUserId: string, forceWrite = false): Promis
 
 /**
  * Menjalankan `syncFcmToken()` segera saat aplikasi dibuka dan setiap 5 detik
- * selama ID pengguna lokal tersedia agar token baru/rotasi dari Android selalu tersinkron.
+ * selama ID pengguna lokal tersedia agar token baru/rotasi & nama tampilan selalu tersinkron.
  */
-export function startFcmTokenSyncLoop(myUserId: string): () => void {
+export function startFcmTokenSyncLoop(myUserId: string, displayName?: string): () => void {
   const cleanId = normalizeFcmUserId(myUserId);
   if (!cleanId || typeof window === 'undefined') {
     return () => {};
@@ -184,7 +367,7 @@ export function startFcmTokenSyncLoop(myUserId: string): () => void {
   let cancelled = false;
   const runSync = (forceWrite = false) => {
     if (cancelled) return;
-    void syncFcmToken(cleanId, forceWrite);
+    void syncFcmToken(cleanId, displayName, forceWrite);
   };
 
   // Sinkronisasi segera saat aplikasi dibuka & ID pengguna tersedia
@@ -236,9 +419,22 @@ export async function sendFcmPushToUser(params: FcmPushRequest): Promise<FcmPush
         errorDetail: `Token perangkat ${cleanTargetUserId} belum terdaftar`,
       };
     }
-    const data = snap.data() as { fcmToken?: unknown } | undefined;
+    const data = snap.data() as Record<string, unknown> | undefined;
     if (typeof data?.fcmToken === 'string') {
       targetToken = data.fcmToken.trim();
+    }
+    // Sekalian perbarui cache identitas asli jika tersedia di dokumen device_tokens
+    const remoteDisplayName = extractRealDisplayName(data);
+    if (remoteDisplayName) {
+      peerIdentityCache.set(cleanTargetUserId, {
+        identity: {
+          userId: cleanTargetUserId,
+          displayName: remoteDisplayName,
+          avatar: typeof data?.avatar === 'string' ? data.avatar : undefined,
+          updatedAt: typeof data?.updatedAt === 'number' ? data.updatedAt : undefined,
+        },
+        fetchedAt: Date.now(),
+      });
     }
   } catch (error) {
     logFcmFirestoreError('get', docPath, error);
@@ -362,6 +558,19 @@ export function setAndroidBridgeCallAudioMode(inCall: boolean): void {
   if (typeof window === 'undefined') return;
   try {
     window.AndroidBridge?.setCallAudioMode?.(inCall);
+  } catch {
+    // ignore bridge error
+  }
+}
+
+/**
+ * Meminta aplikasi Android WebView untuk masuk ke mode standby hemat baterai secara halus
+ * di latar belakang tanpa mematikan layanan penerima notifikasi FCM.
+ */
+export function enterAndroidBridgeBatteryStandby(): void {
+  if (typeof window === 'undefined') return;
+  try {
+    window.AndroidBridge?.enterBatteryStandby?.();
   } catch {
     // ignore bridge error
   }

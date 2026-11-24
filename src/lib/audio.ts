@@ -3,8 +3,14 @@
 let ringtoneTimer: number | null = null;
 let idleReleaseTimer: number | null = null;
 let audioCtx: AudioContext | null = null;
+let ringtoneAudioCtx: AudioContext | null = null;
+let ringtoneSessionId = 0;
+
+const activeRingtoneIntervals = new Set<number>();
+const activeRingtoneContexts = new Set<AudioContext>();
 const activeRingtoneNodes = new Set<AudioNode>();
 const activeRingtoneOscillators = new Set<OscillatorNode>();
+const registeredRingtoneAudioElements = new Set<HTMLAudioElement>();
 let activeRingtoneAudioEl: HTMLAudioElement | null = null;
 
 function clearIdleReleaseTimer(): void {
@@ -14,13 +20,41 @@ function clearIdleReleaseTimer(): void {
   }
 }
 
+function getAudioContextCtor(): typeof AudioContext | null {
+  if (typeof window === 'undefined') return null;
+  return (
+    window.AudioContext ||
+    (window as unknown as { webkitAudioContext?: typeof AudioContext }).webkitAudioContext ||
+    null
+  );
+}
+
+function isRingtoneActive(): boolean {
+  return (
+    ringtoneTimer !== null ||
+    activeRingtoneIntervals.size > 0 ||
+    activeRingtoneOscillators.size > 0 ||
+    ringtoneAudioCtx !== null
+  );
+}
+
+/**
+ * Mendaftarkan elemen HTMLAudioElement (misal dari useRef) agar selalu dihentikan & di-reset
+ * secara sinkron oleh stopAllRingtones().
+ */
+export function registerRingtoneAudioElement(el: HTMLAudioElement | null): () => void {
+  if (!el) return () => {};
+  registeredRingtoneAudioElements.add(el);
+  return () => {
+    registeredRingtoneAudioElements.delete(el);
+  };
+}
+
 export function getSharedAudioContext(): AudioContext | null {
   try {
     clearIdleReleaseTimer();
     if (!audioCtx || audioCtx.state === 'closed') {
-      const Ctx =
-        window.AudioContext ||
-        (window as unknown as { webkitAudioContext: typeof AudioContext }).webkitAudioContext;
+      const Ctx = getAudioContextCtor();
       if (Ctx) {
         audioCtx = new Ctx();
       }
@@ -29,6 +63,28 @@ export function getSharedAudioContext(): AudioContext | null {
       void audioCtx.resume().catch(() => {});
     }
     return audioCtx;
+  } catch {
+    return null;
+  }
+}
+
+function createDedicatedRingtoneContext(): AudioContext | null {
+  try {
+    const Ctx = getAudioContextCtor();
+    if (!Ctx) return null;
+    if (ringtoneAudioCtx && ringtoneAudioCtx.state !== 'closed') {
+      if (ringtoneAudioCtx.state === 'suspended') {
+        void ringtoneAudioCtx.resume().catch(() => {});
+      }
+      return ringtoneAudioCtx;
+    }
+    const ctx = new Ctx();
+    ringtoneAudioCtx = ctx;
+    activeRingtoneContexts.add(ctx);
+    if (ctx.state === 'suspended') {
+      void ctx.resume().catch(() => {});
+    }
+    return ctx;
   } catch {
     return null;
   }
@@ -50,12 +106,12 @@ export function resumeWebAudioContext(): void {
 }
 
 /**
- * Menutup & melepas AudioContext sepenuhnya agar sistem Android dan perangkat Bluetooth
+ * Menutup & melepas AudioContext pesan/notifikasi sepenuhnya agar sistem Android dan perangkat Bluetooth
  * eksternal (misal headset VIVAN Sport X3) langsung mendapatkan kembali fokus audio normal.
  */
 export function releaseAudioContextNow(): void {
   clearIdleReleaseTimer();
-  if (ringtoneTimer !== null) return; // Jangan tutup saat dering panggilan masih aktif
+  if (isRingtoneActive()) return; // Jangan tutup saat dering panggilan masih aktif
 
   const ctx = audioCtx;
   audioCtx = null;
@@ -78,10 +134,10 @@ export function releaseAudioContextNow(): void {
 
 function scheduleIdleAudioContextRelease(delayMs = 550): void {
   clearIdleReleaseTimer();
-  if (ringtoneTimer !== null) return;
+  if (isRingtoneActive()) return;
   idleReleaseTimer = window.setTimeout(() => {
     idleReleaseTimer = null;
-    if (ringtoneTimer === null) {
+    if (!isRingtoneActive()) {
       releaseAudioContextNow();
     }
   }, delayMs);
@@ -98,7 +154,7 @@ export function initGlobalAudioUnlock(): () => void {
   }
 
   const handleVisibilityRelease = () => {
-    if (document.visibilityState === 'hidden' && ringtoneTimer === null) {
+    if (document.visibilityState === 'hidden' && !isRingtoneActive()) {
       releaseAudioContextNow();
     }
   };
@@ -166,7 +222,14 @@ function playMarimbaNote(
   harmonic.stop(startTime + duration + 0.02);
 }
 
-function playTelephoneBurst(ctx: AudioContext, startTime: number, duration: number, gainPeak = 0.34) {
+function playTelephoneBurst(
+  ctx: AudioContext,
+  startTime: number,
+  duration: number,
+  gainPeak = 0.34
+) {
+  if (ctx.state === 'closed') return;
+
   // Osilator ganda 440Hz + 480Hz pola dering telepon klasik + sedikit harmonisa agar nyaring di speaker HP
   const osc440 = ctx.createOscillator();
   const osc480 = ctx.createOscillator();
@@ -221,85 +284,50 @@ function playTelephoneBurst(ctx: AudioContext, startTime: number, duration: numb
 }
 
 /**
- * Nada dering panggilan masuk nyaring:
- * Osilator ganda 440Hz + 480Hz pola dering telepon berulang + getaran [1000, 300, 1000] ms
- * hingga panggilan diangkat atau ditolak.
+ * Fungsi terpusat untuk menghentikan & menghancurkan SELURUH sumber suara dering secara sinkron:
+ * - Semua timer setInterval dering
+ * - Semua elemen HTMLAudioElement dering (pause, currentTime = 0, src = '', load())
+ * - Semua OscillatorNode & AudioNode dering (stop & disconnect)
+ * - Semua AudioContext dering (ringtoneCtx.close())
+ * - Getaran perangkat
  */
-export function startIncomingRingtone(): void {
-  stopRingtone();
-  clearIdleReleaseTimer();
-  const playPattern = () => {
-    triggerAlertVibration([1000, 300, 1000]);
-    const ctx = getSharedAudioContext();
-    if (!ctx) return;
-    if (ctx.state === 'suspended') {
-      void ctx.resume().catch(() => {});
-    }
-    const now = ctx.currentTime;
-    // Pola dering ganda khas telepon: ring 0.45s - jeda 0.18s - ring 0.55s
-    playTelephoneBurst(ctx, now, 0.45, 0.34);
-    playTelephoneBurst(ctx, now + 0.63, 0.55, 0.34);
-  };
+export function stopAllRingtones(): void {
+  // Invalidasi sesi dering aktif terlebih dahulu agar callback interval/resume yang tertunda langsung batal
+  ringtoneSessionId += 1;
 
-  playPattern();
-  ringtoneTimer = window.setInterval(playPattern, 2600);
-}
-
-export function startOutgoingRingback(): void {
-  stopRingtone();
-  clearIdleReleaseTimer();
-  const playPulse = () => {
-    const ctx = getSharedAudioContext();
-    if (!ctx) return;
-    const now = ctx.currentTime;
-    const osc1 = ctx.createOscillator();
-    const osc2 = ctx.createOscillator();
-    const gain = ctx.createGain();
-
-    osc1.type = 'sine';
-    osc2.type = 'sine';
-    osc1.frequency.setValueAtTime(440, now);
-    osc2.frequency.setValueAtTime(480, now);
-
-    gain.gain.setValueAtTime(0.0001, now);
-    gain.gain.linearRampToValueAtTime(0.07, now + 0.05);
-    gain.gain.setValueAtTime(0.07, now + 0.95);
-    gain.gain.linearRampToValueAtTime(0.0001, now + 1.05);
-
-    osc1.connect(gain);
-    osc2.connect(gain);
-    gain.connect(ctx.destination);
-
-    osc1.start(now);
-    osc2.start(now);
-    activeRingtoneOscillators.add(osc1);
-    activeRingtoneOscillators.add(osc2);
-    activeRingtoneNodes.add(gain);
-    osc1.onended = () => {
-      activeRingtoneOscillators.delete(osc1);
-      activeRingtoneOscillators.delete(osc2);
-      activeRingtoneNodes.delete(gain);
-    };
-    osc1.stop(now + 1.1);
-    osc2.stop(now + 1.1);
-  };
-
-  playPulse();
-  ringtoneTimer = window.setInterval(playPulse, 3200);
-}
-
-export function stopRingtone(): void {
   if (ringtoneTimer !== null) {
-    window.clearInterval(ringtoneTimer);
+    try {
+      window.clearInterval(ringtoneTimer);
+    } catch {
+      // ignore
+    }
     ringtoneTimer = null;
   }
 
-  // Hentikan paksa seluruh osilator & node audio dering seketika agar Android melepaskan Audio Focus
+  activeRingtoneIntervals.forEach((timerId) => {
+    try {
+      window.clearInterval(timerId);
+    } catch {
+      // ignore
+    }
+  });
+  activeRingtoneIntervals.clear();
+
+  // Hentikan & putuskan semua OscillatorNode dering seketika
   activeRingtoneOscillators.forEach((osc) => {
     try {
-      osc.stop();
+      osc.onended = null;
     } catch {
-      // ignore if already stopped
+      // ignore
+    }
+    try {
+      osc.stop(0);
+    } catch {
+      try {
+        osc.stop();
+      } catch {
+        // ignore if already stopped
+      }
     }
     try {
       osc.disconnect();
@@ -309,6 +337,7 @@ export function stopRingtone(): void {
   });
   activeRingtoneOscillators.clear();
 
+  // Putuskan semua GainNode / AudioNode dering seketika
   activeRingtoneNodes.forEach((node) => {
     try {
       node.disconnect();
@@ -318,19 +347,155 @@ export function stopRingtone(): void {
   });
   activeRingtoneNodes.clear();
 
-  if (activeRingtoneAudioEl) {
+  // Hentikan & kosongkan seluruh elemen HTMLAudioElement dering yang terlacak
+  const stopAudioEl = (el: HTMLAudioElement) => {
     try {
-      activeRingtoneAudioEl.pause();
-      activeRingtoneAudioEl.src = '';
+      el.pause();
     } catch {
       // ignore
     }
+    try {
+      el.currentTime = 0;
+    } catch {
+      // ignore
+    }
+    try {
+      el.src = '';
+    } catch {
+      // ignore
+    }
+    try {
+      el.load();
+    } catch {
+      // ignore
+    }
+  };
+
+  if (activeRingtoneAudioEl) {
+    stopAudioEl(activeRingtoneAudioEl);
     activeRingtoneAudioEl = null;
   }
+  registeredRingtoneAudioElements.forEach((el) => {
+    stopAudioEl(el);
+  });
+
+  // Tutup paksa AudioContext dering terdedikasi agar tidak ada buffer suara tersisa
+  if (ringtoneAudioCtx) {
+    activeRingtoneContexts.add(ringtoneAudioCtx);
+    ringtoneAudioCtx = null;
+  }
+  activeRingtoneContexts.forEach((ctx) => {
+    try {
+      if (ctx.state !== 'closed') {
+        void ctx.close().catch(() => {
+          try {
+            void ctx.suspend().catch(() => {});
+          } catch {
+            // ignore
+          }
+        });
+      }
+    } catch {
+      // ignore
+    }
+  });
+  activeRingtoneContexts.clear();
 
   stopVibration();
-  // Segera lepas AudioContext agar fokus audio perangkat Android/Bluetooth kembali normal sebelum getUserMedia()
+  // Segera lepas AudioContext pesan jika idle agar fokus audio Android/Bluetooth kembali normal
   releaseAudioContextNow();
+}
+
+// Alias kompatibilitas mundur
+export const stopRingtone = stopAllRingtones;
+
+/**
+ * Nada dering panggilan masuk nyaring:
+ * Osilator ganda 440Hz + 480Hz pola dering telepon berulang + getaran [1000, 300, 1000] ms
+ * hingga panggilan diangkat atau ditolak.
+ */
+export function startIncomingRingtone(): void {
+  stopAllRingtones();
+  clearIdleReleaseTimer();
+  const sessionId = ringtoneSessionId;
+
+  const playPattern = () => {
+    if (sessionId !== ringtoneSessionId) return;
+    triggerAlertVibration([1000, 300, 1000]);
+    const ctx = createDedicatedRingtoneContext();
+    if (!ctx || ctx.state === 'closed' || sessionId !== ringtoneSessionId) return;
+    if (ctx.state === 'suspended') {
+      void ctx.resume().catch(() => {});
+    }
+    try {
+      const now = ctx.currentTime;
+      // Pola dering ganda khas telepon: ring 0.45s - jeda 0.18s - ring 0.55s
+      playTelephoneBurst(ctx, now, 0.45, 0.34);
+      playTelephoneBurst(ctx, now + 0.63, 0.55, 0.34);
+    } catch {
+      // ignore if context closed mid-schedule
+    }
+  };
+
+  playPattern();
+  const timerId = window.setInterval(playPattern, 2600);
+  ringtoneTimer = timerId;
+  activeRingtoneIntervals.add(timerId);
+}
+
+export function startOutgoingRingback(): void {
+  stopAllRingtones();
+  clearIdleReleaseTimer();
+  const sessionId = ringtoneSessionId;
+
+  const playPulse = () => {
+    if (sessionId !== ringtoneSessionId) return;
+    const ctx = createDedicatedRingtoneContext();
+    if (!ctx || ctx.state === 'closed' || sessionId !== ringtoneSessionId) return;
+    if (ctx.state === 'suspended') {
+      void ctx.resume().catch(() => {});
+    }
+    try {
+      const now = ctx.currentTime;
+      const osc1 = ctx.createOscillator();
+      const osc2 = ctx.createOscillator();
+      const gain = ctx.createGain();
+
+      osc1.type = 'sine';
+      osc2.type = 'sine';
+      osc1.frequency.setValueAtTime(440, now);
+      osc2.frequency.setValueAtTime(480, now);
+
+      gain.gain.setValueAtTime(0.0001, now);
+      gain.gain.linearRampToValueAtTime(0.07, now + 0.05);
+      gain.gain.setValueAtTime(0.07, now + 0.95);
+      gain.gain.linearRampToValueAtTime(0.0001, now + 1.05);
+
+      osc1.connect(gain);
+      osc2.connect(gain);
+      gain.connect(ctx.destination);
+
+      osc1.start(now);
+      osc2.start(now);
+      activeRingtoneOscillators.add(osc1);
+      activeRingtoneOscillators.add(osc2);
+      activeRingtoneNodes.add(gain);
+      osc1.onended = () => {
+        activeRingtoneOscillators.delete(osc1);
+        activeRingtoneOscillators.delete(osc2);
+        activeRingtoneNodes.delete(gain);
+      };
+      osc1.stop(now + 1.1);
+      osc2.stop(now + 1.1);
+    } catch {
+      // ignore if context closed mid-schedule
+    }
+  };
+
+  playPulse();
+  const timerId = window.setInterval(playPulse, 3200);
+  ringtoneTimer = timerId;
+  activeRingtoneIntervals.add(timerId);
 }
 
 export function playMessagePop(incoming = false): void {

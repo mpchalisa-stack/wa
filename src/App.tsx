@@ -46,6 +46,7 @@ import {
   dbSaveMessage,
   dbSavePendingMessage,
   dbSaveStatus,
+  getLockedUserId,
   getSavedProfile,
   getSavedTheme,
   getSavedUnreadCounts,
@@ -69,11 +70,12 @@ import {
 import {
   initGlobalAudioUnlock,
   playMessagePop,
+  registerRingtoneAudioElement,
   releaseAudioContextNow,
   resumeWebAudioContext,
   startIncomingRingtone,
   startOutgoingRingback,
-  stopRingtone,
+  stopAllRingtones,
 } from './lib/audio';
 import {
   NotificationClickData,
@@ -81,6 +83,7 @@ import {
   disableStandbyMode,
   dismissIncomingCallNotification,
   enableStandbyMode,
+  enterBackgroundBatteryStandby,
   pauseKeepAliveForCall,
   releaseActiveMediaSession,
   requestNotificationPermission,
@@ -97,9 +100,13 @@ import {
 } from './lib/crypto';
 import { sendNtfyWakeSignal, subscribeNtfySignal } from './lib/ntfy';
 import {
+  enterAndroidBridgeBatteryStandby,
+  fetchPeerIdentityFromFirestore,
+  getCachedPeerIdentity,
   sendFcmPushToUser,
   setAndroidBridgeCallAudioMode,
   startFcmTokenSyncLoop,
+  syncFcmToken,
   triggerAndroidBridgeIncomingCall,
   triggerAndroidBridgeIncomingMessage,
 } from './lib/fcmPush';
@@ -165,6 +172,7 @@ interface AwaitingMediaCallAnswer {
 
 const PENDING_CALL_TTL_MS = 45000;
 const APP_WAKE_SYNC_COOLDOWN_MS = 3000;
+const BATTERY_STANDBY_IDLE_MS = 5 * 60 * 1000; // 5 menit (300.000 ms)
 
 let isHistoryTrapped = false;
 
@@ -241,9 +249,13 @@ export default function App() {
   const [activeCallUI, setActiveCallUI] = useState<ActiveCallUIState | null>(null);
   const [incomingCall, setIncomingCall] = useState<IncomingCallState | null>(null);
   const [incomingCallModalForceTick, setIncomingCallModalForceTick] = useState(0);
+  // State internal mode standby hemat baterai (tanpa elemen UI)
+  const [isBatteryStandby, setIsBatteryStandby] = useState(false);
 
   // Refs for fresh state inside PeerJS callbacks
   const peerManagerRef = useRef<WA6PeerManager | null>(null);
+  const isBatteryStandbyRef = useRef(false);
+  const batteryIdleTimerRef = useRef<number | null>(null);
   const profileRef = useRef<UserProfile | null>(profile);
   const contactsRef = useRef<Contact[]>(contacts);
   const messagesRef = useRef<ChatMessage[]>(messages);
@@ -267,6 +279,7 @@ export default function App() {
     (fallback?: { callerId?: string; callerName?: string; callId?: string; callType?: CallType }) => void
   >(() => {});
   const remoteCallAudioRef = useRef<HTMLAudioElement | null>(null);
+  const ringtoneAudioRef = useRef<HTMLAudioElement | null>(null);
   const remoteStreamRef = useRef<MediaStream | null>(null);
   const callAudioCtxRef = useRef<AudioContext | null>(null);
   const callRemoteSourceRef = useRef<MediaStreamAudioSourceNode | null>(null);
@@ -274,6 +287,77 @@ export default function App() {
   const boundStreamCallsRef = useRef<WeakSet<MediaConnection>>(new WeakSet());
   const boundPcRef = useRef<WeakSet<RTCPeerConnection>>(new WeakSet());
   const isSpeakerOnRef = useRef<boolean>(true);
+
+  const LOADING_IDENTITY_LABEL = 'Memuat identitas...';
+
+  const isPlaceholderPeerName = useCallback((name?: string | null): boolean => {
+    const trimmed = (name || '').trim();
+    if (!trimmed) return true;
+    return (
+      trimmed === 'Memuat identitas...' ||
+      /^teman\s+\d+$/i.test(trimmed) ||
+      /^id[:\s]+\d+$/i.test(trimmed) ||
+      /^pengguna\s*\(?[\d\s]+\)?$/i.test(trimmed) ||
+      /^\d{6}$/.test(trimmed)
+    );
+  }, []);
+
+  /**
+   * Fungsi terpusat untuk mematikan TOTAL seluruh sumber suara dering secara sinkron:
+   * HTMLAudioElement ref, OscillatorNode, setInterval, wakeRingtoneTimer, dan AudioContext dering.
+   */
+  const stopAllCallRingtones = useCallback(() => {
+    if (wakeRingtoneTimerRef.current !== null) {
+      try {
+        window.clearTimeout(wakeRingtoneTimerRef.current);
+      } catch {
+        // ignore
+      }
+      wakeRingtoneTimerRef.current = null;
+    }
+
+    const ringtoneEl = ringtoneAudioRef.current;
+    if (ringtoneEl) {
+      try {
+        ringtoneEl.pause();
+        ringtoneEl.currentTime = 0;
+        ringtoneEl.src = '';
+        ringtoneEl.load();
+      } catch {
+        // ignore
+      }
+    }
+
+    try {
+      stopAllRingtones();
+    } catch {
+      // ignore
+    }
+  }, []);
+
+  const getTrustedPeerName = useCallback(
+    (rawPeerId: string, candidateName?: string | null): string => {
+      const cleanId = fromFullPeerId(rawPeerId);
+      const cached = cleanId ? getCachedPeerIdentity(cleanId) : null;
+      if (cached?.displayName && !isPlaceholderPeerName(cached.displayName)) {
+        return cached.displayName;
+      }
+
+      const existing = cleanId
+        ? contactsRef.current.find((c) => normalizePeerId(c.id) === cleanId)
+        : undefined;
+      if (existing?.name && !isPlaceholderPeerName(existing.name)) {
+        return existing.name.trim();
+      }
+
+      if (candidateName && !isPlaceholderPeerName(candidateName)) {
+        return candidateName.trim();
+      }
+
+      return LOADING_IDENTITY_LABEL;
+    },
+    [isPlaceholderPeerName]
+  );
 
   const closeCallAudioContext = useCallback(() => {
     try {
@@ -704,24 +788,42 @@ export default function App() {
     };
   }, [profile?.id, isExited]);
 
-  // Jalankan syncFcmToken() segera saat aplikasi dibuka dan setiap 5 detik setelah ID pengguna tersedia
+  // Daftarkan elemen ringtoneAudioRef agar ikut dihancurkan oleh stopAllRingtones()
+  useEffect(() => {
+    return registerRingtoneAudioElement(ringtoneAudioRef.current);
+  }, []);
+
+  // Pastikan suara dering mati total setiap kali status panggilan berubah menjadi connected atau ended (null)
+  useEffect(() => {
+    if (
+      activeCallUI?.phase === 'connected' ||
+      (!activeCallUI && !incomingCall && !callRuntimeRef.current && !pendingCallRef.current)
+    ) {
+      stopAllCallRingtones();
+    }
+  }, [activeCallUI?.phase, activeCallUI, incomingCall, stopAllCallRingtones]);
+
+  // Jalankan syncFcmToken() segera saat aplikasi dibuka dan setiap 5 detik setelah ID terkunci tersedia
   useEffect(() => {
     if (!profile?.id || isExited) return;
-    return startFcmTokenSyncLoop(profile.id);
-  }, [profile?.id, isExited]);
+    const lockedId = getLockedUserId();
+    if (!lockedId || lockedId !== profile.id) {
+      // Pastikan kunci wattapps_user_id sinkron sebelum sinkronisasi Firestore berjalan
+      saveUserProfile(profile);
+    }
+    return startFcmTokenSyncLoop(profile.id, profile.name);
+  }, [profile?.id, profile?.name, isExited]);
 
   // Release Wake Lock & silent audio on unmount
   useEffect(() => {
     return () => {
-      if (wakeRingtoneTimerRef.current !== null) {
-        window.clearTimeout(wakeRingtoneTimerRef.current);
-      }
+      stopAllCallRingtones();
       if (unansweredCallTimerRef.current !== null) {
         window.clearTimeout(unansweredCallTimerRef.current);
       }
       void disableStandbyMode();
     };
-  }, []);
+  }, [stopAllCallRingtones]);
 
   // Helper to upsert contact
   const upsertContact = useCallback((contact: Contact) => {
@@ -738,6 +840,112 @@ export default function App() {
       return [contact, ...prev];
     });
   }, []);
+
+  /**
+   * Cocokkan identitas asli lawan bicara langsung dari Firestore (`device_tokens` / `users`)
+   * lalu sinkronkan seketika ke daftar kontak, layar panggilan aktif, panggilan masuk, dan riwayat panggilan.
+   */
+  const resolvePeerIdentity = useCallback(
+    async (rawPeerId: string, fallbackName?: string, forceRefresh = false): Promise<string | null> => {
+      const cleanId = fromFullPeerId(rawPeerId);
+      if (!cleanId || cleanId.startsWith('GRP-')) return null;
+
+      const remoteIdentity = await fetchPeerIdentityFromFirestore(cleanId, { forceRefresh });
+      const resolvedName =
+        remoteIdentity?.displayName ||
+        (fallbackName && !isPlaceholderPeerName(fallbackName) ? fallbackName.trim() : null);
+
+      const finalDisplayName = resolvedName || `Pengguna (${formatSixDigitId(cleanId)})`;
+
+      // Perbarui daftar kontak jika nama sebelumnya masih placeholder / memuat identitas atau Firestore punya nama resmi
+      setContacts((prev) => {
+        let changed = false;
+        const next = prev.map((c) => {
+          if (c.isGroup || normalizePeerId(c.id) !== cleanId) return c;
+          const shouldReplace =
+            Boolean(resolvedName && c.name !== resolvedName) ||
+            isPlaceholderPeerName(c.name);
+          if (!shouldReplace) return c;
+          changed = true;
+          const updated: Contact = {
+            ...c,
+            name: resolvedName || (isPlaceholderPeerName(c.name) ? finalDisplayName : c.name),
+            avatar: c.avatar || remoteIdentity?.avatar || '',
+          };
+          void dbSaveContact(updated);
+          return updated;
+        });
+        return changed ? next : prev;
+      });
+
+      // Perbarui layar panggilan aktif / panggilan masuk secara real-time
+      setActiveCallUI((prev) => {
+        if (!prev || normalizePeerId(prev.peerId) !== cleanId) return prev;
+        if (!resolvedName && !isPlaceholderPeerName(prev.peerName)) return prev;
+        const nextName = resolvedName || finalDisplayName;
+        if (prev.peerName === nextName) return prev;
+        return { ...prev, peerName: nextName };
+      });
+
+      if (callRuntimeRef.current && normalizePeerId(callRuntimeRef.current.peerId) === cleanId) {
+        if (resolvedName || isPlaceholderPeerName(callRuntimeRef.current.peerName)) {
+          callRuntimeRef.current.peerName = resolvedName || finalDisplayName;
+        }
+      }
+
+      if (pendingCallRef.current && normalizePeerId(pendingCallRef.current.peerId) === cleanId) {
+        if (resolvedName || isPlaceholderPeerName(pendingCallRef.current.peerName)) {
+          pendingCallRef.current.peerName = resolvedName || finalDisplayName;
+        }
+      }
+
+      if (incomingCallRef.current && normalizePeerId(incomingCallRef.current.callerId) === cleanId) {
+        if (resolvedName || isPlaceholderPeerName(incomingCallRef.current.callerName)) {
+          const updatedIncoming = {
+            ...incomingCallRef.current,
+            callerName: resolvedName || finalDisplayName,
+          };
+          incomingCallRef.current = updatedIncoming;
+          setIncomingCall(updatedIncoming);
+        }
+      }
+
+      if (resolvedName) {
+        setCalls((prev) => {
+          let changed = false;
+          const next = prev.map((rec) => {
+            if (normalizePeerId(rec.peerId) === cleanId && isPlaceholderPeerName(rec.peerName)) {
+              changed = true;
+              const updated = { ...rec, peerName: resolvedName };
+              void dbSaveCall(updated);
+              return updated;
+            }
+            return rec;
+          });
+          return changed ? next : prev;
+        });
+      }
+
+      return resolvedName;
+    },
+    [isPlaceholderPeerName]
+  );
+
+  // Sinkronkan identitas asli semua kontak tersimpan dari Firestore saat data lokal selesai dimuat
+  useEffect(() => {
+    if (!dataLoaded || !profile?.id || isExited) return;
+    contactsRef.current
+      .filter((c) => !c.isGroup)
+      .forEach((c) => {
+        void resolvePeerIdentity(c.id, c.name);
+      });
+  }, [dataLoaded, profile?.id, isExited, resolvePeerIdentity]);
+
+  // Setiap kali membuka ruang chat, pastikan identitas lawan bicara dicocokkan langsung dengan Firestore
+  useEffect(() => {
+    if (!activeChatId || activeChatId.startsWith('GRP-')) return;
+    void resolvePeerIdentity(activeChatId);
+  }, [activeChatId, resolvePeerIdentity]);
 
   // Hapus satu entri dari antrean outbox tertunda
   const removePendingEntry = useCallback((messageId: string, recipientId: string) => {
@@ -828,11 +1036,12 @@ export default function App() {
       if (!contactsRef.current.some((c) => c.id === record.peerId)) {
         upsertContact({
           id: record.peerId,
-          name: record.peerName || `Teman ${record.peerId}`,
+          name: getTrustedPeerName(record.peerId, record.peerName),
           bio: 'Ada',
           avatar: record.peerAvatar || '',
           addedAt: Date.now(),
         });
+        void resolvePeerIdentity(record.peerId, record.peerName);
       }
 
       const isVideo = record.callType === 'video';
@@ -901,15 +1110,12 @@ export default function App() {
   // Clean up any active or pending call & record call history + chat call log bubble
   const finalizeCall = useCallback(
     (statusOverride?: 'answered' | 'missed' | 'rejected') => {
-      if (wakeRingtoneTimerRef.current !== null) {
-        window.clearTimeout(wakeRingtoneTimerRef.current);
-        wakeRingtoneTimerRef.current = null;
-      }
+      // BARIS PERTAMA: hentikan & hancurkan seluruh suara dering secara sinkron
+      stopAllCallRingtones();
       if (unansweredCallTimerRef.current !== null) {
         window.clearTimeout(unansweredCallTimerRef.current);
         unansweredCallTimerRef.current = null;
       }
-      stopRingtone();
       if (callTimerRef.current !== null) {
         window.clearInterval(callTimerRef.current);
         callTimerRef.current = null;
@@ -997,7 +1203,7 @@ export default function App() {
       void dbSaveCall(record);
       appendCallLogToChat(record);
     },
-    [appendCallLogToChat, setPersistentIncomingCall]
+    [appendCallLogToChat, setPersistentIncomingCall, stopAllCallRingtones]
   );
 
   // Tampilkan paksa Modal Layar Penuh Panggilan Masuk (saat notifikasi diketuk / kembali dari latar belakang)
@@ -1054,12 +1260,12 @@ export default function App() {
         const cleanId = fromFullPeerId(override.callerId.trim());
         if (!cleanId) return;
         const existingContact = contactsRef.current.find((c) => c.id === cleanId);
-        const callerName =
-          existingContact?.name?.trim() || override.callerName?.trim() || `ID: ${cleanId}`;
+        const callerName = getTrustedPeerName(cleanId, override.callerName);
         const callerAvatar = existingContact?.avatar || '';
         const isVideo = Boolean(override.isVideo ?? override.callType === 'video');
         const callType: CallType = isVideo ? 'video' : 'audio';
         const callId = override.callId || generateUid('call');
+        void resolvePeerIdentity(cleanId, override.callerName, true);
 
         const pending: PendingIncomingCall = {
           callId,
@@ -1098,7 +1304,7 @@ export default function App() {
         setIncomingCallModalForceTick((n) => n + 1);
       }
     },
-    [isIncomingCallStillActive, setPersistentIncomingCall]
+    [getTrustedPeerName, isIncomingCallStillActive, resolvePeerIdentity, setPersistentIncomingCall]
   );
 
   // Tampilkan pop-up panggilan masuk untuk pendingCall (misal saat kembali dari latar belakang / klik notifikasi)
@@ -1184,11 +1390,7 @@ export default function App() {
             unansweredCallTimerRef.current = null;
           }
 
-          try {
-            stopRingtone();
-          } catch {
-            // ignore
-          }
+          stopAllCallRingtones();
           isSpeakerOnRef.current = true;
 
           if (!rt.connectedAt) {
@@ -1382,12 +1584,13 @@ export default function App() {
             if (!existingContact) {
               upsertContact({
                 id: fromId,
-                name: incomingMsg.senderName || `Teman ${fromId}`,
+                name: getTrustedPeerName(fromId, incomingMsg.senderName),
                 bio: 'Ada',
                 avatar: '',
                 addedAt: Date.now(),
               });
             }
+            void resolvePeerIdentity(fromId, incomingMsg.senderName);
           }
 
           // Dekripsi payload teks AES-256-GCM (transparan & kompatibel mundur) sebelum disimpan & ditampilkan
@@ -1619,7 +1822,7 @@ export default function App() {
             startIncomingRingtone();
             const cleanId = fromFullPeerId(fromId);
             const existingContact = contactsRef.current.find((c) => c.id === cleanId);
-            const callerName = existingContact?.name?.trim() || `ID: ${cleanId}`;
+            const callerName = getTrustedPeerName(cleanId, packet.fromName);
             const callerAvatar = existingContact?.avatar || packet.fromAvatar || '';
             const isVideo = packet.callType === 'video';
             const pending: PendingIncomingCall = {
@@ -1632,6 +1835,7 @@ export default function App() {
             };
             pendingCallRef.current = pending;
             presentPendingCallModal(pending);
+            void resolvePeerIdentity(cleanId, packet.fromName, true);
             triggerAndroidBridgeIncomingCall(
               callerName,
               isVideo ? 'Panggilan video masuk...' : 'Panggilan masuk...'
@@ -1785,19 +1989,20 @@ export default function App() {
       pendingCallRef.current = null;
 
       const existingContact = contactsRef.current.find((c) => c.id === cleanId);
-      const callerName = existingContact?.name?.trim() || `ID: ${cleanId}`;
+      const callerName = getTrustedPeerName(cleanId, meta.callerName);
       const callerAvatar = existingContact?.avatar || meta.callerAvatar || '';
       const isVideo = Boolean(meta.isVideo ?? meta.callType === 'video');
       const callType: CallType = isVideo ? 'video' : 'audio';
       const callId = meta.callId || generateUid('call');
+      void resolvePeerIdentity(cleanId, meta.callerName, true);
 
       // Jika pengguna sudah menekan "Angkat" pada pop-up pendingCall saat kembali dari latar belakang, langsung jawab!
       const awaitingAnswer = awaitingMediaCallAnswerRef.current;
       if (awaitingAnswer && awaitingAnswer.peerId === cleanId) {
+        stopAllCallRingtones();
         window.clearTimeout(awaitingAnswer.timeoutId);
         awaitingMediaCallAnswerRef.current = null;
         setPersistentIncomingCall(null);
-        stopRingtone();
         isSpeakerOnRef.current = true;
 
         awaitingAnswer.localStream.getAudioTracks().forEach((track) => {
@@ -2087,12 +2292,13 @@ export default function App() {
         if (!existingContact) {
           upsertContact({
             id: fromId,
-            name: meta.senderName || `Teman ${fromId}`,
+            name: getTrustedPeerName(fromId, meta.senderName),
             bio: 'Ada',
             avatar: '',
             addedAt: Date.now(),
           });
         }
+        void resolvePeerIdentity(fromId, meta.senderName);
       }
 
       if (messagesRef.current.some((m) => m.id === meta.id)) {
@@ -2444,9 +2650,13 @@ export default function App() {
     [removePendingEntry, sendMediaMessageToPeer, sendEncryptedMessageToPeer]
   );
 
-  // Initialize PeerJS whenever profile is ready and app is active
+  // Initialize PeerJS whenever locked profile is ready and app is active
   useEffect(() => {
     if (!profile || isExited) return;
+    const lockedId = getLockedUserId();
+    if (!lockedId || lockedId !== profile.id) {
+      saveUserProfile(profile);
+    }
 
     const manager = new WA6PeerManager(profile, {
       onStatusChange: (state, errMsg) => {
@@ -2563,15 +2773,130 @@ export default function App() {
   }, [profile?.id, peerState, standbyMode, isExited, onlineContactsCount]);
 
   // Screen Wake Lock API (navigator.wakeLock): aktif saat koneksi PeerJS online agar layar
-  // HP/tablet tidak mati otomatis selama aplikasi terbuka, dan dilepas saat koneksi terhenti
+  // HP/tablet tidak mati otomatis selama aplikasi terbuka, dan dilepas saat koneksi terhenti atau mode standby hemat baterai aktif
   useEffect(() => {
-    const isConnectionActive = Boolean(profile && !isExited && peerState === 'online');
+    const isConnectionActive = Boolean(
+      profile && !isExited && peerState === 'online' && !isBatteryStandby
+    );
     void syncConnectionWakeLock(isConnectionActive);
 
     return () => {
       void syncConnectionWakeLock(false);
     };
-  }, [profile?.id, isExited, peerState]);
+  }, [profile?.id, isExited, peerState, isBatteryStandby]);
+
+  // Mode Standby Hemat Baterai Otomatis (tanpa elemen UI):
+  // Pantau touchstart, touchmove, click, keydown, scroll serta status panggilan (isInCall / isRinging).
+  // Setelah tepat 5 menit (300.000 ms) tanpa aktivitas & tidak menelepon/berdering:
+  // lepaskan wakeLock, hentikan audio latar & polling berat, pertahankan listener Firestore/ntfy + FCM device_tokens,
+  // lalu panggil window.AndroidBridge?.enterBatteryStandby?.().
+  const isInCallOrRinging = Boolean(activeCallUI || incomingCall);
+
+  useEffect(() => {
+    if (!profile?.id || isExited) {
+      if (batteryIdleTimerRef.current !== null) {
+        window.clearTimeout(batteryIdleTimerRef.current);
+        batteryIdleTimerRef.current = null;
+      }
+      if (isBatteryStandbyRef.current) {
+        isBatteryStandbyRef.current = false;
+        setIsBatteryStandby(false);
+      }
+      return;
+    }
+
+    const clearIdleTimer = () => {
+      if (batteryIdleTimerRef.current !== null) {
+        window.clearTimeout(batteryIdleTimerRef.current);
+        batteryIdleTimerRef.current = null;
+      }
+    };
+
+    const wakeFromBatteryStandby = () => {
+      if (!isBatteryStandbyRef.current) return;
+      isBatteryStandbyRef.current = false;
+      setIsBatteryStandby(false);
+      peerManagerRef.current?.setBatteryStandby(false);
+    };
+
+    const scheduleBatteryStandby = () => {
+      clearIdleTimer();
+      const isCallBusy = Boolean(
+        isInCallOrRinging ||
+          callRuntimeRef.current ||
+          pendingCallRef.current ||
+          incomingCallRef.current
+      );
+      if (isCallBusy) {
+        wakeFromBatteryStandby();
+        return;
+      }
+
+      batteryIdleTimerRef.current = window.setTimeout(() => {
+        batteryIdleTimerRef.current = null;
+        // Verifikasi ulang tepat di titik 5 menit: jangan masuk standby bila panggilan sedang berlangsung/berdering
+        if (
+          callRuntimeRef.current ||
+          pendingCallRef.current ||
+          incomingCallRef.current
+        ) {
+          return;
+        }
+        if (isBatteryStandbyRef.current) return;
+
+        isBatteryStandbyRef.current = true;
+        setIsBatteryStandby(true);
+
+        // 1. Lepaskan wakeLock & hentikan audio loop latar belakang agar layar bisa mati otomatis
+        void enterBackgroundBatteryStandby();
+        // 2. Hentikan interval polling PeerJS yang berat (pertahankan listener Firestore/ntfy & token FCM device_tokens tetap aktif)
+        peerManagerRef.current?.setBatteryStandby(true);
+        const currentProfile = profileRef.current;
+        if (currentProfile?.id) {
+          void syncFcmToken(currentProfile.id, currentProfile.name, false);
+        }
+        // 3. Minimize halus ke latar belakang di Android WebView tanpa mematikan penerima notifikasi FCM
+        enterAndroidBridgeBatteryStandby();
+      }, BATTERY_STANDBY_IDLE_MS);
+    };
+
+    let lastResetAt = 0;
+    const handleUserActivity = () => {
+      const wasStandby = isBatteryStandbyRef.current;
+      wakeFromBatteryStandby();
+      const now = Date.now();
+      if (wasStandby || now - lastResetAt >= 1000) {
+        lastResetAt = now;
+        scheduleBatteryStandby();
+      }
+    };
+
+    // Jika sedang menelepon atau berdering, segera bangun dari standby dan tahan timer hingga panggilan berakhir
+    if (isInCallOrRinging) {
+      wakeFromBatteryStandby();
+      clearIdleTimer();
+    } else {
+      scheduleBatteryStandby();
+    }
+
+    const activityEvents: Array<keyof WindowEventMap> = [
+      'touchstart',
+      'touchmove',
+      'click',
+      'keydown',
+      'scroll',
+    ];
+    activityEvents.forEach((evt) => {
+      window.addEventListener(evt, handleUserActivity, { passive: true, capture: true });
+    });
+
+    return () => {
+      clearIdleTimer();
+      activityEvents.forEach((evt) => {
+        window.removeEventListener(evt, handleUserActivity, true);
+      });
+    };
+  }, [profile?.id, isExited, isInCallOrRinging]);
 
   // Stream SSE tunggal & hemat baterai ke https://ntfy.sh/wattappsau-signal-{my6DigitId}/sse
   // Menggantikan polling timer agresif agar broker PeerJS stabil & bebas rate-limit
@@ -2598,7 +2923,7 @@ export default function App() {
           startIncomingRingtone();
           const cleanId = fromFullPeerId(signal.fromId);
           const existingContact = contactsRef.current.find((c) => c.id === cleanId);
-          const callerName = existingContact?.name?.trim() || `ID: ${cleanId}`;
+          const callerName = getTrustedPeerName(cleanId, signal.fromName);
           const isVideo = signal.callType === 'video';
           const callerAvatar = existingContact?.avatar || '';
           const pending: PendingIncomingCall = {
@@ -2611,6 +2936,7 @@ export default function App() {
           };
           pendingCallRef.current = pending;
           presentPendingCallModal(pending);
+          void resolvePeerIdentity(cleanId, signal.fromName, true);
           triggerAndroidBridgeIncomingCall(
             callerName,
             isVideo ? 'Panggilan video masuk...' : 'Panggilan masuk...'
@@ -3014,12 +3340,13 @@ export default function App() {
         if (!contactsRef.current.some((c) => c.id === cleanId)) {
           upsertContact({
             id: cleanId,
-            name: nameParam || `Teman ${cleanId}`,
+            name: getTrustedPeerName(cleanId, nameParam),
             bio: 'Ada',
             avatar: '',
             addedAt: Date.now(),
           });
         }
+        void resolvePeerIdentity(cleanId, nameParam);
         setActiveTab('chats');
         setActiveChatId(cleanId);
         activeChatIdRef.current = cleanId;
@@ -3211,32 +3538,33 @@ export default function App() {
     if (!existing) {
       upsertContact({
         id: invite.id,
-        name: invite.name || `Teman ${invite.id}`,
+        name: getTrustedPeerName(invite.id, invite.name),
         bio: 'Ada',
         avatar: '',
         addedAt: Date.now(),
       });
-    } else if (invite.name && existing.name.startsWith('Teman ')) {
+    } else if (invite.name && isPlaceholderPeerName(existing.name)) {
       upsertContact({ ...existing, name: invite.name });
     }
+    void resolvePeerIdentity(invite.id, invite.name, true);
     setActiveTab('chats');
     setActiveChatId(invite.id);
     peerManagerRef.current?.ensureConnection(invite.id);
     showToast(`Terhubung dengan ${invite.name || `ID ${invite.id}`} via tautan undangan`);
-  }, [profile, dataLoaded, pendingInvite, upsertContact, showToast]);
+  }, [profile, dataLoaded, pendingInvite, upsertContact, showToast, getTrustedPeerName, isPlaceholderPeerName, resolvePeerIdentity]);
 
-  // Complete Onboarding
+  // Complete Onboarding (kunci permanen wattapps_user_id & wattapps_user_name di localStorage)
   const handleCompleteOnboarding = (newProfile: UserProfile) => {
-    saveUserProfile(newProfile);
-    setProfile(newProfile);
-    showToast(`Selamat datang, ${newProfile.name}! ID Anda: ${newProfile.id}`);
+    const lockedProfile = saveUserProfile(newProfile);
+    setProfile(lockedProfile);
+    showToast(`Selamat datang, ${lockedProfile.name}! ID Terkunci: ${formatSixDigitId(lockedProfile.id)}`);
   };
 
-  // Update Profile
+  // Update Profile (tetap kunci wattapps_user_id & perbarui wattapps_user_name)
   const handleUpdateProfile = (updated: UserProfile) => {
-    saveUserProfile(updated);
-    setProfile(updated);
-    peerManagerRef.current?.updateProfile(updated);
+    const lockedProfile = saveUserProfile(updated);
+    setProfile(lockedProfile);
+    peerManagerRef.current?.updateProfile(lockedProfile);
   };
 
   // Add Contact / Open Chat
@@ -3246,19 +3574,21 @@ export default function App() {
       showToast('ID kontak tidak valid.');
       return;
     }
+    const cleanNickname = nickname?.trim();
     const existing = contacts.find((c) => normalizePeerId(c.id) === sixDigitId);
     if (!existing) {
       const contact: Contact = {
         id: sixDigitId,
-        name: nickname || `Teman ${sixDigitId}`,
+        name: cleanNickname || getTrustedPeerName(sixDigitId),
         bio: 'Ada',
         avatar: '',
         addedAt: Date.now(),
       };
       upsertContact(contact);
-    } else if (nickname) {
-      upsertContact({ ...existing, id: sixDigitId, name: nickname });
+    } else if (cleanNickname) {
+      upsertContact({ ...existing, id: sixDigitId, name: cleanNickname });
     }
+    void resolvePeerIdentity(sixDigitId, cleanNickname, true);
     setShowNewChatModal(false);
     setActiveTab('chats');
     setActiveChatId(sixDigitId);
@@ -3272,7 +3602,7 @@ export default function App() {
     const memberNames: Record<string, string> = { [profile.id]: profile.name };
     for (const id of memberIds) {
       const c = contacts.find((ct) => ct.id === id);
-      memberNames[id] = c?.name || `Teman ${id}`;
+      memberNames[id] = c?.name || getTrustedPeerName(id);
     }
 
     const groupContact: Contact = {
@@ -3643,11 +3973,12 @@ export default function App() {
     if (!existing) {
       upsertContact({
         id: userId,
-        name: `Teman ${userId}`,
+        name: getTrustedPeerName(userId),
         bio: 'Ada',
         avatar: '',
         addedAt: Date.now(),
       });
+      void resolvePeerIdentity(userId);
     }
     setActiveTab('chats');
     setActiveChatId(userId);
@@ -3682,9 +4013,9 @@ export default function App() {
     }
 
     // 1. Tepat di baris pertama klik tombol Panggil (User Gesture Android WebView):
-    // Reset audio panggilan sebelumnya, hentikan dering & keep-alive, buka & resume AudioContext panggilan,
+    // Hentikan semua dering, reset audio panggilan sebelumnya, buka & resume AudioContext panggilan,
     // aktifkan mode audio panggilan native Android, buka kunci <audio id="remoteAudio">, lalu tangkap mikrofon
-    stopRingtone();
+    stopAllCallRingtones();
     pauseKeepAliveForCall();
     attachRemoteCallAudioStream(null);
     resumeWebAudioContext();
@@ -3710,8 +4041,9 @@ export default function App() {
 
     const callId = generateUid('call');
     const contact = contacts.find((c) => normalizePeerId(c.id) === peerId);
-    const peerName = contact?.name || `ID ${peerId}`;
+    const peerName = getTrustedPeerName(peerId, contact?.name);
     const peerAvatar = contact?.avatar || '';
+    void resolvePeerIdentity(peerId, contact?.name, true);
 
     // 2. Setelah mikrofon siap, kirim sinyal FCM, ntfy wake, CALL_REQUEST, lalu buka MediaConnection (iceTransportPolicy: 'all')
     void sendFcmPushToUser({
@@ -3843,6 +4175,8 @@ export default function App() {
 
   // Accept Incoming Call (termasuk pendingCall / incomingCallRef yang stabil terhadap re-render React)
   const handleAcceptCall = async (isAutoAccept = false) => {
+    // BARIS PERTAMA: matikan total seluruh suara dering secara sinkron seketika tombol Jawab ditekan
+    stopAllCallRingtones();
     try {
       const initialRt = callRuntimeRef.current;
       const initialIncoming = incomingCallRef.current;
@@ -3854,13 +4188,6 @@ export default function App() {
         (initialIncoming ? (initialIncoming.isVideo ? 'video' : 'audio') : undefined) ||
         initialPending?.callType ||
         'audio';
-
-      // Hentikan nada dering secara aman agar Android melepas Audio Focus mikrofon
-      try {
-        stopRingtone();
-      } catch {
-        // ignore
-      }
 
       // 1. Pertama-tama ambil mikrofon via getUserMedia (otomatis fallback ke { audio: true } jika kamera video gagal)
       let localStream: MediaStream;
@@ -3895,11 +4222,11 @@ export default function App() {
           latestIncoming?.callerId ||
           latestPending?.peerId ||
           fromFullPeerId(targetMediaCall.peer);
-        const resolvedPeerName =
-          latestRt?.peerName ||
-          latestIncoming?.callerName ||
-          latestPending?.peerName ||
-          `ID: ${resolvedPeerId}`;
+        const resolvedPeerName = getTrustedPeerName(
+          resolvedPeerId,
+          latestRt?.peerName || latestIncoming?.callerName || latestPending?.peerName
+        );
+        void resolvePeerIdentity(resolvedPeerId);
         const resolvedPeerAvatar =
           latestRt?.peerAvatar ||
           latestIncoming?.callerAvatar ||
@@ -3950,18 +4277,14 @@ export default function App() {
         // Pasang listener RTCPeerConnection (pc.ontrack & iceconnectionstatechange) segera setelah answer() membuat peerConnection
         bindMediaCallDiagnostics(resolvedCallId, targetMediaCall);
 
-        // 2. Setelah handshake answer berhasil dipicu, jalankan pengaturan audio, native bridge, & UI secara terisolasi (aman dari error)
-        if (wakeRingtoneTimerRef.current !== null) {
-          window.clearTimeout(wakeRingtoneTimerRef.current);
-          wakeRingtoneTimerRef.current = null;
-        }
+        // 2. Setelah handshake answer berhasil dipicu, pastikan semua dering mati & jalankan pengaturan audio/UI secara terisolasi
+        stopAllCallRingtones();
         if (unansweredCallTimerRef.current !== null) {
           window.clearTimeout(unansweredCallTimerRef.current);
           unansweredCallTimerRef.current = null;
         }
 
         try {
-          stopRingtone();
           pauseKeepAliveForCall();
           dismissIncomingCallNotification(resolvedPeerId);
         } catch {
@@ -4024,7 +4347,9 @@ export default function App() {
       // Kasus 2: Pengguna mengetuk Jawab pada pop-up pendingCall/notifikasi sebelum MediaConnection baru tiba dari penelepon
       const fallbackPeerId = latestPending?.peerId || latestIncoming?.callerId;
       const fallbackCallId = latestPending?.callId || latestIncoming?.callId;
-      const fallbackPeerName = latestPending?.peerName || latestIncoming?.callerName || `ID: ${fallbackPeerId || ''}`;
+      const fallbackPeerName = fallbackPeerId
+        ? getTrustedPeerName(fallbackPeerId, latestPending?.peerName || latestIncoming?.callerName)
+        : LOADING_IDENTITY_LABEL;
       const fallbackPeerAvatar = latestPending?.peerAvatar || latestIncoming?.callerAvatar || '';
 
       if (fallbackPeerId && fallbackCallId && me) {
@@ -4032,10 +4357,7 @@ export default function App() {
         const resolvedCallType: CallType =
           targetCallType === 'video' && hasVideoTrack ? 'video' : 'audio';
 
-        if (wakeRingtoneTimerRef.current !== null) {
-          window.clearTimeout(wakeRingtoneTimerRef.current);
-          wakeRingtoneTimerRef.current = null;
-        }
+        stopAllCallRingtones();
         if (unansweredCallTimerRef.current !== null) {
           window.clearTimeout(unansweredCallTimerRef.current);
           unansweredCallTimerRef.current = null;
@@ -4071,7 +4393,7 @@ export default function App() {
         });
 
         try {
-          stopRingtone();
+          stopAllCallRingtones();
           pauseKeepAliveForCall();
           dismissIncomingCallNotification(fallbackPeerId);
           isSpeakerOnRef.current = true;
@@ -4108,6 +4430,8 @@ export default function App() {
     callId?: string;
     callType?: CallType;
   }) => {
+    // BARIS PERTAMA: matikan total seluruh suara dering secara sinkron seketika tombol Tolak ditekan
+    stopAllCallRingtones();
     const rt = callRuntimeRef.current;
     const pending = pendingCallRef.current;
     const activeIncoming = incomingCallRef.current;
@@ -4151,7 +4475,7 @@ export default function App() {
     }
 
     // Fallback bila penolakan dari layar kunci datang sebelum state runtime terbentuk
-    stopRingtone();
+    stopAllCallRingtones();
     attachRemoteCallAudioStream(null);
     setAndroidBridgeCallAudioMode(false);
     resumeKeepAliveAfterCall();
@@ -4162,11 +4486,10 @@ export default function App() {
       const record: CallRecord = {
         id: targetCallId,
         peerId: targetPeerId,
-        peerName:
-          existingContact?.name?.trim() ||
-          activeIncoming?.callerName ||
-          fallback?.callerName ||
-          `ID: ${targetPeerId}`,
+        peerName: getTrustedPeerName(
+          targetPeerId,
+          activeIncoming?.callerName || fallback?.callerName
+        ),
         peerAvatar: existingContact?.avatar || activeIncoming?.callerAvatar || '',
         callType: targetCallType,
         direction: 'incoming',
@@ -4177,6 +4500,7 @@ export default function App() {
       setCalls((prev) => (prev.some((c) => c.id === record.id) ? prev : [record, ...prev]));
       void dbSaveCall(record);
       appendCallLogToChat(record);
+      void resolvePeerIdentity(targetPeerId);
     }
   };
 
@@ -4184,6 +4508,8 @@ export default function App() {
   handleRejectCallRef.current = handleRejectCall;
 
   const handleEndCall = () => {
+    // BARIS PERTAMA: matikan total seluruh suara dering secara sinkron seketika tombol Tutup ditekan
+    stopAllCallRingtones();
     const rt = callRuntimeRef.current;
     const pending = pendingCallRef.current || awaitingMediaCallAnswerRef.current;
     const me = profileRef.current;
@@ -4293,7 +4619,7 @@ export default function App() {
   // serta memanggil window.AndroidBridge?.setCallAudioMode?.(true).
   const handleRefreshCallAudio = () => {
     const rt = callRuntimeRef.current;
-    stopRingtone();
+    stopAllCallRingtones();
     resumeWebAudioContext();
     const ctx = ensureCallAudioContext(false);
     if (ctx) {
@@ -4393,7 +4719,7 @@ export default function App() {
     if (callRuntimeRef.current || pendingCallRef.current) {
       finalizeCall('rejected');
     }
-    stopRingtone();
+    stopAllCallRingtones();
 
     standbyModeRef.current = false;
     setStandbyMode(false);
@@ -4542,6 +4868,7 @@ export default function App() {
               />
             </div>
           ) : (
+            <div className="flex flex-col">
             <div className="min-h-[60px] py-1.5 px-3 flex items-center justify-between gap-1.5">
               {/* Brand & PeerJS Live Status Indicator */}
               <div className="flex items-center gap-2 min-w-0 flex-1">
@@ -4772,6 +5099,40 @@ export default function App() {
                   )}
                 </div>
               </div>
+            </div>
+
+            {/* Badge Identitas Aktif Perangkat (Terkunci di localStorage) */}
+            <div className="px-3 pb-1.5 flex items-center justify-between gap-2">
+              <button
+                type="button"
+                onClick={() => setShowProfileDrawer(true)}
+                className="min-w-0 flex-1 inline-flex items-center gap-1.5 rounded-lg bg-black/15 dark:bg-slate-800/80 border border-white/15 dark:border-cyan-500/25 px-2.5 py-1 text-left text-[11.5px] font-medium text-white/95 hover:bg-black/25 dark:hover:bg-slate-800 transition-colors cursor-pointer"
+                title="Identitas perangkat terkunci permanen — ketuk untuk melihat profil"
+              >
+                <Lock className="w-3 h-3 text-emerald-300 dark:text-cyan-400 shrink-0" />
+                <span className="truncate">
+                  <span className="text-white/75">ID Aktif: </span>
+                  <span className="font-semibold text-white">{profile.name}</span>
+                  <span className="font-mono text-emerald-200 dark:text-cyan-300 ml-1">
+                    ({formatSixDigitId(profile.id)})
+                  </span>
+                </span>
+              </button>
+              <button
+                type="button"
+                onClick={() => {
+                  void navigator.clipboard?.writeText(profile.id).then(() => {
+                    showToast(`ID Aktif ${formatSixDigitId(profile.id)} disalin`);
+                  });
+                }}
+                className="h-7 px-2 rounded-lg bg-black/15 dark:bg-slate-800/80 border border-white/15 dark:border-cyan-500/25 text-[11px] font-medium text-white/90 hover:bg-black/25 dark:hover:bg-slate-800 inline-flex items-center gap-1 shrink-0 transition-colors cursor-pointer"
+                title="Salin ID Aktif"
+                aria-label="Salin ID Aktif"
+              >
+                <Copy className="w-3 h-3 shrink-0" />
+                <span>Salin</span>
+              </button>
+            </div>
             </div>
           )}
 
@@ -5108,6 +5469,13 @@ export default function App() {
         ref={remoteCallAudioRef}
         autoPlay
         playsInline
+        className="sr-only pointer-events-none"
+      />
+      {/* Elemen audio dering terlacak agar selalu dihentikan & di-reset sinkron oleh stopAllRingtones() */}
+      <audio
+        id="ringtoneAudio"
+        ref={ringtoneAudioRef}
+        preload="none"
         className="sr-only pointer-events-none"
       />
 

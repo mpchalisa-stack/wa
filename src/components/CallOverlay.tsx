@@ -14,6 +14,7 @@ import {
 } from 'lucide-react';
 import { CallType } from '../types';
 import { formatDuration, formatSixDigitId } from '../lib/media';
+import { stopAllRingtones } from '../lib/audio';
 import { activateActiveMediaSession, releaseActiveMediaSession } from '../lib/standby';
 import { Avatar } from './Avatar';
 import { AppLogo } from './AppLogo';
@@ -77,6 +78,9 @@ export const CallOverlay: React.FC<CallOverlayProps> = ({
     setShakeStopped(false);
     setMinimizedBanner(false);
     setAvatarImgFailed(false);
+    if (call.phase === 'connected') {
+      stopAllRingtones();
+    }
   }, [call.callId, call.phase, call.peerAvatar, forceFullscreenTick]);
 
   // Kelola navigator.mediaSession secara terkontrol HANYA selama panggilan berlangsung
@@ -239,17 +243,24 @@ export const CallOverlay: React.FC<CallOverlayProps> = ({
   const showRemoteVideo = isVideo && call.phase === 'connected' && Boolean(call.remoteStream);
   const hasContactPhoto = Boolean(call.peerAvatar && !avatarImgFailed);
 
-  // Hentikan animasi getar & radar seketika saat tombol Jawab atau Tolak ditekan
+  // Hentikan total seluruh suara dering & animasi getar SEKETIKA saat tombol Jawab/Tolak/Akhiri ditekan
   const handleAcceptClick = () => {
+    stopAllRingtones();
     setShakeStopped(true);
     setMinimizedBanner(false);
     onAccept();
   };
 
   const handleRejectClick = () => {
+    stopAllRingtones();
     setShakeStopped(true);
     setMinimizedBanner(false);
     onReject();
+  };
+
+  const handleEndClick = () => {
+    stopAllRingtones();
+    onEnd();
   };
 
   // Banner Notifikasi Mengambang ala WhatsApp (saat panggilan masuk diperkecil)
@@ -724,7 +735,7 @@ export const CallOverlay: React.FC<CallOverlayProps> = ({
             <div className="flex flex-col items-center gap-1">
               <button
                 type="button"
-                onClick={onEnd}
+                onClick={handleEndClick}
                 className="w-14 h-12 rounded-full bg-rose-600 hover:bg-rose-500 text-white flex items-center justify-center shadow-lg active:scale-95 transition-transform cursor-pointer"
                 aria-label="Akhiri Panggilan"
                 title="Akhiri Panggilan"
