@@ -2022,7 +2022,11 @@ export class WA6PeerManager {
       track.enabled = true;
     });
 
-    this.applyPeerIcePolicy(false);
+    try {
+      this.applyPeerIcePolicy(false);
+    } catch {
+      // ignore config patch error
+    }
     try {
       const mediaCall = this.peer.call(toFullPeerId(targetSixDigitId), stream, {
         metadata,
@@ -2051,7 +2055,11 @@ export class WA6PeerManager {
       track.enabled = true;
     });
 
-    this.applyPeerIcePolicy(false);
+    try {
+      this.applyPeerIcePolicy(false);
+    } catch {
+      // ignore config patch error
+    }
     mediaCall.answer(stream);
     ensureLocalAudioTracksAttached(mediaCall, stream);
   }
