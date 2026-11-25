@@ -1119,11 +1119,10 @@ export const ChatRoom: React.FC<ChatRoomProps> = ({
       {/* Floating WhatsApp Attachment Pop-Up */}
       {showAttach && (
         <div className="absolute bottom-[74px] left-4 sm:left-6 z-30 rounded-2xl bg-white dark:bg-[#233138] shadow-2xl border border-black/10 dark:border-white/10 p-4 grid grid-cols-3 gap-4 w-72">
-          <button
-            type="button"
+          <label
+            htmlFor="wattapps-gallery-input"
             onClick={() => {
-              setShowAttach(false);
-              galleryInputRef.current?.click();
+              window.setTimeout(() => setShowAttach(false), 300);
             }}
             className="flex flex-col items-center gap-1.5 group cursor-pointer"
           >
@@ -1131,13 +1130,12 @@ export const ChatRoom: React.FC<ChatRoomProps> = ({
               <ImageIcon className="w-5 h-5" />
             </span>
             <span className="text-xs font-medium text-[#3B4A54] dark:text-[#D1D7DB]">Galeri</span>
-          </button>
+          </label>
 
-          <button
-            type="button"
+          <label
+            htmlFor="wattapps-camera-input"
             onClick={() => {
-              setShowAttach(false);
-              cameraInputRef.current?.click();
+              window.setTimeout(() => setShowAttach(false), 300);
             }}
             className="flex flex-col items-center gap-1.5 group cursor-pointer"
           >
@@ -1145,13 +1143,12 @@ export const ChatRoom: React.FC<ChatRoomProps> = ({
               <Camera className="w-5 h-5" />
             </span>
             <span className="text-xs font-medium text-[#3B4A54] dark:text-[#D1D7DB]">Kamera</span>
-          </button>
+          </label>
 
-          <button
-            type="button"
+          <label
+            htmlFor="wattapps-doc-input"
             onClick={() => {
-              setShowAttach(false);
-              docInputRef.current?.click();
+              window.setTimeout(() => setShowAttach(false), 300);
             }}
             className="flex flex-col items-center gap-1.5 group cursor-pointer"
           >
@@ -1159,32 +1156,32 @@ export const ChatRoom: React.FC<ChatRoomProps> = ({
               <FileText className="w-5 h-5" />
             </span>
             <span className="text-xs font-medium text-[#3B4A54] dark:text-[#D1D7DB]">Dokumen</span>
-          </button>
+          </label>
         </div>
       )}
 
-      {/* Hidden File Inputs */}
+      {/* Hidden File Inputs Outside Popup (Persistent in DOM) */}
       <input
-        ref={galleryInputRef}
+        id="wattapps-gallery-input"
         type="file"
         accept="image/*,video/*"
         onChange={handleGallerySelect}
-        style={{ position: 'fixed', opacity: 0, pointerEvents: 'none', width: 1, height: 1 }}
+        style={{ position: 'fixed', width: 1, height: 1, opacity: 0.001, zIndex: -1 }}
       />
       <input
-        ref={cameraInputRef}
+        id="wattapps-camera-input"
         type="file"
         accept="image/*"
         capture="environment"
         onChange={handleCameraSelect}
-        style={{ position: 'fixed', opacity: 0, pointerEvents: 'none', width: 1, height: 1 }}
+        style={{ position: 'fixed', width: 1, height: 1, opacity: 0.001, zIndex: -1 }}
       />
       <input
-        ref={docInputRef}
+        id="wattapps-doc-input"
         type="file"
-        accept="*/*,.pdf,.doc,.docx,.xls,.xlsx,.ppt,.pptx,.zip,.rar,.txt,.csv"
+        accept="*/*"
         onChange={handleDocumentSelect}
-        style={{ position: 'fixed', opacity: 0, pointerEvents: 'none', width: 1, height: 1 }}
+        style={{ position: 'fixed', width: 1, height: 1, opacity: 0.001, zIndex: -1 }}
       />
 
       {/* Bottom Input Bar / Live Voice Note Recorder */}
