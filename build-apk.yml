@@ -16,13 +16,13 @@ jobs:
       - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
-          node-version: '20'
+          node-version: '22'
 
-      - name: Setup Java 17
+      - name: Setup Java 21 (Temurin)
         uses: actions/setup-java@v4
         with:
           distribution: 'temurin'
-          java-version: '17'
+          java-version: '21'
 
       - name: Install Capacitor & Generate Android Project
         run: |
@@ -50,9 +50,12 @@ jobs:
             fs.writeFileSync("capacitor.config.json", JSON.stringify(cfg, null, 2));
           '
           npx cap add android
-          if [ -f "icon.png" ]; then
+          if [ -f "logo.png" ]; then
+            cp logo.png assets/icon.png
+            npx capacitor-assets generate --android || true
+          elif [ -f "icon.png" ]; then
             cp icon.png assets/icon.png
-            npx capacitor-assets generate --android
+            npx capacitor-assets generate --android || true
           fi
 
       - name: Configure Firebase FCM, KeepAliveService, Anti-Freeze WebView & Notifications
