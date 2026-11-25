@@ -28,8 +28,8 @@ jobs:
         run: |
           mkdir -p www assets
           echo "<h1>WattappsAU Loading...</h1>" > www/index.html
-          npm install
-          npm install -D @capacitor/assets
+          npm install --legacy-peer-deps
+          npm install -D @capacitor/assets --legacy-peer-deps
           npx cap init "WattappsAU" "mil.tniau.diskomlekau.wattappsau" --web-dir www
           node -e '
             const fs = require("fs");
