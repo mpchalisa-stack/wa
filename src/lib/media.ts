@@ -358,58 +358,145 @@ export async function toDownloadBlob(
   return dataUrlToBlob(trimmed, targetMime);
 }
 
+export function extractPureBase64(dataUrlOrBase64: string): string {
+  const trimmed = dataUrlOrBase64.trim();
+  const commaIdx = trimmed.indexOf(',');
+  const raw = commaIdx >= 0 && trimmed.slice(0, commaIdx).startsWith('data:')
+    ? trimmed.slice(commaIdx + 1)
+    : trimmed;
+  return raw.replace(/\s+/g, '');
+}
+
+export async function blobToPureBase64(blob: Blob): Promise<string> {
+  const dataUrl = await fileToDataUrl(blob);
+  return extractPureBase64(dataUrl);
+}
+
 export async function triggerDownload(
   source: Blob | string,
   fileName: string,
   mimeType?: string
-): Promise<{ ok: boolean; method?: 'android_bridge' | 'web_share' | 'blob_anchor'; error?: string }> {
+): Promise<{
+  ok: boolean;
+  method?: 'android_bridge_base64' | 'android_bridge_url' | 'web_share' | 'blob_anchor';
+  error?: string;
+}> {
   const safeFileName = (fileName || 'file-wattappsau').trim();
   const resolvedMime = resolveMimeTypeForFile(safeFileName, mimeType);
 
+  if (!source || (typeof source === 'string' && source.trim().length === 0)) {
+    return { ok: false, error: 'Data file kosong atau tidak ditemukan.' };
+  }
+
   try {
+    const isDirectHttpUrl =
+      typeof source === 'string' &&
+      (source.trim().startsWith('http://') || source.trim().startsWith('https://'));
+
+    const hasAndroidBridge =
+      typeof window !== 'undefined' && typeof window.AndroidBridge !== 'undefined';
+
+    // 1. Jika berjalan di Android WebView Capacitor dengan window.AndroidBridge
+    if (hasAndroidBridge && window.AndroidBridge) {
+      // 1a. Jika berupa URL HTTP/HTTPS langsung, coba downloadFile(url, fileName)
+      if (isDirectHttpUrl && typeof source === 'string') {
+        try {
+          if (typeof window.AndroidBridge.downloadFile === 'function') {
+            const handled = window.AndroidBridge.downloadFile(source.trim(), safeFileName);
+            if (handled !== false) {
+              return { ok: true, method: 'android_bridge_url' };
+            }
+          }
+        } catch (bridgeUrlErr) {
+          console.warn('[Download] AndroidBridge.downloadFile(url) gagal:', bridgeUrlErr);
+        }
+      }
+
+      // 1b. Ambil Blob & konversi ke string base64 murni (tanpa prefix data:...;base64,)
+      const blob = await toDownloadBlob(source, safeFileName, resolvedMime);
+      if (blob.size === 0) {
+        return { ok: false, error: 'Ukuran file 0 byte (data kosong).' };
+      }
+
+      const pureBase64 =
+        typeof source === 'string' &&
+        source.trim().startsWith('data:') &&
+        /;base64/i.test(source.slice(0, source.indexOf(',')))
+          ? extractPureBase64(source)
+          : await blobToPureBase64(blob);
+
+      if (!pureBase64) {
+        return { ok: false, error: 'Gagal mengonversi file ke base64.' };
+      }
+
+      try {
+        if (typeof window.AndroidBridge.saveBase64File === 'function') {
+          const saved = window.AndroidBridge.saveBase64File(safeFileName, pureBase64);
+          if (saved !== false) {
+            return { ok: true, method: 'android_bridge_base64' };
+          }
+        }
+      } catch (saveErr) {
+        console.warn('[Download] AndroidBridge.saveBase64File gagal:', saveErr);
+      }
+
+      try {
+        if (typeof window.AndroidBridge.downloadFile === 'function') {
+          const dataUrlPayload = `data:${resolvedMime};base64,${pureBase64}`;
+          const handled = window.AndroidBridge.downloadFile(
+            dataUrlPayload,
+            safeFileName,
+            resolvedMime
+          );
+          if (handled !== false) {
+            return { ok: true, method: 'android_bridge_base64' };
+          }
+        }
+      } catch (dlErr) {
+        console.warn('[Download] AndroidBridge.downloadFile fallback gagal:', dlErr);
+      }
+
+      // Fallback Web Share File API bila APK lama belum memiliki saveBase64File/downloadFile
+      if (typeof navigator !== 'undefined' && typeof navigator.canShare === 'function') {
+        try {
+          const fileObj = new File([blob], safeFileName, { type: resolvedMime });
+          if (navigator.canShare({ files: [fileObj] })) {
+            await navigator.share({
+              files: [fileObj],
+              title: safeFileName,
+            });
+            return { ok: true, method: 'web_share' };
+          }
+        } catch (shareErr) {
+          if (shareErr instanceof Error && shareErr.name === 'AbortError') {
+            return { ok: false, error: 'Penyimpanan file dibatalkan.' };
+          }
+          console.warn('[Download] navigator.share fallback gagal:', shareErr);
+        }
+      }
+
+      // Fallback terakhir di WebView
+      const fallbackUrl = URL.createObjectURL(blob);
+      const fallbackLink = document.createElement('a');
+      fallbackLink.href = fallbackUrl;
+      fallbackLink.download = safeFileName;
+      fallbackLink.rel = 'noopener noreferrer';
+      fallbackLink.style.display = 'none';
+      document.body.appendChild(fallbackLink);
+      fallbackLink.click();
+      window.setTimeout(() => {
+        if (fallbackLink.parentNode) fallbackLink.parentNode.removeChild(fallbackLink);
+        URL.revokeObjectURL(fallbackUrl);
+      }, 5000);
+      return { ok: true, method: 'blob_anchor' };
+    }
+
+    // 2. Di browser biasa / Vercel (tanpa AndroidBridge): unduhan standar <a download> dengan URL.createObjectURL(blob)
     const blob = await toDownloadBlob(source, safeFileName, resolvedMime);
-
-    // 1. Jika APK Android WebView menyediakan bridge unduhan native, simpan ke Downloads & buka file
-    if (typeof window !== 'undefined' && typeof window.AndroidBridge?.downloadFile === 'function') {
-      try {
-        const dataUrl =
-          typeof source === 'string' && source.startsWith(`data:${resolvedMime};base64,`)
-            ? source
-            : await fileToDataUrl(blob);
-        const handled = window.AndroidBridge.downloadFile(dataUrl, safeFileName, resolvedMime);
-        if (handled !== false) {
-          return { ok: true, method: 'android_bridge' };
-        }
-      } catch (bridgeErr) {
-        console.warn('[Download] AndroidBridge.downloadFile fallback:', bridgeErr);
-      }
+    if (blob.size === 0) {
+      return { ok: false, error: 'Ukuran file 0 byte (data kosong).' };
     }
 
-    // 2. Jika berjalan di Android WebView lama tanpa AndroidBridge.downloadFile, coba Web Share File API terlebih dahulu
-    const isAndroidWebView =
-      typeof window !== 'undefined' &&
-      (Boolean(window.AndroidBridge) || /; wv\)/i.test(navigator.userAgent || ''));
-
-    if (isAndroidWebView && typeof navigator !== 'undefined' && typeof navigator.canShare === 'function') {
-      try {
-        const fileObj = new File([blob], safeFileName, { type: resolvedMime });
-        if (navigator.canShare({ files: [fileObj] })) {
-          await navigator.share({
-            files: [fileObj],
-            title: safeFileName,
-          });
-          return { ok: true, method: 'web_share' };
-        }
-      } catch (shareErr) {
-        // Jika pengguna membatalkan share sheet, jangan paksa error
-        if (shareErr instanceof Error && shareErr.name === 'AbortError') {
-          return { ok: false, error: 'Penyimpanan file dibatalkan.' };
-        }
-        console.warn('[Download] navigator.share fallback gagal:', shareErr);
-      }
-    }
-
-    // 3. Unduhan standar via Blob ObjectURL (Chrome, Safari, Desktop, dan WebView dengan DownloadListener)
     const objectUrl = URL.createObjectURL(blob);
     const link = document.createElement('a');
     link.href = objectUrl;
@@ -431,7 +518,7 @@ export async function triggerDownload(
     console.error('[Download] Gagal mengunduh file:', err);
     return {
       ok: false,
-      error: 'Berkas rusak atau gagal dikonversi untuk diunduh.',
+      error: 'Berkas rusak atau gagal diproses untuk diunduh.',
     };
   }
 }

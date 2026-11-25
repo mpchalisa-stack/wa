@@ -16,7 +16,8 @@ export interface AndroidBridgeInterface {
   showIncomingMessage?: (sender: string, body: string) => void;
   setCallAudioMode?: (inCall: boolean) => void;
   enterBatteryStandby?: () => void;
-  downloadFile?: (dataUrl: string, fileName: string, mimeType?: string) => boolean | void;
+  saveBase64File?: (fileName: string, base64Data: string) => boolean | void;
+  downloadFile?: (urlOrData: string, fileName: string, mimeType?: string) => boolean | void;
 }
 
 declare global {

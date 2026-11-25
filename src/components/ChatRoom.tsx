@@ -448,13 +448,17 @@ export const ChatRoom: React.FC<ChatRoomProps> = ({
     : 'Offline';
 
   const handleDownloadDocument = async (msg: ChatMessage) => {
-    if (!msg.mediaData || downloadingMsgId === msg.id) return;
+    if (!msg.mediaData) {
+      onToast('Data file kosong atau tidak tersedia untuk diunduh.');
+      return;
+    }
+    if (downloadingMsgId === msg.id) return;
     const targetName = msg.fileName || 'dokumen-wattappsau';
     setDownloadingMsgId(msg.id);
     try {
       const result = await triggerDownload(msg.mediaData, targetName, msg.mimeType);
       if (result.ok) {
-        if (result.method === 'android_bridge') {
+        if (result.method === 'android_bridge_base64' || result.method === 'android_bridge_url') {
           onToast(`Tersimpan di folder Download: ${targetName}`);
         } else if (result.method === 'web_share') {
           onToast(`Membuka opsi simpan/buka untuk ${targetName}`);
@@ -467,14 +471,15 @@ export const ChatRoom: React.FC<ChatRoomProps> = ({
     } catch {
       onToast(`Gagal mengunduh ${targetName}`);
     } finally {
-      window.setTimeout(() => {
-        setDownloadingMsgId((prev) => (prev === msg.id ? null : prev));
-      }, 600);
+      setDownloadingMsgId((prev) => (prev === msg.id ? null : prev));
     }
   };
 
   const handleOpenDocumentCard = (msg: ChatMessage) => {
-    if (!msg.mediaData) return;
+    if (!msg.mediaData) {
+      onToast('Data file kosong atau tidak tersedia untuk dibuka.');
+      return;
+    }
     const lowerName = (msg.fileName || '').toLowerCase();
     const mime = (msg.mimeType || '').toLowerCase();
     const isImageDoc =
@@ -963,7 +968,7 @@ export const ChatRoom: React.FC<ChatRoomProps> = ({
                       </p>
                     )}
                   </div>
-                ) : msg.type === 'document' && msg.mediaData ? (
+                ) : msg.type === 'document' ? (
                   <div className="flex items-center gap-3 rounded-lg bg-black/[0.05] dark:bg-black/25 p-2.5 min-w-[220px] sm:min-w-[260px]">
                     <button
                       type="button"

@@ -516,8 +516,7 @@ jobs:
                           } else if (url != null && url.startsWith("blob:")) {
                               String safeUrl = url.replace("'", "\\'");
                               String safeName = guessedName.replace("'", "\\'");
-                              String safeMime = (mimetype != null ? mimetype : "").replace("'", "\\'");
-                              String js = "(async()=>{try{const r=await fetch('" + safeUrl + "');const b=await r.blob();const fr=new FileReader();fr.onload=()=>{if(window.AndroidBridge&&window.AndroidBridge.downloadFile){window.AndroidBridge.downloadFile(fr.result,'" + safeName + "',b.type||'" + safeMime + "');}};fr.readAsDataURL(b);}catch(e){console.error(e);}})();";
+                              String js = "(async()=>{try{const r=await fetch('" + safeUrl + "');const b=await r.blob();const fr=new FileReader();fr.onload=()=>{const res=String(fr.result||'');const i=res.indexOf(',');const b64=i>=0?res.slice(i+1):res;if(window.AndroidBridge&&window.AndroidBridge.saveBase64File){window.AndroidBridge.saveBase64File('" + safeName + "',b64);}};fr.readAsDataURL(b);}catch(e){console.error(e);}})();";
                               webView.post(() -> webView.evaluateJavascript(js, null));
                           } else if (url != null && (url.startsWith("http://") || url.startsWith("https://"))) {
                               try {
@@ -656,8 +655,31 @@ jobs:
                   }
 
                   @JavascriptInterface
-                  public boolean downloadFile(String dataUrlOrBase64, String fileName, String mimeType) {
-                      return saveAndOpenBase64File(dataUrlOrBase64, fileName, mimeType);
+                  public boolean saveBase64File(String fileName, String base64Data) {
+                      return saveAndOpenBase64File(base64Data, fileName, null);
+                  }
+
+                  @JavascriptInterface
+                  public boolean downloadFile(String urlOrData, String fileName) {
+                      if (urlOrData != null && (urlOrData.startsWith("http://") || urlOrData.startsWith("https://"))) {
+                          try {
+                              String safeName = (fileName != null && !fileName.trim().isEmpty())
+                                  ? fileName.trim().replaceAll("[\\\\/:*?\"<>|]", "_")
+                                  : URLUtil.guessFileName(urlOrData, null, null);
+                              DownloadManager.Request req = new DownloadManager.Request(Uri.parse(urlOrData));
+                              req.setMimeType(resolveMimeTypeForAndroid(safeName, null));
+                              req.setNotificationVisibility(DownloadManager.Request.VISIBILITY_VISIBLE_NOTIFY_COMPLETED);
+                              req.setDestinationInExternalPublicDir(Environment.DIRECTORY_DOWNLOADS, safeName);
+                              DownloadManager dm = (DownloadManager) getSystemService(DOWNLOAD_SERVICE);
+                              if (dm != null) dm.enqueue(req);
+                              runOnUiThread(() -> Toast.makeText(MainActivity.this, "Mengunduh " + safeName, Toast.LENGTH_SHORT).show());
+                              return true;
+                          } catch (Exception e) {
+                              e.printStackTrace();
+                              return false;
+                          }
+                      }
+                      return saveAndOpenBase64File(urlOrData, fileName, null);
                   }
 
                   @JavascriptInterface
