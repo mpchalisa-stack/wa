@@ -7,6 +7,7 @@ import {
   FileText,
   Film,
   Hourglass,
+  MapPin,
   MessageSquarePlus,
   Mic,
   Ban,
@@ -161,6 +162,12 @@ export const ChatList: React.FC<ChatListProps> = ({
           <span className="inline-flex items-center gap-1 truncate">
             <Mic className="w-3.5 h-3.5 text-[#00A884] shrink-0" />
             {prefix}Pesan suara
+          </span>
+        ) : last.type === 'location' ? (
+          <span className="inline-flex items-center gap-1 truncate">
+            <MapPin className="w-3.5 h-3.5 text-[#00A884] shrink-0" />
+            {prefix}
+            {last.location?.label || last.text || 'Lokasi GPS'}
           </span>
         ) : (
           <span className="truncate">

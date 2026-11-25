@@ -9,10 +9,12 @@ import {
   Clock,
   Copy,
   Download,
+  ExternalLink,
   FileText,
   Hourglass,
   Image as ImageIcon,
   Loader2,
+  MapPin,
   Mic,
   MoreVertical,
   Paperclip,
@@ -29,7 +31,7 @@ import {
   Video,
   X,
 } from 'lucide-react';
-import { CallType, ChatMessage, Contact, ReplyPreview, UserProfile } from '../types';
+import { CallType, ChatMessage, Contact, LocationMeta, ReplyPreview, UserProfile } from '../types';
 import {
   compressImageFile,
   estimateDataUrlBytes,
@@ -46,6 +48,11 @@ import {
 import { Avatar } from './Avatar';
 import { VoiceNoteBubble } from './VoiceNoteBubble';
 import { LightboxMedia } from './MediaLightbox';
+import {
+  LocationPickerModal,
+  buildExternalMapUrl,
+  buildOpenStreetMapEmbedUrl,
+} from './LocationPickerModal';
 import { activateActiveMediaSession, releaseActiveMediaSession } from '../lib/standby';
 import type { PeerTransportMode } from '../lib/peerManager';
 
@@ -68,6 +75,7 @@ interface ChatRoomProps {
     duration?: number;
     replyTo?: ReplyPreview;
   }) => void;
+  onSendLocation: (location: LocationMeta, replyTo?: ReplyPreview) => void;
   onDeleteMessage: (messageId: string, forEveryone: boolean) => void;
   onClearChat: (chatId: string) => void;
   onDeleteContact: (chatId: string) => void;
@@ -103,6 +111,7 @@ export const ChatRoom: React.FC<ChatRoomProps> = ({
   onBack,
   onSendText,
   onSendMedia,
+  onSendLocation,
   onDeleteMessage,
   onClearChat,
   onDeleteContact,
@@ -117,6 +126,7 @@ export const ChatRoom: React.FC<ChatRoomProps> = ({
   const [showEmoji, setShowEmoji] = useState(false);
   const [emojiTab, setEmojiTab] = useState(0);
   const [showAttach, setShowAttach] = useState(false);
+  const [showLocationPicker, setShowLocationPicker] = useState(false);
   const [showHeaderMenu, setShowHeaderMenu] = useState(false);
   const [showInfoSheet, setShowInfoSheet] = useState(false);
   const [activeMsgMenuId, setActiveMsgMenuId] = useState<string | null>(null);
@@ -441,11 +451,16 @@ export const ChatRoom: React.FC<ChatRoomProps> = ({
     if (!msg.mediaData || downloadingMsgId === msg.id) return;
     const targetName = msg.fileName || 'dokumen-wattappsau';
     setDownloadingMsgId(msg.id);
-    onToast(`Mengunduh ${targetName}...`);
     try {
       const result = await triggerDownload(msg.mediaData, targetName, msg.mimeType);
       if (result.ok) {
-        onToast(`Unduhan dimulai: ${targetName}`);
+        if (result.method === 'android_bridge') {
+          onToast(`Tersimpan di folder Download: ${targetName}`);
+        } else if (result.method === 'web_share') {
+          onToast(`Membuka opsi simpan/buka untuk ${targetName}`);
+        } else {
+          onToast(`Unduhan dimulai: ${targetName}`);
+        }
       } else {
         onToast(result.error || `Gagal mengunduh ${targetName}`);
       }
@@ -456,6 +471,30 @@ export const ChatRoom: React.FC<ChatRoomProps> = ({
         setDownloadingMsgId((prev) => (prev === msg.id ? null : prev));
       }, 600);
     }
+  };
+
+  const handleOpenDocumentCard = (msg: ChatMessage) => {
+    if (!msg.mediaData) return;
+    const lowerName = (msg.fileName || '').toLowerCase();
+    const mime = (msg.mimeType || '').toLowerCase();
+    const isImageDoc =
+      mime.startsWith('image/') || /\.(png|jpe?g|gif|webp|bmp)$/i.test(lowerName);
+    const isVideoDoc =
+      mime.startsWith('video/') || /\.(mp4|webm|mov|m4v)$/i.test(lowerName);
+
+    if (isImageDoc || isVideoDoc) {
+      onOpenLightbox({
+        type: isVideoDoc ? 'video' : 'image',
+        src: msg.mediaData,
+        senderName: msg.senderId === profile.id ? 'Anda' : msg.senderName,
+        timestamp: msg.timestamp,
+        caption: msg.fileName,
+        fileName: msg.fileName,
+      });
+      return;
+    }
+
+    void handleDownloadDocument(msg);
   };
 
   return (
@@ -789,6 +828,8 @@ export const ChatRoom: React.FC<ChatRoomProps> = ({
                               ? 'Video'
                               : msg.type === 'voice'
                               ? 'Pesan suara'
+                              : msg.type === 'location'
+                              ? msg.location?.label || 'Lokasi GPS'
                               : msg.fileName || 'Dokumen'),
                         });
                         setActiveMsgMenuId(null);
@@ -924,18 +965,25 @@ export const ChatRoom: React.FC<ChatRoomProps> = ({
                   </div>
                 ) : msg.type === 'document' && msg.mediaData ? (
                   <div className="flex items-center gap-3 rounded-lg bg-black/[0.05] dark:bg-black/25 p-2.5 min-w-[220px] sm:min-w-[260px]">
-                    <div className="w-10 h-10 rounded-lg bg-[#008069]/15 dark:bg-[#00A884]/20 text-[#008069] dark:text-[#00A884] flex items-center justify-center shrink-0">
-                      <FileText className="w-5 h-5" />
-                    </div>
-                    <div className="flex-1 min-w-0">
-                      <div className="text-sm font-medium truncate">
-                        {msg.fileName || 'Dokumen'}
+                    <button
+                      type="button"
+                      onClick={() => handleOpenDocumentCard(msg)}
+                      className="flex-1 flex items-center gap-3 min-w-0 text-left cursor-pointer"
+                      title="Buka atau unduh dokumen"
+                    >
+                      <div className="w-10 h-10 rounded-lg bg-[#008069]/15 dark:bg-[#00A884]/20 text-[#008069] dark:text-[#00A884] flex items-center justify-center shrink-0">
+                        <FileText className="w-5 h-5" />
                       </div>
-                      <div className="text-[11px] text-[#667781] dark:text-[#AEBAC1] tabular-nums">
-                        {formatFileSize(msg.fileSize)} ·{' '}
-                        {(msg.fileName?.split('.').pop() || 'FILE').toUpperCase()}
+                      <div className="flex-1 min-w-0">
+                        <div className="text-sm font-medium truncate">
+                          {msg.fileName || 'Dokumen'}
+                        </div>
+                        <div className="text-[11px] text-[#667781] dark:text-[#AEBAC1] tabular-nums">
+                          {formatFileSize(msg.fileSize)} ·{' '}
+                          {(msg.fileName?.split('.').pop() || 'FILE').toUpperCase()}
+                        </div>
                       </div>
-                    </div>
+                    </button>
                     <button
                       type="button"
                       disabled={downloadingMsgId === msg.id}
@@ -952,6 +1000,63 @@ export const ChatRoom: React.FC<ChatRoomProps> = ({
                         <Download className="w-4 h-4" />
                       )}
                     </button>
+                  </div>
+                ) : msg.type === 'location' && msg.location ? (
+                  <div className="space-y-2 min-w-[230px] sm:min-w-[265px]">
+                    <div className="relative h-36 w-full rounded-lg overflow-hidden bg-[#0B141A] border border-black/10 dark:border-white/10">
+                      <iframe
+                        title="Peta Lokasi GPS"
+                        src={buildOpenStreetMapEmbedUrl(msg.location.lat, msg.location.lng)}
+                        className="w-full h-full border-0 pointer-events-none"
+                        loading="lazy"
+                      />
+                      <span className="absolute top-2 left-2 inline-flex items-center gap-1 px-2 py-0.5 rounded-md bg-[#111B21]/85 text-white text-[10px] font-semibold">
+                        <MapPin className="w-3 h-3 text-emerald-400" />
+                        <span>Lokasi GPS</span>
+                      </span>
+                    </div>
+                    <div className="px-0.5 space-y-1">
+                      {(msg.location.label || msg.text) && (
+                        <div className="text-[13.5px] font-semibold leading-snug break-words">
+                          {msg.location.label || msg.text}
+                        </div>
+                      )}
+                      <div className="font-mono-id text-[11px] text-[#008069] dark:text-[#00A884]">
+                        {msg.location.lat.toFixed(6)}, {msg.location.lng.toFixed(6)}
+                        {typeof msg.location.accuracy === 'number'
+                          ? ` · ±${msg.location.accuracy} m`
+                          : ''}
+                      </div>
+                      <div className="pt-1 flex items-center gap-2">
+                        <a
+                          href={buildExternalMapUrl(msg.location.lat, msg.location.lng)}
+                          target="_blank"
+                          rel="noopener noreferrer"
+                          className="flex-1 inline-flex items-center justify-center gap-1.5 h-8 px-2.5 rounded-lg bg-[#008069] hover:bg-[#017561] dark:bg-[#00A884] dark:hover:bg-[#06CF9C] text-white dark:text-[#111B21] text-xs font-semibold transition-colors"
+                        >
+                          <ExternalLink className="w-3.5 h-3.5" />
+                          <span>Buka Peta</span>
+                        </a>
+                        <button
+                          type="button"
+                          onClick={async () => {
+                            try {
+                              await navigator.clipboard.writeText(
+                                `${msg.location!.lat.toFixed(6)}, ${msg.location!.lng.toFixed(6)}`
+                              );
+                              onToast('Koordinat GPS disalin');
+                            } catch {
+                              onToast('Gagal menyalin koordinat');
+                            }
+                          }}
+                          className="inline-flex items-center justify-center gap-1 h-8 px-2.5 rounded-lg bg-black/5 dark:bg-white/10 hover:bg-black/10 dark:hover:bg-white/15 text-xs font-medium cursor-pointer"
+                          title="Salin koordinat"
+                        >
+                          <Copy className="w-3.5 h-3.5" />
+                          <span>Salin</span>
+                        </button>
+                      </div>
+                    </div>
                   </div>
                 ) : msg.type === 'voice' && msg.mediaData ? (
                   <VoiceNoteBubble
@@ -1125,7 +1230,7 @@ export const ChatRoom: React.FC<ChatRoomProps> = ({
 
       {/* Floating WhatsApp Attachment Pop-Up */}
       {showAttach && (
-        <div className="absolute bottom-[74px] left-4 sm:left-6 z-30 rounded-2xl bg-white dark:bg-[#233138] shadow-2xl border border-black/10 dark:border-white/10 p-4 grid grid-cols-3 gap-4 w-72">
+        <div className="absolute bottom-[74px] left-3 sm:left-6 z-30 rounded-2xl bg-white dark:bg-[#233138] shadow-2xl border border-black/10 dark:border-white/10 p-4 grid grid-cols-4 gap-3 w-[312px] max-w-[calc(100vw-1.5rem)]">
           <label
             htmlFor="wattapps-gallery-input"
             onClick={() => {
@@ -1165,6 +1270,20 @@ export const ChatRoom: React.FC<ChatRoomProps> = ({
             </span>
             <span className="text-xs font-medium text-[#3B4A54] dark:text-[#D1D7DB]">Dokumen</span>
           </label>
+
+          <button
+            type="button"
+            onClick={() => {
+              setShowAttach(false);
+              setShowLocationPicker(true);
+            }}
+            className="flex flex-col items-center gap-1.5 group cursor-pointer"
+          >
+            <span className="w-12 h-12 rounded-full bg-emerald-600 text-white flex items-center justify-center shadow-md group-hover:scale-105 transition-transform">
+              <MapPin className="w-5 h-5" />
+            </span>
+            <span className="text-xs font-medium text-[#3B4A54] dark:text-[#D1D7DB]">Lokasi</span>
+          </button>
         </div>
       )}
 
@@ -1268,8 +1387,8 @@ export const ChatRoom: React.FC<ChatRoomProps> = ({
                     ? 'text-[#008069] dark:text-[#00A884]'
                     : 'text-[#54656F] dark:text-[#8696A0] hover:text-[#111B21] dark:hover:text-white'
                 }`}
-                aria-label="Lampirkan file"
-                title="Lampirkan (Galeri, Kamera, Dokumen)"
+                aria-label="Lampirkan file atau lokasi"
+                title="Lampirkan (Galeri, Kamera, Dokumen, Lokasi)"
               >
                 <Paperclip className="w-5 h-5 -rotate-45" />
               </button>
@@ -1382,6 +1501,16 @@ export const ChatRoom: React.FC<ChatRoomProps> = ({
           </div>
         </div>
       )}
+
+      {/* GPS Location Picker Modal */}
+      <LocationPickerModal
+        open={showLocationPicker}
+        onClose={() => setShowLocationPicker(false)}
+        onSendLocation={(loc) => {
+          onSendLocation(loc, replyTo ?? undefined);
+          setReplyTo(null);
+        }}
+      />
     </div>
   );
 };

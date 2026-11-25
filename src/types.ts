@@ -25,7 +25,7 @@ export interface Contact {
   lastSeen?: number;
 }
 
-export type MessageType = 'text' | 'image' | 'video' | 'document' | 'voice' | 'call_log';
+export type MessageType = 'text' | 'image' | 'video' | 'document' | 'voice' | 'location' | 'call_log';
 export type MessageStatus = 'pending' | 'sending' | 'sent' | 'delivered' | 'read';
 
 export interface CallLogMeta {
@@ -51,6 +51,14 @@ export interface EncryptedTextPayload {
   ct: string; // Base64 ciphertext + GCM auth tag
 }
 
+export interface LocationMeta {
+  lat: number;
+  lng: number;
+  accuracy?: number;
+  label?: string;
+  capturedAt?: number;
+}
+
 export interface ChatMessage {
   id: string;
   chatId: string; // Peer 6-digit ID or Group ID
@@ -65,6 +73,7 @@ export interface ChatMessage {
   fileSize?: number;
   mimeType?: string;
   duration?: number; // Seconds for voice note
+  location?: LocationMeta; // GPS coordinates for location messages
   timestamp: number;
   status: MessageStatus;
   transferProgress?: number; // 0-100 while chunking/sending until Centang 2 (delivered/read)

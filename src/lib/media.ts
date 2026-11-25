@@ -362,29 +362,54 @@ export async function triggerDownload(
   source: Blob | string,
   fileName: string,
   mimeType?: string
-): Promise<{ ok: boolean; error?: string }> {
+): Promise<{ ok: boolean; method?: 'android_bridge' | 'web_share' | 'blob_anchor'; error?: string }> {
   const safeFileName = (fileName || 'file-wattappsau').trim();
   const resolvedMime = resolveMimeTypeForFile(safeFileName, mimeType);
 
   try {
     const blob = await toDownloadBlob(source, safeFileName, resolvedMime);
 
-    // Jika APK Android WebView menyediakan bridge unduhan native, utamakan bridge tersebut
+    // 1. Jika APK Android WebView menyediakan bridge unduhan native, simpan ke Downloads & buka file
     if (typeof window !== 'undefined' && typeof window.AndroidBridge?.downloadFile === 'function') {
       try {
         const dataUrl =
-          typeof source === 'string' && source.startsWith('data:')
+          typeof source === 'string' && source.startsWith(`data:${resolvedMime};base64,`)
             ? source
             : await fileToDataUrl(blob);
         const handled = window.AndroidBridge.downloadFile(dataUrl, safeFileName, resolvedMime);
         if (handled !== false) {
-          return { ok: true };
+          return { ok: true, method: 'android_bridge' };
         }
       } catch (bridgeErr) {
-        console.warn('[Download] AndroidBridge.downloadFile fallback ke Blob URL:', bridgeErr);
+        console.warn('[Download] AndroidBridge.downloadFile fallback:', bridgeErr);
       }
     }
 
+    // 2. Jika berjalan di Android WebView lama tanpa AndroidBridge.downloadFile, coba Web Share File API terlebih dahulu
+    const isAndroidWebView =
+      typeof window !== 'undefined' &&
+      (Boolean(window.AndroidBridge) || /; wv\)/i.test(navigator.userAgent || ''));
+
+    if (isAndroidWebView && typeof navigator !== 'undefined' && typeof navigator.canShare === 'function') {
+      try {
+        const fileObj = new File([blob], safeFileName, { type: resolvedMime });
+        if (navigator.canShare({ files: [fileObj] })) {
+          await navigator.share({
+            files: [fileObj],
+            title: safeFileName,
+          });
+          return { ok: true, method: 'web_share' };
+        }
+      } catch (shareErr) {
+        // Jika pengguna membatalkan share sheet, jangan paksa error
+        if (shareErr instanceof Error && shareErr.name === 'AbortError') {
+          return { ok: false, error: 'Penyimpanan file dibatalkan.' };
+        }
+        console.warn('[Download] navigator.share fallback gagal:', shareErr);
+      }
+    }
+
+    // 3. Unduhan standar via Blob ObjectURL (Chrome, Safari, Desktop, dan WebView dengan DownloadListener)
     const objectUrl = URL.createObjectURL(blob);
     const link = document.createElement('a');
     link.href = objectUrl;
@@ -401,7 +426,7 @@ export async function triggerDownload(
       URL.revokeObjectURL(objectUrl);
     }, 5000);
 
-    return { ok: true };
+    return { ok: true, method: 'blob_anchor' };
   } catch (err) {
     console.error('[Download] Gagal mengunduh file:', err);
     return {

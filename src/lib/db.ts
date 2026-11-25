@@ -7,7 +7,7 @@ import {
   ThemeMode,
   UserProfile,
 } from '../types';
-import { dataUrlToBlob, fileToDataUrl } from './media';
+import { dataUrlToBlob, fileToDataUrl, resolveMimeTypeForFile } from './media';
 
 const DB_NAME = 'WA6LocalDatabase';
 const DB_VERSION = 3;
@@ -321,18 +321,19 @@ export async function dbSaveMessage(msg: ChatMessage): Promise<void> {
     if (recordToStore.mediaData && !recordToStore.deleted) {
       const mediaId = recordToStore.mediaId || `media-${recordToStore.id}`;
       try {
-        const blob = dataUrlToBlob(recordToStore.mediaData);
+        const resolvedMime = resolveMimeTypeForFile(recordToStore.fileName, recordToStore.mimeType);
+        const blob = dataUrlToBlob(recordToStore.mediaData, resolvedMime);
         mediaRecord = {
           id: mediaId,
           chatId: recordToStore.chatId,
           blob,
-          mimeType: recordToStore.mimeType || blob.type,
+          mimeType: resolvedMime,
           fileName: recordToStore.fileName,
           fileSize: recordToStore.fileSize || blob.size,
           createdAt: recordToStore.timestamp,
         };
         // Simpan referensi mediaId pada pesan dan kosongkan base64 duplikat di store messages
-        recordToStore = { ...recordToStore, mediaId, mediaData: undefined };
+        recordToStore = { ...recordToStore, mimeType: resolvedMime, mediaId, mediaData: undefined };
       } catch {
         // Fallback tetap simpan di IndexedDB messages store jika bukan data URL standar
       }
@@ -389,8 +390,18 @@ export async function loadAllLocalData(): Promise<{
         const mediaRec = mediaMap.get(msg.mediaId);
         if (mediaRec?.blob) {
           try {
-            const dataUrl = await fileToDataUrl(mediaRec.blob);
-            return { ...msg, mediaData: dataUrl };
+            const resolvedMime = resolveMimeTypeForFile(
+              msg.fileName || mediaRec.fileName,
+              msg.mimeType || mediaRec.mimeType || mediaRec.blob.type
+            );
+            const normalizedBlob =
+              !mediaRec.blob.type ||
+              (mediaRec.blob.type === 'application/octet-stream' &&
+                resolvedMime !== 'application/octet-stream')
+                ? new Blob([mediaRec.blob], { type: resolvedMime })
+                : mediaRec.blob;
+            const dataUrl = await fileToDataUrl(normalizedBlob);
+            return { ...msg, mimeType: resolvedMime, mediaData: dataUrl };
           } catch {
             return msg;
           }

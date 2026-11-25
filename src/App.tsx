@@ -1669,6 +1669,10 @@ export default function App() {
                     ? savedMsg.text
                       ? `📷 Foto: ${savedMsg.text}`
                       : '📷 Foto'
+                    : savedMsg.type === 'location'
+                    ? savedMsg.location?.label || savedMsg.text
+                      ? `📍 Lokasi: ${savedMsg.location?.label || savedMsg.text}`
+                      : '📍 Lokasi GPS'
                     : savedMsg.text || 'Pesan baru masuk';
                 triggerAndroidBridgeIncomingMessage(senderTitle, incomingMsgBody);
                 void showIncomingWebNotification({
@@ -3717,6 +3721,8 @@ export default function App() {
           ? '🎤 Pesan suara'
           : msg.type === 'document'
           ? `📄 ${msg.fileName || 'Dokumen'}`
+          : msg.type === 'location'
+          ? `📍 ${msg.location?.label || 'Lokasi GPS'}`
           : 'Pesan baru masuk');
 
       const fcmSenderName = me.name?.trim() || me.id;
@@ -5248,6 +5254,14 @@ export default function App() {
               dispatchMessage(activeContact.id, { type: 'text', text: txt, replyTo })
             }
             onSendMedia={(media) => dispatchMessage(activeContact.id, media)}
+            onSendLocation={(loc, replyTo) =>
+              dispatchMessage(activeContact.id, {
+                type: 'location',
+                text: loc.label,
+                location: loc,
+                replyTo,
+              })
+            }
             onDeleteMessage={handleDeleteMessage}
             onClearChat={handleClearChat}
             onDeleteContact={handleDeleteContact}
