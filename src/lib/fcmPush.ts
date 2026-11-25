@@ -126,19 +126,7 @@ function logFcmFirestoreError(operationType: 'get' | 'write', path: string, erro
   console.warn('[WattappsAU FCM Firestore]', JSON.stringify(details));
 }
 
-// Verifikasi konektivitas Firestore FCM saat aplikasi pertama kali dimuat
-async function testFcmFirestoreConnection(): Promise<void> {
-  const db = getFcmFirestore();
-  if (!db) return;
-  try {
-    await getDocFromServer(doc(db, 'test', 'connection'));
-  } catch (error) {
-    if (error instanceof Error && error.message.includes('the client is offline')) {
-      console.error('[WattappsAU FCM] Firestore tidak dapat dijangkau. Periksa konfigurasi Firebase.');
-    }
-  }
-}
-void testFcmFirestoreConnection();
+// Inisialisasi Firestore FCM (siaga offline / P2P mandiri tanpa timeout backend)
 
 function extractRealDisplayName(data: Record<string, unknown> | undefined): string {
   if (!data) return '';
