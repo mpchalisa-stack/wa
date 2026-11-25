@@ -136,7 +136,6 @@ export const ChatRoom: React.FC<ChatRoomProps> = ({
 
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const galleryInputRef = useRef<HTMLInputElement>(null);
-  const cameraInputRef = useRef<HTMLInputElement>(null);
   const docInputRef = useRef<HTMLInputElement>(null);
   const typingTimeoutRef = useRef<number | null>(null);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
@@ -270,33 +269,7 @@ export const ChatRoom: React.FC<ChatRoomProps> = ({
     }
   };
 
-  const handleCameraSelect = async (e: React.ChangeEvent<HTMLInputElement>) => {
-    const file = e.target.files?.[0];
-    e.target.value = '';
-    setShowAttach(false);
-    if (!file) return;
 
-    if (file.size > 12 * 1024 * 1024) {
-      onToast('Ukuran foto kamera maksimal 12 MB.');
-      return;
-    }
-
-    try {
-      const compressed = await compressImageFile(file, 1000, 0.75, 250 * 1024);
-      const compressedBytes = estimateDataUrlBytes(compressed);
-      onSendMedia({
-        type: 'image',
-        mediaData: compressed,
-        fileName: `camera-${Date.now()}.jpg`,
-        fileSize: compressedBytes,
-        mimeType: 'image/jpeg',
-        replyTo: replyTo ?? undefined,
-      });
-      setReplyTo(null);
-    } catch {
-      onToast('Gagal memproses foto kamera.');
-    }
-  };
 
   const handleDocumentSelect = async (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
@@ -1132,10 +1105,11 @@ export const ChatRoom: React.FC<ChatRoomProps> = ({
             <span className="text-xs font-medium text-[#3B4A54] dark:text-[#D1D7DB]">Galeri</span>
           </label>
 
-          <label
-            htmlFor="wattapps-camera-input"
+          <button
+            type="button"
             onClick={() => {
-              window.setTimeout(() => setShowAttach(false), 300);
+              setShowAttach(false);
+              onOpenCamera();
             }}
             className="flex flex-col items-center gap-1.5 group cursor-pointer"
           >
@@ -1143,7 +1117,7 @@ export const ChatRoom: React.FC<ChatRoomProps> = ({
               <Camera className="w-5 h-5" />
             </span>
             <span className="text-xs font-medium text-[#3B4A54] dark:text-[#D1D7DB]">Kamera</span>
-          </label>
+          </button>
 
           <label
             htmlFor="wattapps-doc-input"
@@ -1166,14 +1140,6 @@ export const ChatRoom: React.FC<ChatRoomProps> = ({
         type="file"
         accept="image/*,video/*"
         onChange={handleGallerySelect}
-        style={{ position: 'fixed', width: 1, height: 1, opacity: 0.001, zIndex: -1 }}
-      />
-      <input
-        id="wattapps-camera-input"
-        type="file"
-        accept="image/*"
-        capture="environment"
-        onChange={handleCameraSelect}
         style={{ position: 'fixed', width: 1, height: 1, opacity: 0.001, zIndex: -1 }}
       />
       <input
