@@ -136,6 +136,7 @@ export const ChatRoom: React.FC<ChatRoomProps> = ({
 
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const galleryInputRef = useRef<HTMLInputElement>(null);
+  const cameraInputRef = useRef<HTMLInputElement>(null);
   const docInputRef = useRef<HTMLInputElement>(null);
   const typingTimeoutRef = useRef<number | null>(null);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
@@ -225,9 +226,14 @@ export const ChatRoom: React.FC<ChatRoomProps> = ({
     setShowAttach(false);
     if (!file) return;
 
-    if (file.type.startsWith('image/')) {
-      try {
-        const compressed = await compressImageFile(file, 800, 0.65, 150 * 1024);
+    if (file.size > 12 * 1024 * 1024) {
+      onToast('Ukuran file maksimal 12 MB untuk transfer langsung.');
+      return;
+    }
+
+    try {
+      if (file.type.startsWith('image/')) {
+        const compressed = await compressImageFile(file, 900, 0.7, 200 * 1024);
         const compressedBytes = estimateDataUrlBytes(compressed);
         onSendMedia({
           type: 'image',
@@ -237,16 +243,7 @@ export const ChatRoom: React.FC<ChatRoomProps> = ({
           mimeType: 'image/jpeg',
           replyTo: replyTo ?? undefined,
         });
-        setReplyTo(null);
-      } catch {
-        onToast('Gagal memproses gambar.');
-      }
-    } else if (file.type.startsWith('video/')) {
-      if (file.size > 16 * 1024 * 1024) {
-        onToast('Ukuran video maksimal 16 MB untuk pengiriman P2P cepat.');
-        return;
-      }
-      try {
+      } else if (file.type.startsWith('video/')) {
         const dataUrl = await fileToDataUrl(file);
         onSendMedia({
           type: 'video',
@@ -256,10 +253,48 @@ export const ChatRoom: React.FC<ChatRoomProps> = ({
           mimeType: file.type,
           replyTo: replyTo ?? undefined,
         });
-        setReplyTo(null);
-      } catch {
-        onToast('Gagal membaca file video.');
+      } else {
+        const dataUrl = await fileToDataUrl(file);
+        onSendMedia({
+          type: 'document',
+          mediaData: dataUrl,
+          fileName: file.name,
+          fileSize: file.size,
+          mimeType: file.type || 'application/octet-stream',
+          replyTo: replyTo ?? undefined,
+        });
       }
+      setReplyTo(null);
+    } catch {
+      onToast('Gagal memproses file galeri.');
+    }
+  };
+
+  const handleCameraSelect = async (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    e.target.value = '';
+    setShowAttach(false);
+    if (!file) return;
+
+    if (file.size > 12 * 1024 * 1024) {
+      onToast('Ukuran foto kamera maksimal 12 MB.');
+      return;
+    }
+
+    try {
+      const compressed = await compressImageFile(file, 1000, 0.75, 250 * 1024);
+      const compressedBytes = estimateDataUrlBytes(compressed);
+      onSendMedia({
+        type: 'image',
+        mediaData: compressed,
+        fileName: `camera-${Date.now()}.jpg`,
+        fileSize: compressedBytes,
+        mimeType: 'image/jpeg',
+        replyTo: replyTo ?? undefined,
+      });
+      setReplyTo(null);
+    } catch {
+      onToast('Gagal memproses foto kamera.');
     }
   };
 
@@ -269,8 +304,8 @@ export const ChatRoom: React.FC<ChatRoomProps> = ({
     setShowAttach(false);
     if (!file) return;
 
-    if (file.size > 18 * 1024 * 1024) {
-      onToast('Ukuran dokumen maksimal 18 MB agar lancar dikirim lewat WebRTC.');
+    if (file.size > 12 * 1024 * 1024) {
+      onToast('Ukuran dokumen maksimal 12 MB agar lancar dikirim.');
       return;
     }
 
@@ -1086,7 +1121,10 @@ export const ChatRoom: React.FC<ChatRoomProps> = ({
         <div className="absolute bottom-[74px] left-4 sm:left-6 z-30 rounded-2xl bg-white dark:bg-[#233138] shadow-2xl border border-black/10 dark:border-white/10 p-4 grid grid-cols-3 gap-4 w-72">
           <button
             type="button"
-            onClick={() => galleryInputRef.current?.click()}
+            onClick={() => {
+              setShowAttach(false);
+              galleryInputRef.current?.click();
+            }}
             className="flex flex-col items-center gap-1.5 group cursor-pointer"
           >
             <span className="w-12 h-12 rounded-full bg-purple-600 text-white flex items-center justify-center shadow-md group-hover:scale-105 transition-transform">
@@ -1099,7 +1137,7 @@ export const ChatRoom: React.FC<ChatRoomProps> = ({
             type="button"
             onClick={() => {
               setShowAttach(false);
-              onOpenCamera();
+              cameraInputRef.current?.click();
             }}
             className="flex flex-col items-center gap-1.5 group cursor-pointer"
           >
@@ -1111,7 +1149,10 @@ export const ChatRoom: React.FC<ChatRoomProps> = ({
 
           <button
             type="button"
-            onClick={() => docInputRef.current?.click()}
+            onClick={() => {
+              setShowAttach(false);
+              docInputRef.current?.click();
+            }}
             className="flex flex-col items-center gap-1.5 group cursor-pointer"
           >
             <span className="w-12 h-12 rounded-full bg-indigo-600 text-white flex items-center justify-center shadow-md group-hover:scale-105 transition-transform">
@@ -1128,14 +1169,22 @@ export const ChatRoom: React.FC<ChatRoomProps> = ({
         type="file"
         accept="image/*,video/*"
         onChange={handleGallerySelect}
-        className="hidden"
+        style={{ position: 'fixed', opacity: 0, pointerEvents: 'none', width: 1, height: 1 }}
+      />
+      <input
+        ref={cameraInputRef}
+        type="file"
+        accept="image/*"
+        capture="environment"
+        onChange={handleCameraSelect}
+        style={{ position: 'fixed', opacity: 0, pointerEvents: 'none', width: 1, height: 1 }}
       />
       <input
         ref={docInputRef}
         type="file"
-        accept=".pdf,.doc,.docx,.xls,.xlsx,.ppt,.pptx,.zip,.rar,.txt,.csv,*/*"
+        accept="*/*,.pdf,.doc,.docx,.xls,.xlsx,.ppt,.pptx,.zip,.rar,.txt,.csv"
         onChange={handleDocumentSelect}
-        className="hidden"
+        style={{ position: 'fixed', opacity: 0, pointerEvents: 'none', width: 1, height: 1 }}
       />
 
       {/* Bottom Input Bar / Live Voice Note Recorder */}
