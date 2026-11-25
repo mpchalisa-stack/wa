@@ -510,9 +510,12 @@ jobs:
 
                       webView.addJavascriptInterface(new WebAppInterface(), "AndroidBridge");
                       webView.setDownloadListener((url, userAgent, contentDisposition, mimetype, contentLength) -> {
-                          String guessedName = URLUtil.guessFileName(url, contentDisposition, mimetype);
+                          String rawName = URLUtil.guessFileName(url, contentDisposition, mimetype);
+                          String guessedName = (rawName != null && !rawName.trim().isEmpty())
+                              ? rawName.trim().replaceAll("[\\\\/:*?\"<>|]", "_")
+                              : ("wattappsau_" + System.currentTimeMillis());
                           if (url != null && url.startsWith("data:")) {
-                              saveAndOpenBase64File(url, guessedName, mimetype);
+                              saveDataUriToDownloads(url, guessedName, mimetype);
                           } else if (url != null && url.startsWith("blob:")) {
                               String safeUrl = url.replace("'", "\\'");
                               String safeName = guessedName.replace("'", "\\'");
@@ -521,8 +524,8 @@ jobs:
                           } else if (url != null && (url.startsWith("http://") || url.startsWith("https://"))) {
                               try {
                                   DownloadManager.Request req = new DownloadManager.Request(Uri.parse(url));
-                                  req.setMimeType(mimetype);
-                                  req.addRequestHeader("User-Agent", userAgent);
+                                  req.setMimeType(resolveMimeTypeForAndroid(guessedName, mimetype));
+                                  if (userAgent != null) req.addRequestHeader("User-Agent", userAgent);
                                   req.setNotificationVisibility(DownloadManager.Request.VISIBILITY_VISIBLE_NOTIFY_COMPLETED);
                                   req.setDestinationInExternalPublicDir(Environment.DIRECTORY_DOWNLOADS, guessedName);
                                   DownloadManager dm = (DownloadManager) getSystemService(DOWNLOAD_SERVICE);
@@ -530,6 +533,7 @@ jobs:
                                   runOnUiThread(() -> Toast.makeText(MainActivity.this, "Mengunduh " + guessedName, Toast.LENGTH_SHORT).show());
                               } catch (Exception e) {
                                   e.printStackTrace();
+                                  runOnUiThread(() -> Toast.makeText(MainActivity.this, "Gagal mengunduh " + guessedName, Toast.LENGTH_SHORT).show());
                               }
                           }
                       });
@@ -570,13 +574,16 @@ jobs:
                   return "application/octet-stream";
               }
 
-              private boolean saveAndOpenBase64File(String dataUrlOrBase64, String fileName, String mimeType) {
+              private boolean saveDataUriToDownloads(String dataUrlOrBase64, String fileName, String mimeType) {
                   try {
-                      if (dataUrlOrBase64 == null || dataUrlOrBase64.isEmpty()) return false;
+                      if (dataUrlOrBase64 == null || dataUrlOrBase64.trim().isEmpty()) {
+                          runOnUiThread(() -> Toast.makeText(MainActivity.this, "Gagal menyimpan file: data kosong", Toast.LENGTH_SHORT).show());
+                          return false;
+                      }
                       String base64Part = dataUrlOrBase64;
                       String extractedMime = mimeType;
                       int commaIdx = dataUrlOrBase64.indexOf(',');
-                      if (commaIdx >= 0) {
+                      if (commaIdx >= 0 && dataUrlOrBase64.substring(0, commaIdx).contains("base64")) {
                           String header = dataUrlOrBase64.substring(0, commaIdx);
                           base64Part = dataUrlOrBase64.substring(commaIdx + 1);
                           if ((extractedMime == null || extractedMime.isEmpty()) && header.startsWith("data:")) {
@@ -585,6 +592,10 @@ jobs:
                           }
                       }
                       byte[] bytes = Base64.decode(base64Part.replaceAll("\\s+", ""), Base64.DEFAULT);
+                      if (bytes == null || bytes.length == 0) {
+                          runOnUiThread(() -> Toast.makeText(MainActivity.this, "Gagal menyimpan file: isi kosong", Toast.LENGTH_SHORT).show());
+                          return false;
+                      }
                       String safeName = (fileName != null && !fileName.trim().isEmpty())
                           ? fileName.trim().replaceAll("[\\\\/:*?\"<>|]", "_")
                           : ("wattappsau_" + System.currentTimeMillis());
@@ -599,9 +610,15 @@ jobs:
                           values.put(MediaStore.Downloads.IS_PENDING, 1);
 
                           Uri itemUri = resolver.insert(MediaStore.Downloads.EXTERNAL_CONTENT_URI, values);
-                          if (itemUri == null) return false;
+                          if (itemUri == null) {
+                              runOnUiThread(() -> Toast.makeText(MainActivity.this, "Gagal membuat file di Download", Toast.LENGTH_SHORT).show());
+                              return false;
+                          }
                           try (OutputStream os = resolver.openOutputStream(itemUri)) {
-                              if (os == null) return false;
+                              if (os == null) {
+                                  runOnUiThread(() -> Toast.makeText(MainActivity.this, "Gagal menulis file ke Download", Toast.LENGTH_SHORT).show());
+                                  return false;
+                              }
                               os.write(bytes);
                               os.flush();
                           }
@@ -609,15 +626,7 @@ jobs:
                           values.put(MediaStore.Downloads.IS_PENDING, 0);
                           resolver.update(itemUri, values, null, null);
 
-                          runOnUiThread(() -> {
-                              Toast.makeText(MainActivity.this, "Tersimpan di Download: " + safeName, Toast.LENGTH_LONG).show();
-                              try {
-                                  Intent viewIntent = new Intent(Intent.ACTION_VIEW);
-                                  viewIntent.setDataAndType(itemUri, resolvedMime);
-                                  viewIntent.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION | Intent.FLAG_ACTIVITY_NEW_TASK);
-                                  startActivity(Intent.createChooser(viewIntent, "Buka " + safeName));
-                              } catch (Exception ignored) {}
-                          });
+                          runOnUiThread(() -> Toast.makeText(MainActivity.this, "Tersimpan di folder Download: " + safeName, Toast.LENGTH_LONG).show());
                           return true;
                       } else {
                           File downloadsDir = Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS);
@@ -632,12 +641,7 @@ jobs:
                           if (dm != null) {
                               dm.addCompletedDownload(safeName, "WattappsAU Download", true, resolvedMime, outFile.getAbsolutePath(), bytes.length, true);
                           }
-                          runOnUiThread(() -> {
-                              Toast.makeText(MainActivity.this, "Tersimpan di Download: " + safeName, Toast.LENGTH_LONG).show();
-                              try {
-                                  startActivity(new Intent(DownloadManager.ACTION_VIEW_DOWNLOADS).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK));
-                              } catch (Exception ignored) {}
-                          });
+                          runOnUiThread(() -> Toast.makeText(MainActivity.this, "Tersimpan di folder Download: " + safeName, Toast.LENGTH_LONG).show());
                           return true;
                       }
                   } catch (Exception e) {
@@ -655,31 +659,33 @@ jobs:
                   }
 
                   @JavascriptInterface
-                  public boolean saveBase64File(String fileName, String base64Data) {
-                      return saveAndOpenBase64File(base64Data, fileName, null);
+                  public void saveBase64File(String fileName, String base64Data) {
+                      saveDataUriToDownloads(base64Data, fileName, null);
                   }
 
                   @JavascriptInterface
-                  public boolean downloadFile(String urlOrData, String fileName) {
-                      if (urlOrData != null && (urlOrData.startsWith("http://") || urlOrData.startsWith("https://"))) {
+                  public void downloadFile(String url, String fileName) {
+                      if (url != null && url.startsWith("data:")) {
+                          saveDataUriToDownloads(url, fileName, null);
+                      } else if (url != null && (url.startsWith("http://") || url.startsWith("https://"))) {
                           try {
                               String safeName = (fileName != null && !fileName.trim().isEmpty())
                                   ? fileName.trim().replaceAll("[\\\\/:*?\"<>|]", "_")
-                                  : URLUtil.guessFileName(urlOrData, null, null);
-                              DownloadManager.Request req = new DownloadManager.Request(Uri.parse(urlOrData));
+                                  : URLUtil.guessFileName(url, null, null);
+                              DownloadManager.Request req = new DownloadManager.Request(Uri.parse(url));
                               req.setMimeType(resolveMimeTypeForAndroid(safeName, null));
                               req.setNotificationVisibility(DownloadManager.Request.VISIBILITY_VISIBLE_NOTIFY_COMPLETED);
                               req.setDestinationInExternalPublicDir(Environment.DIRECTORY_DOWNLOADS, safeName);
                               DownloadManager dm = (DownloadManager) getSystemService(DOWNLOAD_SERVICE);
                               if (dm != null) dm.enqueue(req);
                               runOnUiThread(() -> Toast.makeText(MainActivity.this, "Mengunduh " + safeName, Toast.LENGTH_SHORT).show());
-                              return true;
                           } catch (Exception e) {
                               e.printStackTrace();
-                              return false;
+                              runOnUiThread(() -> Toast.makeText(MainActivity.this, "Gagal mengunduh file", Toast.LENGTH_SHORT).show());
                           }
+                      } else {
+                          saveDataUriToDownloads(url, fileName, null);
                       }
-                      return saveAndOpenBase64File(urlOrData, fileName, null);
                   }
 
                   @JavascriptInterface
@@ -915,6 +921,7 @@ jobs:
               <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
               <uses-permission android:name="android.permission.USE_FULL_SCREEN_INTENT" />
               <uses-permission android:name="android.permission.SYSTEM_ALERT_WINDOW" />
+              <uses-permission android:name="android.permission.WRITE_EXTERNAL_STORAGE" android:maxSdkVersion="28" />
             `;
             const services = `
               <service
