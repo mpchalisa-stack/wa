@@ -7,7 +7,7 @@ import {
   PeerPacket,
   UserProfile,
 } from '../types';
-import { dataUrlToBlob, fileToDataUrl } from './media';
+import { dataUrlToBlob, fileToDataUrl, resolveMimeTypeForFile } from './media';
 
 export const PEER_PREFIX = 'WA6-';
 
@@ -1225,11 +1225,12 @@ export class WA6PeerManager {
     }
     const combinedRaw = orderedParts.join('');
 
+    const resolvedMime = resolveMimeTypeForFile(buf.fileName, buf.fileType);
     let blob: Blob;
     try {
-      blob = dataUrlToBlob(combinedRaw);
+      blob = dataUrlToBlob(combinedRaw, resolvedMime);
     } catch {
-      blob = new Blob([combinedRaw], { type: buf.fileType || 'application/octet-stream' });
+      blob = new Blob([combinedRaw], { type: resolvedMime });
     }
 
     const finalDataUrl = combinedRaw.startsWith('data:')
@@ -1246,7 +1247,7 @@ export class WA6PeerManager {
         fileId: buf.fileId,
         messageId: resolvedMessageId,
         fileName: buf.fileName,
-        fileType: buf.fileType,
+        fileType: resolvedMime,
         fileSize: buf.fileSize || blob.size,
         dataUrl: finalDataUrl,
         blob,

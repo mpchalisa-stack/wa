@@ -22,12 +22,12 @@ export const AppLogo: React.FC<AppLogoProps> = ({ size = 36, className = '' }) =
   if (!imgFailed) {
     return (
       <img
-        src="/icon-512.png"
-        alt="WattappsAU Diskomlekau"
+        src="/assets/aistudio/1792503945296_954409ac.jpg"
+        alt="WattappsAU Swa Bhuwana Paksa"
         width={size}
         height={size}
         onError={() => setImgFailed(true)}
-        className={`rounded-full object-cover shrink-0 select-none ${className}`}
+        className={`rounded-full object-cover shrink-0 select-none bg-black ${className}`}
         style={{ width: size, height: size }}
       />
     );

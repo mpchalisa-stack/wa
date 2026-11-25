@@ -63,6 +63,10 @@
   padding-top: env(safe-area-inset-top, 0px);
 }
 
+.pt-safe-header {
+  padding-top: max(36px, env(safe-area-inset-top, 0px));
+}
+
 /* Animasi logo WattappsAU bergetar & gelombang radar berdenyut saat Panggilan Masuk */
 @keyframes ring-shake {
   0%,

@@ -40,6 +40,7 @@ import {
   formatSixDigitId,
   formatTime,
   getSenderColor,
+  resolveMimeTypeForFile,
   triggerDownload,
 } from '../lib/media';
 import { Avatar } from './Avatar';
@@ -119,6 +120,7 @@ export const ChatRoom: React.FC<ChatRoomProps> = ({
   const [showHeaderMenu, setShowHeaderMenu] = useState(false);
   const [showInfoSheet, setShowInfoSheet] = useState(false);
   const [activeMsgMenuId, setActiveMsgMenuId] = useState<string | null>(null);
+  const [downloadingMsgId, setDownloadingMsgId] = useState<string | null>(null);
 
   // Voice Note Recorder state
   const [isRecording, setIsRecording] = useState(false);
@@ -259,7 +261,7 @@ export const ChatRoom: React.FC<ChatRoomProps> = ({
           mediaData: dataUrl,
           fileName: file.name,
           fileSize: file.size,
-          mimeType: file.type || 'application/octet-stream',
+          mimeType: resolveMimeTypeForFile(file.name, file.type),
           replyTo: replyTo ?? undefined,
         });
       }
@@ -289,7 +291,7 @@ export const ChatRoom: React.FC<ChatRoomProps> = ({
         mediaData: dataUrl,
         fileName: file.name,
         fileSize: file.size,
-        mimeType: file.type || 'application/octet-stream',
+        mimeType: resolveMimeTypeForFile(file.name, file.type),
         replyTo: replyTo ?? undefined,
       });
       setReplyTo(null);
@@ -435,15 +437,39 @@ export const ChatRoom: React.FC<ChatRoomProps> = ({
     ? 'Online'
     : 'Offline';
 
+  const handleDownloadDocument = async (msg: ChatMessage) => {
+    if (!msg.mediaData || downloadingMsgId === msg.id) return;
+    const targetName = msg.fileName || 'dokumen-wattappsau';
+    setDownloadingMsgId(msg.id);
+    onToast(`Mengunduh ${targetName}...`);
+    try {
+      const result = await triggerDownload(msg.mediaData, targetName, msg.mimeType);
+      if (result.ok) {
+        onToast(`Unduhan dimulai: ${targetName}`);
+      } else {
+        onToast(result.error || `Gagal mengunduh ${targetName}`);
+      }
+    } catch {
+      onToast(`Gagal mengunduh ${targetName}`);
+    } finally {
+      window.setTimeout(() => {
+        setDownloadingMsgId((prev) => (prev === msg.id ? null : prev));
+      }, 600);
+    }
+  };
+
   return (
     <div className="flex-1 flex flex-col h-full min-w-0 relative overflow-hidden">
       {/* Chat Room Header (WhatsApp Authentic) */}
-      <header className="h-[60px] bg-[#008069] dark:bg-[#202C33] text-white md:bg-[#F0F2F5] md:text-[#111B21] md:dark:bg-[#202C33] md:dark:text-[#E9EDEF] px-2 sm:px-4 flex items-center justify-between gap-2 border-b border-black/5 dark:border-white/5 shrink-0 z-20">
-        <div className="flex items-center gap-2 min-w-0 flex-1">
+      <header
+        className="min-h-[calc(60px+max(36px,env(safe-area-inset-top,0px)))] bg-[#008069] dark:bg-[#202C33] text-white md:bg-[#F0F2F5] md:text-[#111B21] md:dark:bg-[#202C33] md:dark:text-[#E9EDEF] px-2 sm:px-4 pb-1.5 flex items-center justify-between gap-2 border-b border-black/5 dark:border-white/5 shrink-0 relative z-30 pt-safe-header"
+        style={{ paddingTop: 'max(36px, env(safe-area-inset-top, 0px))' }}
+      >
+        <div className="flex items-center gap-2 min-w-0 flex-1 relative z-30">
           <button
             type="button"
             onClick={onBack}
-            className="md:hidden w-10 h-10 rounded-full flex items-center justify-center hover:bg-white/10 shrink-0 cursor-pointer"
+            className="md:hidden relative z-30 pointer-events-auto w-10 h-10 rounded-full flex items-center justify-center hover:bg-white/10 shrink-0 cursor-pointer"
             aria-label="Kembali ke daftar chat"
           >
             <ArrowLeft className="w-5 h-5" />
@@ -495,13 +521,13 @@ export const ChatRoom: React.FC<ChatRoomProps> = ({
         </div>
 
         {/* Right Call & Menu Controls */}
-        <div className="flex items-center gap-0.5 shrink-0">
+        <div className="relative z-30 pointer-events-auto flex items-center gap-0.5 shrink-0">
           {!contact.isGroup && (
             <>
               <button
                 type="button"
                 onClick={() => onStartCall(contact.id, 'video')}
-                className="w-10 h-10 rounded-full flex items-center justify-center hover:bg-black/10 dark:hover:bg-white/10 transition-colors cursor-pointer"
+                className="relative z-30 pointer-events-auto w-10 h-10 rounded-full flex items-center justify-center hover:bg-black/10 dark:hover:bg-white/10 transition-colors cursor-pointer"
                 title="Panggilan Video"
               >
                 <Video className="w-5 h-5" />
@@ -509,7 +535,7 @@ export const ChatRoom: React.FC<ChatRoomProps> = ({
               <button
                 type="button"
                 onClick={() => onStartCall(contact.id, 'audio')}
-                className="w-10 h-10 rounded-full flex items-center justify-center hover:bg-black/10 dark:hover:bg-white/10 transition-colors cursor-pointer"
+                className="relative z-30 pointer-events-auto w-10 h-10 rounded-full flex items-center justify-center hover:bg-black/10 dark:hover:bg-white/10 transition-colors cursor-pointer"
                 title="Panggilan Suara"
               >
                 <Phone className="w-5 h-5" />
@@ -517,11 +543,11 @@ export const ChatRoom: React.FC<ChatRoomProps> = ({
             </>
           )}
 
-          <div className="relative">
+          <div className="relative z-30 pointer-events-auto">
             <button
               type="button"
               onClick={() => setShowHeaderMenu((prev) => !prev)}
-              className="w-10 h-10 rounded-full flex items-center justify-center hover:bg-black/10 dark:hover:bg-white/10 transition-colors cursor-pointer"
+              className="relative z-30 pointer-events-auto w-10 h-10 rounded-full flex items-center justify-center hover:bg-black/10 dark:hover:bg-white/10 transition-colors cursor-pointer"
               aria-label="Menu obrolan"
             >
               <MoreVertical className="w-5 h-5" />
@@ -912,11 +938,19 @@ export const ChatRoom: React.FC<ChatRoomProps> = ({
                     </div>
                     <button
                       type="button"
-                      onClick={() => triggerDownload(msg.mediaData!, msg.fileName || 'dokumen-wattappsau')}
-                      className="w-9 h-9 rounded-full bg-white/80 dark:bg-white/10 hover:bg-white dark:hover:bg-white/20 text-[#008069] dark:text-[#00A884] flex items-center justify-center shrink-0 transition-colors cursor-pointer"
+                      disabled={downloadingMsgId === msg.id}
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        void handleDownloadDocument(msg);
+                      }}
+                      className="w-9 h-9 rounded-full bg-white/80 dark:bg-white/10 hover:bg-white dark:hover:bg-white/20 disabled:opacity-60 text-[#008069] dark:text-[#00A884] flex items-center justify-center shrink-0 transition-colors cursor-pointer"
                       title="Unduh Dokumen"
                     >
-                      <Download className="w-4 h-4" />
+                      {downloadingMsgId === msg.id ? (
+                        <Loader2 className="w-4 h-4 animate-spin" />
+                      ) : (
+                        <Download className="w-4 h-4" />
+                      )}
                     </button>
                   </div>
                 ) : msg.type === 'voice' && msg.mediaData ? (

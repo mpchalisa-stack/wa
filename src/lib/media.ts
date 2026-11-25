@@ -147,17 +147,80 @@ export function estimateDataUrlBytes(dataUrl: string): number {
   return Math.max(0, Math.floor((base64Part.length * 3) / 4) - padding);
 }
 
-export function dataUrlToBlob(dataUrl: string): Blob {
-  const [header, base64] = dataUrl.split(',');
-  const mimeMatch = header.match(/data:([^;]+);base64/i);
-  const mimeType = mimeMatch ? mimeMatch[1] : 'application/octet-stream';
-  const binary = atob(base64 || '');
+const EXTENSION_MIME_MAP: Record<string, string> = {
+  docx: 'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+  doc: 'application/msword',
+  xlsx: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+  xls: 'application/vnd.ms-excel',
+  pptx: 'application/vnd.openxmlformats-officedocument.presentationml.presentation',
+  ppt: 'application/vnd.ms-powerpoint',
+  pdf: 'application/pdf',
+  txt: 'text/plain;charset=utf-8',
+  csv: 'text/csv;charset=utf-8',
+  json: 'application/json',
+  zip: 'application/zip',
+  rar: 'application/vnd.rar',
+  '7z': 'application/x-7z-compressed',
+  png: 'image/png',
+  jpg: 'image/jpeg',
+  jpeg: 'image/jpeg',
+  webp: 'image/webp',
+  gif: 'image/gif',
+  mp4: 'video/mp4',
+  webm: 'audio/webm',
+  mp3: 'audio/mpeg',
+  wav: 'audio/wav',
+  ogg: 'audio/ogg',
+};
+
+export function resolveMimeTypeForFile(fileName?: string, explicitMimeType?: string): string {
+  const cleanExplicit = explicitMimeType?.trim();
+  if (cleanExplicit && cleanExplicit !== 'application/octet-stream') {
+    return cleanExplicit;
+  }
+  const ext = fileName?.split('.').pop()?.toLowerCase().trim() || '';
+  if (ext && EXTENSION_MIME_MAP[ext]) {
+    return EXTENSION_MIME_MAP[ext];
+  }
+  return cleanExplicit || 'application/octet-stream';
+}
+
+function decodeBase64ToBytes(base64Input: string): Uint8Array<ArrayBuffer> {
+  const cleaned = base64Input.replace(/\s+/g, '');
+  const binary = atob(cleaned);
   const len = binary.length;
-  const bytes = new Uint8Array(len);
+  const buffer = new ArrayBuffer(len);
+  const bytes = new Uint8Array(buffer);
   for (let i = 0; i < len; i++) {
     bytes[i] = binary.charCodeAt(i);
   }
-  return new Blob([bytes], { type: mimeType });
+  return bytes;
+}
+
+export function dataUrlToBlob(dataUrl: string, fallbackMimeType?: string): Blob {
+  const commaIdx = dataUrl.indexOf(',');
+  if (commaIdx < 0) {
+    const bytes = decodeBase64ToBytes(dataUrl);
+    return new Blob([bytes], { type: fallbackMimeType || 'application/octet-stream' });
+  }
+
+  const header = dataUrl.slice(0, commaIdx);
+  const payload = dataUrl.slice(commaIdx + 1);
+  const mimeMatch = header.match(/^data:([^;,]+)/i);
+  const parsedMime = mimeMatch?.[1]?.trim();
+  const mimeType =
+    (parsedMime && parsedMime !== 'application/octet-stream' ? parsedMime : '') ||
+    fallbackMimeType ||
+    parsedMime ||
+    'application/octet-stream';
+
+  if (/;base64/i.test(header)) {
+    const bytes = decodeBase64ToBytes(payload);
+    return new Blob([bytes], { type: mimeType });
+  }
+
+  const decodedText = decodeURIComponent(payload);
+  return new Blob([decodedText], { type: mimeType });
 }
 
 export function fileToDataUrl(file: Blob): Promise<string> {
@@ -258,11 +321,92 @@ export function compressImageFile(
   });
 }
 
-export function triggerDownload(dataUrl: string, fileName: string): void {
-  const link = document.createElement('a');
-  link.href = dataUrl;
-  link.download = fileName || 'file-wattappsau';
-  document.body.appendChild(link);
-  link.click();
-  document.body.removeChild(link);
+export async function toDownloadBlob(
+  source: Blob | string,
+  fileName?: string,
+  explicitMimeType?: string
+): Promise<Blob> {
+  const targetMime = resolveMimeTypeForFile(fileName, explicitMimeType);
+
+  if (source instanceof Blob) {
+    if (!source.type || (source.type === 'application/octet-stream' && targetMime !== 'application/octet-stream')) {
+      return new Blob([source], { type: targetMime });
+    }
+    return source;
+  }
+
+  const trimmed = source.trim();
+  if (
+    trimmed.startsWith('blob:') ||
+    trimmed.startsWith('http://') ||
+    trimmed.startsWith('https://')
+  ) {
+    const response = await fetch(trimmed);
+    if (!response.ok) {
+      throw new Error(`HTTP ${response.status}`);
+    }
+    const fetchedBlob = await response.blob();
+    if (
+      !fetchedBlob.type ||
+      (fetchedBlob.type === 'application/octet-stream' && targetMime !== 'application/octet-stream')
+    ) {
+      return new Blob([fetchedBlob], { type: targetMime });
+    }
+    return fetchedBlob;
+  }
+
+  return dataUrlToBlob(trimmed, targetMime);
+}
+
+export async function triggerDownload(
+  source: Blob | string,
+  fileName: string,
+  mimeType?: string
+): Promise<{ ok: boolean; error?: string }> {
+  const safeFileName = (fileName || 'file-wattappsau').trim();
+  const resolvedMime = resolveMimeTypeForFile(safeFileName, mimeType);
+
+  try {
+    const blob = await toDownloadBlob(source, safeFileName, resolvedMime);
+
+    // Jika APK Android WebView menyediakan bridge unduhan native, utamakan bridge tersebut
+    if (typeof window !== 'undefined' && typeof window.AndroidBridge?.downloadFile === 'function') {
+      try {
+        const dataUrl =
+          typeof source === 'string' && source.startsWith('data:')
+            ? source
+            : await fileToDataUrl(blob);
+        const handled = window.AndroidBridge.downloadFile(dataUrl, safeFileName, resolvedMime);
+        if (handled !== false) {
+          return { ok: true };
+        }
+      } catch (bridgeErr) {
+        console.warn('[Download] AndroidBridge.downloadFile fallback ke Blob URL:', bridgeErr);
+      }
+    }
+
+    const objectUrl = URL.createObjectURL(blob);
+    const link = document.createElement('a');
+    link.href = objectUrl;
+    link.download = safeFileName;
+    link.rel = 'noopener noreferrer';
+    link.style.display = 'none';
+    document.body.appendChild(link);
+    link.click();
+
+    window.setTimeout(() => {
+      if (link.parentNode) {
+        link.parentNode.removeChild(link);
+      }
+      URL.revokeObjectURL(objectUrl);
+    }, 5000);
+
+    return { ok: true };
+  } catch (err) {
+    console.error('[Download] Gagal mengunduh file:', err);
+    return {
+      ok: false,
+      error: 'Berkas rusak atau gagal dikonversi untuk diunduh.',
+    };
+  }
 }

@@ -4844,7 +4844,10 @@ export default function App() {
         }`}
       >
         {/* Top Command-Center Header (Navy/Slate + Neon Cyan & Gold Accents in Dark Mode) */}
-        <header className="bg-[#008069] dark:bg-[#0f172a] dark:border-b dark:border-cyan-500/15 text-white shrink-0 pt-safe">
+        <header
+          className="bg-[#008069] dark:bg-[#0f172a] dark:border-b dark:border-cyan-500/15 text-white shrink-0 pt-safe-header"
+          style={{ paddingTop: 'max(36px, env(safe-area-inset-top, 0px))' }}
+        >
           {searchOpen ? (
             <div className="h-[58px] px-3 flex items-center gap-2">
               <button
@@ -4881,9 +4884,6 @@ export default function App() {
                   <span className="flex flex-col items-start text-left min-w-0 leading-none">
                     <span className="text-[16px] font-bold tracking-tight leading-tight">
                       WattappsAU
-                    </span>
-                    <span className="text-[6.5px] font-medium tracking-[0.01em] text-white/80 leading-[1.15] whitespace-normal">
-                      Wireless Air Tactical Application System Angkatan Udara
                     </span>
                   </span>
                 </button>
