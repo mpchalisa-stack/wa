@@ -16,7 +16,7 @@ jobs:
       - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
-          node-version: '22'
+          node-version: '24'
 
       - name: Setup Java 21 (Temurin)
         uses: actions/setup-java@v4
@@ -24,13 +24,12 @@ jobs:
           distribution: 'temurin'
           java-version: '21'
 
-      - name: Install Capacitor & Generate Android Project
+      - name: Install Capacitor & Sync Android Project
         run: |
           mkdir -p www assets
           echo "<h1>WattappsAU Loading...</h1>" > www/index.html
           npm install --legacy-peer-deps
           npm install -D @capacitor/assets --legacy-peer-deps
-          npx cap init "WattappsAU" "mil.tniau.diskomlekau.wattappsau" --web-dir www
           node -e '
             const fs = require("fs");
             const cfg = {
@@ -49,7 +48,11 @@ jobs:
             };
             fs.writeFileSync("capacitor.config.json", JSON.stringify(cfg, null, 2));
           '
-          npx cap add android
+          if [ ! -d "android" ]; then
+            npx cap add android
+          else
+            npx cap sync android || true
+          fi
           if [ -f "logo.png" ]; then
             cp logo.png assets/icon.png
             npx capacitor-assets generate --android || true
