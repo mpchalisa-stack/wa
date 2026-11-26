@@ -16,6 +16,7 @@ import {
 import { CallType } from '../types';
 import { formatDuration, formatSixDigitId } from '../lib/media';
 import { stopAllRingtones } from '../lib/audio';
+import { dismissAndroidBridgeIncomingCall } from '../lib/fcmPush';
 import { activateActiveMediaSession, releaseActiveMediaSession } from '../lib/standby';
 import { Avatar } from './Avatar';
 import { AppLogo } from './AppLogo';
@@ -244,9 +245,10 @@ export const CallOverlay: React.FC<CallOverlayProps> = ({
   const showRemoteVideo = isVideo && call.phase === 'connected' && Boolean(call.remoteStream);
   const hasContactPhoto = Boolean(call.peerAvatar && !avatarImgFailed);
 
-  // Hentikan total seluruh suara dering & animasi getar SEKETIKA saat tombol Jawab/Tolak/Akhiri ditekan
+  // Hentikan total seluruh suara dering, tutup notifikasi native Android & hentikan animasi getar SEKETIKA saat tombol Angkat/Tolak/Akhiri ditekan
   const handleAcceptClick = () => {
     stopAllRingtones();
+    dismissAndroidBridgeIncomingCall();
     setShakeStopped(true);
     setMinimizedBanner(false);
     onAccept();
@@ -254,6 +256,7 @@ export const CallOverlay: React.FC<CallOverlayProps> = ({
 
   const handleRejectClick = () => {
     stopAllRingtones();
+    dismissAndroidBridgeIncomingCall();
     setShakeStopped(true);
     setMinimizedBanner(false);
     onReject();
@@ -261,6 +264,7 @@ export const CallOverlay: React.FC<CallOverlayProps> = ({
 
   const handleEndClick = () => {
     stopAllRingtones();
+    dismissAndroidBridgeIncomingCall();
     onEnd();
   };
 
@@ -345,7 +349,7 @@ export const CallOverlay: React.FC<CallOverlayProps> = ({
             <button
               type="button"
               onClick={handleRejectClick}
-              className="w-10 h-10 rounded-full bg-red-600 hover:bg-red-500 text-white shadow-lg flex items-center justify-center active:scale-95 transition-transform cursor-pointer"
+              className="w-10 h-10 rounded-full bg-red-600 hover:bg-red-500 text-white shadow-lg flex items-center justify-center active:scale-95 transition-transform cursor-pointer pointer-events-auto touch-manipulation"
               aria-label="Tolak panggilan"
               title="Tolak"
             >
@@ -354,11 +358,11 @@ export const CallOverlay: React.FC<CallOverlayProps> = ({
             <button
               type="button"
               onClick={handleAcceptClick}
-              className={`w-10 h-10 rounded-full bg-[#00a884] hover:bg-[#00c298] text-white shadow-lg flex items-center justify-center active:scale-95 transition-transform cursor-pointer ${
+              className={`w-10 h-10 rounded-full bg-[#00a884] hover:bg-[#00c298] text-white shadow-lg flex items-center justify-center active:scale-95 transition-transform cursor-pointer pointer-events-auto touch-manipulation ${
                 isIncomingRinging ? 'animate-bounce' : ''
               }`}
-              aria-label="Jawab panggilan"
-              title="Jawab"
+              aria-label="Angkat panggilan"
+              title="Angkat"
             >
               {isVideo ? <Video className="w-4 h-4" /> : <Phone className="w-4 h-4" />}
             </button>
@@ -626,16 +630,16 @@ export const CallOverlay: React.FC<CallOverlayProps> = ({
 
       {/* Bottom Controls */}
       <div
-        className="relative z-20 px-8"
+        className="relative z-30 pointer-events-auto px-8"
         style={{ paddingBottom: 'max(40px, calc(env(safe-area-inset-bottom, 0px) + 20px))' }}
       >
         {call.phase === 'incoming' ? (
-          <div className="max-w-xs mx-auto flex items-center justify-between">
+          <div className="max-w-xs mx-auto flex items-center justify-between relative z-30 pointer-events-auto">
             <div className="flex flex-col items-center gap-2.5">
               <button
                 type="button"
                 onClick={handleRejectClick}
-                className="w-16 h-16 rounded-full bg-red-600 hover:bg-red-500 text-white shadow-lg flex items-center justify-center active:scale-95 transition-transform cursor-pointer"
+                className="w-16 h-16 rounded-full bg-red-600 hover:bg-red-500 text-white shadow-lg flex items-center justify-center active:scale-95 transition-transform cursor-pointer pointer-events-auto touch-manipulation"
                 aria-label="Tolak panggilan"
               >
                 <PhoneOff className="w-7 h-7" />
@@ -647,14 +651,14 @@ export const CallOverlay: React.FC<CallOverlayProps> = ({
               <button
                 type="button"
                 onClick={handleAcceptClick}
-                className={`w-16 h-16 rounded-full bg-[#00a884] hover:bg-[#00c298] text-white shadow-lg shadow-[#00a884]/40 flex items-center justify-center active:scale-95 transition-transform cursor-pointer ${
+                className={`w-16 h-16 rounded-full bg-[#00a884] hover:bg-[#00c298] text-white shadow-lg shadow-[#00a884]/40 flex items-center justify-center active:scale-95 transition-transform cursor-pointer pointer-events-auto touch-manipulation ${
                   isIncomingRinging ? 'animate-bounce' : ''
                 }`}
-                aria-label="Jawab panggilan"
+                aria-label="Angkat panggilan"
               >
                 {isVideo ? <Video className="w-7 h-7" /> : <Phone className="w-7 h-7" />}
               </button>
-              <span className="text-sm font-semibold text-emerald-300">Jawab</span>
+              <span className="text-sm font-semibold text-emerald-300">Angkat</span>
             </div>
           </div>
         ) : (

@@ -171,9 +171,123 @@ interface AwaitingMediaCallAnswer {
   timeoutId: number;
 }
 
-const PENDING_CALL_TTL_MS = 45000;
+interface PersistedIncomingCall {
+  callId: string;
+  callerId: string;
+  callerName: string;
+  callerAvatar: string;
+  callType: CallType;
+  isVideo: boolean;
+  ringing: boolean;
+  timestamp: number;
+}
+
+const WATTAPPS_ACTIVE_INCOMING_CALL_KEY = 'wattapps_active_incoming_call';
+const PENDING_CALL_TTL_MS = 60000;
 const APP_WAKE_SYNC_COOLDOWN_MS = 3000;
 const BATTERY_STANDBY_IDLE_MS = 5 * 60 * 1000; // 5 menit (300.000 ms)
+
+function clearPersistedIncomingCallState(): void {
+  if (typeof window === 'undefined') return;
+  try {
+    window.sessionStorage?.removeItem(WATTAPPS_ACTIVE_INCOMING_CALL_KEY);
+  } catch {
+    // ignore storage errors
+  }
+  try {
+    window.localStorage?.removeItem(WATTAPPS_ACTIVE_INCOMING_CALL_KEY);
+  } catch {
+    // ignore storage errors
+  }
+}
+
+function persistIncomingCallState(data: PersistedIncomingCall): void {
+  if (typeof window === 'undefined') return;
+  const serialized = JSON.stringify(data);
+  try {
+    window.sessionStorage?.setItem(WATTAPPS_ACTIVE_INCOMING_CALL_KEY, serialized);
+  } catch {
+    // ignore storage errors
+  }
+  try {
+    window.localStorage?.setItem(WATTAPPS_ACTIVE_INCOMING_CALL_KEY, serialized);
+  } catch {
+    // ignore storage errors
+  }
+}
+
+function readPersistedIncomingCallState(): PersistedIncomingCall | null {
+  if (typeof window === 'undefined') return null;
+  const parseRaw = (raw: string | null): PersistedIncomingCall | null => {
+    if (!raw) return null;
+    try {
+      const parsed = JSON.parse(raw) as Partial<PersistedIncomingCall>;
+      if (
+        !parsed ||
+        parsed.ringing !== true ||
+        typeof parsed.callId !== 'string' ||
+        !parsed.callId ||
+        typeof parsed.callerId !== 'string' ||
+        !parsed.callerId ||
+        typeof parsed.timestamp !== 'number'
+      ) {
+        return null;
+      }
+      if (Date.now() - parsed.timestamp > PENDING_CALL_TTL_MS) {
+        return null;
+      }
+      const isVideo = Boolean(parsed.isVideo || parsed.callType === 'video');
+      return {
+        callId: parsed.callId,
+        callerId: parsed.callerId,
+        callerName:
+          typeof parsed.callerName === 'string' && parsed.callerName.trim()
+            ? parsed.callerName.trim()
+            : 'Panggilan Masuk',
+        callerAvatar: typeof parsed.callerAvatar === 'string' ? parsed.callerAvatar : '',
+        callType: isVideo ? 'video' : 'audio',
+        isVideo,
+        ringing: true,
+        timestamp: parsed.timestamp,
+      };
+    } catch {
+      return null;
+    }
+  };
+
+  let sessionRaw: string | null = null;
+  let localRaw: string | null = null;
+  try {
+    sessionRaw = window.sessionStorage?.getItem(WATTAPPS_ACTIVE_INCOMING_CALL_KEY) ?? null;
+  } catch {
+    sessionRaw = null;
+  }
+  try {
+    localRaw = window.localStorage?.getItem(WATTAPPS_ACTIVE_INCOMING_CALL_KEY) ?? null;
+  } catch {
+    localRaw = null;
+  }
+
+  const fromSession = parseRaw(sessionRaw);
+  const fromLocal = parseRaw(localRaw);
+  const resolved =
+    fromSession && fromLocal
+      ? fromSession.timestamp >= fromLocal.timestamp
+        ? fromSession
+        : fromLocal
+      : fromSession || fromLocal;
+
+  if (!resolved) {
+    if (sessionRaw || localRaw) {
+      clearPersistedIncomingCallState();
+    }
+    return null;
+  }
+
+  // Pastikan sessionStorage & localStorage sinkron selama masih berdering
+  persistIncomingCallState(resolved);
+  return resolved;
+}
 
 let isHistoryTrapped = false;
 
@@ -248,7 +362,22 @@ export default function App() {
 
   // Call UI & persistent Incoming Call state
   const [activeCallUI, setActiveCallUI] = useState<ActiveCallUIState | null>(null);
-  const [incomingCall, setIncomingCall] = useState<IncomingCallState | null>(null);
+  const [incomingCall, setIncomingCall] = useState<IncomingCallState | null>(() => {
+    const saved = readPersistedIncomingCallState();
+    if (!saved) return null;
+    return {
+      call: null,
+      callId: saved.callId,
+      callerId: saved.callerId,
+      callerName: saved.callerName,
+      callerAvatar: saved.callerAvatar,
+      isVideo: saved.isVideo,
+      timestamp: saved.timestamp,
+    };
+  });
+  const [isIncomingCallOpen, setIsIncomingCallOpen] = useState<boolean>(() =>
+    Boolean(readPersistedIncomingCallState())
+  );
   const [incomingCallModalForceTick, setIncomingCallModalForceTick] = useState(0);
   // State internal mode standby hemat baterai (tanpa elemen UI)
   const [isBatteryStandby, setIsBatteryStandby] = useState(false);
@@ -266,8 +395,19 @@ export default function App() {
   const pendingLastAttemptRef = useRef<Map<string, number>>(new Map());
   const activeChatIdRef = useRef<string | null>(activeChatId);
   const callRuntimeRef = useRef<ActiveCallRuntime | null>(null);
-  const pendingCallRef = useRef<PendingIncomingCall | null>(null);
-  const incomingCallRef = useRef<IncomingCallState | null>(null);
+  const pendingCallRef = useRef<PendingIncomingCall | null>(
+    incomingCall
+      ? {
+          callId: incomingCall.callId,
+          peerId: incomingCall.callerId,
+          peerName: incomingCall.callerName,
+          peerAvatar: incomingCall.callerAvatar,
+          callType: incomingCall.isVideo ? 'video' : 'audio',
+          receivedAt: incomingCall.timestamp,
+        }
+      : null
+  );
+  const incomingCallRef = useRef<IncomingCallState | null>(incomingCall);
   const awaitingMediaCallAnswerRef = useRef<AwaitingMediaCallAnswer | null>(null);
   const lastAppWakeSyncRef = useRef<number>(0);
   const callTimerRef = useRef<number | null>(null);
@@ -667,7 +807,7 @@ export default function App() {
     showResetConfirm,
     cameraPurpose,
     lightboxMedia,
-    hasCallModal: Boolean(activeCallUI || incomingCall),
+    hasCallModal: Boolean(activeCallUI || incomingCall || isIncomingCallOpen),
   });
 
   useEffect(() => {
@@ -704,7 +844,7 @@ export default function App() {
       showResetConfirm,
       cameraPurpose,
       lightboxMedia,
-      hasCallModal: Boolean(activeCallUI || incomingCall),
+      hasCallModal: Boolean(activeCallUI || incomingCall || isIncomingCallOpen),
     };
   }, [
     activeTab,
@@ -720,6 +860,7 @@ export default function App() {
     lightboxMedia,
     activeCallUI,
     incomingCall,
+    isIncomingCallOpen,
   ]);
 
   // Sync Tailwind dark class & browser theme-color
@@ -1131,6 +1272,22 @@ export default function App() {
   const setPersistentIncomingCall = useCallback((next: IncomingCallState | null) => {
     incomingCallRef.current = next;
     setIncomingCall(next);
+    if (next) {
+      setIsIncomingCallOpen(true);
+      persistIncomingCallState({
+        callId: next.callId,
+        callerId: next.callerId,
+        callerName: next.callerName,
+        callerAvatar: next.callerAvatar,
+        callType: next.isVideo ? 'video' : 'audio',
+        isVideo: next.isVideo,
+        ringing: true,
+        timestamp: next.timestamp || Date.now(),
+      });
+    } else {
+      setIsIncomingCallOpen(false);
+      clearPersistedIncomingCallState();
+    }
   }, []);
 
   const isIncomingCallStillActive = useCallback((ic: IncomingCallState | null): boolean => {
@@ -1172,6 +1329,8 @@ export default function App() {
 
       const currentIncoming = incomingCallRef.current;
       setPersistentIncomingCall(null);
+      clearPersistedIncomingCallState();
+      setIsIncomingCallOpen(false);
 
       const rt = callRuntimeRef.current;
       callRuntimeRef.current = null;
@@ -1194,7 +1353,7 @@ export default function App() {
             // ignore
           }
         }
-        if (pendingCall && statusOverride) {
+        if (pendingCall && statusOverride && pendingCall.peerId !== 'android-fcm-call') {
           const record: CallRecord = {
             id: pendingCall.callId,
             peerId: pendingCall.peerId,
@@ -1243,10 +1402,15 @@ export default function App() {
       void dbSaveCall(record);
       appendCallLogToChat(record);
     },
-    [appendCallLogToChat, setPersistentIncomingCall, stopAllCallRingtones]
+    [
+      appendCallLogToChat,
+      clearAndroidIncomingCallNotice,
+      setPersistentIncomingCall,
+      stopAllCallRingtones,
+    ]
   );
 
-  // Tampilkan paksa Modal Layar Penuh Panggilan Masuk (saat notifikasi diketuk / kembali dari latar belakang)
+  // Tampilkan paksa Modal Layar Penuh Panggilan Masuk (saat notifikasi diketuk / kembali dari latar belakang / layar HP menyala)
   const forceShowIncomingCallModal = useCallback(
     (override?: {
       callerId?: string;
@@ -1273,7 +1437,7 @@ export default function App() {
       const activeIncoming = incomingCallRef.current;
       if (activeIncoming && isIncomingCallStillActive(activeIncoming)) {
         dismissBlockingOverlays();
-        setIncomingCall({ ...activeIncoming });
+        setPersistentIncomingCall({ ...activeIncoming });
         const callType: CallType = activeIncoming.isVideo ? 'video' : 'audio';
         setActiveCallUI({
           callId: activeIncoming.callId,
@@ -1289,6 +1453,7 @@ export default function App() {
           localStream: null,
           remoteStream: null,
         });
+        setIsIncomingCallOpen(true);
         setIncomingCallModalForceTick((n) => n + 1);
         return;
       }
@@ -1297,24 +1462,103 @@ export default function App() {
         setPersistentIncomingCall(null);
       }
 
+      const activePending = pendingCallRef.current;
+      if (activePending && Date.now() - activePending.receivedAt <= PENDING_CALL_TTL_MS) {
+        dismissBlockingOverlays();
+        setPersistentIncomingCall({
+          call: null,
+          callId: activePending.callId,
+          callerId: activePending.peerId,
+          callerName: activePending.peerName,
+          callerAvatar: activePending.peerAvatar,
+          isVideo: activePending.callType === 'video',
+          timestamp: activePending.receivedAt,
+        });
+        setActiveCallUI({
+          callId: activePending.callId,
+          peerId: activePending.peerId,
+          peerName: activePending.peerName,
+          peerAvatar: activePending.peerAvatar,
+          callType: activePending.callType,
+          phase: 'incoming',
+          duration: 0,
+          isMuted: false,
+          isCameraOff: activePending.callType !== 'video',
+          isSpeakerOn: true,
+          localStream: null,
+          remoteStream: null,
+        });
+        setIsIncomingCallOpen(true);
+        setIncomingCallModalForceTick((n) => n + 1);
+        return;
+      }
+
+      const persisted = readPersistedIncomingCallState();
+      if (persisted) {
+        dismissBlockingOverlays();
+        const pending: PendingIncomingCall = {
+          callId: persisted.callId,
+          peerId: persisted.callerId,
+          peerName: persisted.callerName,
+          peerAvatar: persisted.callerAvatar,
+          callType: persisted.callType,
+          receivedAt: persisted.timestamp,
+        };
+        pendingCallRef.current = pending;
+        setPersistentIncomingCall({
+          call: null,
+          callId: persisted.callId,
+          callerId: persisted.callerId,
+          callerName: persisted.callerName,
+          callerAvatar: persisted.callerAvatar,
+          isVideo: persisted.isVideo,
+          timestamp: persisted.timestamp,
+        });
+        setActiveCallUI({
+          callId: persisted.callId,
+          peerId: persisted.callerId,
+          peerName: persisted.callerName,
+          peerAvatar: persisted.callerAvatar,
+          callType: persisted.callType,
+          phase: 'incoming',
+          duration: 0,
+          isMuted: false,
+          isCameraOff: !persisted.isVideo,
+          isSpeakerOn: true,
+          localStream: null,
+          remoteStream: null,
+        });
+        setIsIncomingCallOpen(true);
+        setIncomingCallModalForceTick((n) => n + 1);
+        return;
+      }
+
       if (override?.callerId) {
         const cleanId = fromFullPeerId(override.callerId.trim());
         if (!cleanId) return;
-        const existingContact = contactsRef.current.find((c) => c.id === cleanId);
-        const callerName = getTrustedPeerName(cleanId, override.callerName);
+        const isPlaceholderCaller = cleanId === 'android-fcm-call';
+        const existingContact = isPlaceholderCaller
+          ? undefined
+          : contactsRef.current.find((c) => c.id === cleanId);
+        const callerName = isPlaceholderCaller
+          ? override.callerName?.trim() || 'Panggilan Masuk'
+          : getTrustedPeerName(cleanId, override.callerName);
         const callerAvatar = existingContact?.avatar || '';
         const isVideo = Boolean(override.isVideo ?? override.callType === 'video');
         const callType: CallType = isVideo ? 'video' : 'audio';
         const callId = override.callId || generateUid('call');
-        void resolvePeerIdentity(cleanId, override.callerName, true);
+        if (!isPlaceholderCaller) {
+          void resolvePeerIdentity(cleanId, override.callerName, true);
+        }
 
+        const now = Date.now();
         const pending: PendingIncomingCall = {
           callId,
           peerId: cleanId,
           peerName: callerName,
           peerAvatar: callerAvatar,
           callType,
-          receivedAt: Date.now(),
+          receivedAt: now,
         };
         pendingCallRef.current = pending;
         setPersistentIncomingCall({
@@ -1324,7 +1568,7 @@ export default function App() {
           callerName,
           callerAvatar,
           isVideo,
-          timestamp: Date.now(),
+          timestamp: now,
         });
 
         dismissBlockingOverlays();
@@ -1342,10 +1586,17 @@ export default function App() {
           localStream: null,
           remoteStream: null,
         });
+        setIsIncomingCallOpen(true);
         setIncomingCallModalForceTick((n) => n + 1);
       }
     },
-    [getTrustedPeerName, isIncomingCallStillActive, resolvePeerIdentity, setPersistentIncomingCall]
+    [
+      blurActiveInputElement,
+      getTrustedPeerName,
+      isIncomingCallStillActive,
+      resolvePeerIdentity,
+      setPersistentIncomingCall,
+    ]
   );
 
   // Tampilkan pop-up panggilan masuk untuk pendingCall (misal saat kembali dari latar belakang / klik notifikasi)
@@ -1356,6 +1607,8 @@ export default function App() {
         if (pendingCallRef.current?.callId === pending.callId) {
           pendingCallRef.current = null;
         }
+        clearPersistedIncomingCallState();
+        setIsIncomingCallOpen(false);
         return;
       }
 
@@ -1952,18 +2205,31 @@ export default function App() {
         case 'CALL_SIGNAL': {
           const rt = callRuntimeRef.current;
           const pending = pendingCallRef.current;
+          const ic = incomingCallRef.current;
+          const matchesPending = Boolean(
+            pending &&
+              (pending.peerId === fromId ||
+                pending.callId === packet.callId ||
+                pending.peerId === 'android-fcm-call')
+          );
+          const matchesIncoming = Boolean(
+            ic &&
+              (ic.callerId === fromId ||
+                ic.callId === packet.callId ||
+                ic.callerId === 'android-fcm-call')
+          );
           if (packet.action === 'reject') {
             if (rt && rt.peerId === fromId) {
               showToast(`${rt.peerName} menolak panggilan`);
               finalizeCall('rejected');
-            } else if (pending && pending.peerId === fromId) {
+            } else if (matchesPending || matchesIncoming) {
               finalizeCall('rejected');
             }
           } else if (packet.action === 'end') {
             if (rt && rt.peerId === fromId) {
               showToast('Panggilan berakhir');
               finalizeCall();
-            } else if (pending && pending.peerId === fromId) {
+            } else if (matchesPending || matchesIncoming) {
               finalizeCall('missed');
             }
           } else if (packet.action === 'busy' && rt && rt.peerId === fromId) {
@@ -2066,7 +2332,10 @@ export default function App() {
 
       // Jika pengguna sudah menekan "Angkat" pada pop-up pendingCall saat kembali dari latar belakang, langsung jawab!
       const awaitingAnswer = awaitingMediaCallAnswerRef.current;
-      if (awaitingAnswer && awaitingAnswer.peerId === cleanId) {
+      if (
+        awaitingAnswer &&
+        (awaitingAnswer.peerId === cleanId || awaitingAnswer.peerId === 'android-fcm-call')
+      ) {
         stopAllCallRingtones();
         clearAndroidIncomingCallNotice();
         dismissIncomingCallNotification(cleanId);
@@ -2898,7 +3167,7 @@ export default function App() {
   // Setelah tepat 5 menit (300.000 ms) tanpa aktivitas & tidak menelepon/berdering:
   // lepaskan wakeLock, hentikan audio latar & polling berat, pertahankan listener Firestore/ntfy + FCM device_tokens,
   // lalu panggil window.AndroidBridge?.enterBatteryStandby?.().
-  const isInCallOrRinging = Boolean(activeCallUI || incomingCall);
+  const isInCallOrRinging = Boolean(activeCallUI || incomingCall || isIncomingCallOpen);
 
   useEffect(() => {
     if (!profile?.id || isExited) {
@@ -3229,10 +3498,13 @@ export default function App() {
   );
 
   // Dengarkan visibilitychange, online, pageshow & window.focus untuk auto-reconnect PeerJS/WebRTC
+  // dan paksa munculkan layar panggilan masuk bila masih berdering saat layar HP dinyalakan
   useEffect(() => {
     if (!profile || isExited) return;
 
     const checkIncomingCallOnResume = () => {
+      if (callRuntimeRef.current?.connectedAt) return;
+
       try {
         const params = new URLSearchParams(window.location.search);
         const incomingId = params.get('incomingCall')?.trim();
@@ -3255,9 +3527,54 @@ export default function App() {
       }
 
       if (incomingCallRef.current && isIncomingCallStillActive(incomingCallRef.current)) {
+        setIsIncomingCallOpen(true);
         forceShowIncomingCallModal();
+        return;
+      }
+
+      if (
+        pendingCallRef.current &&
+        Date.now() - pendingCallRef.current.receivedAt <= PENDING_CALL_TTL_MS
+      ) {
+        setIsIncomingCallOpen(true);
+        forceShowIncomingCallModal();
+        return;
+      }
+
+      const persisted = readPersistedIncomingCallState();
+      if (persisted) {
+        const pending: PendingIncomingCall = {
+          callId: persisted.callId,
+          peerId: persisted.callerId,
+          peerName: persisted.callerName,
+          peerAvatar: persisted.callerAvatar,
+          callType: persisted.callType,
+          receivedAt: persisted.timestamp,
+        };
+        pendingCallRef.current = pending;
+        setPersistentIncomingCall({
+          call: null,
+          callId: persisted.callId,
+          callerId: persisted.callerId,
+          callerName: persisted.callerName,
+          callerAvatar: persisted.callerAvatar,
+          isVideo: persisted.isVideo,
+          timestamp: persisted.timestamp,
+        });
+        setIsIncomingCallOpen(true);
+        forceShowIncomingCallModal();
+        if (
+          persisted.callerId &&
+          persisted.callerId !== 'android-fcm-call' &&
+          !peerManagerRef.current?.isPeerOnline(persisted.callerId)
+        ) {
+          peerManagerRef.current?.ensureConnection(persisted.callerId, true);
+        }
       }
     };
+
+    // Periksa seketika saat APK/halaman pertama kali dimuat dari layar mati
+    checkIncomingCallOnResume();
 
     const handleVisibilityChange = () => {
       if (document.visibilityState === 'visible') {
@@ -3300,6 +3617,7 @@ export default function App() {
     wakeAndSyncPeer,
     forceShowIncomingCallModal,
     isIncomingCallStillActive,
+    setPersistentIncomingCall,
   ]);
 
   // Cegah tombol Back sistem Android (tombol segitiga) menutup aplikasi & mematikan Mode Siaga
@@ -3623,14 +3941,101 @@ export default function App() {
     };
   }, [applyNotificationTarget, forceShowIncomingCallModal, wakeAndSyncPeer]);
 
-  // Dengarkan event native Android WebView: android-answer-call & android-decline-call
+  // Dengarkan event native Android WebView: android-incoming-call, android-answer-call & android-decline-call
   useEffect(() => {
     if (typeof window === 'undefined' || !profile || isExited) return;
+
+    const onAndroidIncomingCall = (event: Event) => {
+      if (callRuntimeRef.current?.connectedAt) return;
+      const customEvent = event as CustomEvent<{ caller?: string; type?: string }>;
+      const rawCaller = (customEvent?.detail?.caller || '').trim();
+      const rawType = String(customEvent?.detail?.type || '').toLowerCase();
+      const isVideo = rawType === 'video';
+      const callType: CallType = isVideo ? 'video' : 'audio';
+
+      const existingIncoming =
+        incomingCallRef.current && isIncomingCallStillActive(incomingCallRef.current)
+          ? incomingCallRef.current
+          : null;
+      const existingPending =
+        pendingCallRef.current && Date.now() - pendingCallRef.current.receivedAt <= PENDING_CALL_TTL_MS
+          ? pendingCallRef.current
+          : null;
+      const savedPersisted = readPersistedIncomingCallState();
+
+      if (existingIncoming || existingPending || savedPersisted) {
+        if (existingIncoming && existingIncoming.callerId === 'android-fcm-call' && rawCaller) {
+          setPersistentIncomingCall({
+            ...existingIncoming,
+            callerName: rawCaller,
+            isVideo: isVideo || existingIncoming.isVideo,
+          });
+        }
+        setIsIncomingCallOpen(true);
+        forceShowIncomingCallModal();
+        setIncomingCallModalForceTick((n) => n + 1);
+        void wakeAndSyncPeer(true);
+        return;
+      }
+
+      const matchedContact = rawCaller
+        ? contactsRef.current.find(
+            (c) =>
+              !c.isGroup &&
+              (c.name.trim().toLowerCase() === rawCaller.toLowerCase() ||
+                c.id === fromFullPeerId(rawCaller))
+          )
+        : undefined;
+
+      const resolvedCallerId = matchedContact?.id || 'android-fcm-call';
+      const resolvedCallerName = matchedContact?.name || rawCaller || 'Panggilan Masuk';
+      const resolvedCallerAvatar = matchedContact?.avatar || '';
+      const callId = `android-incoming-${Date.now()}`;
+
+      pauseKeepAliveForCall();
+      startIncomingRingtone();
+
+      const pending: PendingIncomingCall = {
+        callId,
+        peerId: resolvedCallerId,
+        peerName: resolvedCallerName,
+        peerAvatar: resolvedCallerAvatar,
+        callType,
+        receivedAt: Date.now(),
+      };
+      pendingCallRef.current = pending;
+      presentPendingCallModal(pending);
+      setIsIncomingCallOpen(true);
+
+      if (wakeRingtoneTimerRef.current !== null) {
+        window.clearTimeout(wakeRingtoneTimerRef.current);
+      }
+      wakeRingtoneTimerRef.current = window.setTimeout(() => {
+        wakeRingtoneTimerRef.current = null;
+        if (!callRuntimeRef.current && pendingCallRef.current?.callId === callId) {
+          finalizeCall('missed');
+        }
+      }, 30000);
+
+      void wakeAndSyncPeer(true);
+    };
 
     const onAndroidAnswerCall = () => {
       stopAllCallRingtones();
       clearAndroidIncomingCallNotice();
       dismissIncomingCallNotification();
+
+      const persisted = readPersistedIncomingCallState();
+      if (persisted && !incomingCallRef.current && !pendingCallRef.current) {
+        pendingCallRef.current = {
+          callId: persisted.callId,
+          peerId: persisted.callerId,
+          peerName: persisted.callerName,
+          peerAvatar: persisted.callerAvatar,
+          callType: persisted.callType,
+          receivedAt: persisted.timestamp,
+        };
+      }
 
       const hasIncoming = Boolean(
         (callRuntimeRef.current &&
@@ -3658,25 +4063,39 @@ export default function App() {
       clearAndroidIncomingCallNotice();
       dismissIncomingCallNotification();
 
+      const persisted = readPersistedIncomingCallState();
       const hasAnyCall = Boolean(
-        callRuntimeRef.current || incomingCallRef.current || pendingCallRef.current
+        callRuntimeRef.current || incomingCallRef.current || pendingCallRef.current || persisted
       );
 
       if (hasAnyCall) {
         pendingAndroidCallActionRef.current = null;
-        handleRejectCallRef.current();
+        handleRejectCallRef.current(
+          persisted
+            ? {
+                callerId: persisted.callerId,
+                callerName: persisted.callerName,
+                callId: persisted.callId,
+                callType: persisted.callType,
+              }
+            : undefined
+        );
       } else {
         pendingAndroidCallActionRef.current = {
           action: 'decline',
           timestamp: Date.now(),
         };
+        clearPersistedIncomingCallState();
+        setIsIncomingCallOpen(false);
         void wakeAndSyncPeer(true);
       }
     };
 
+    window.addEventListener('android-incoming-call', onAndroidIncomingCall);
     window.addEventListener('android-answer-call', onAndroidAnswerCall);
     window.addEventListener('android-decline-call', onAndroidDeclineCall);
     return () => {
+      window.removeEventListener('android-incoming-call', onAndroidIncomingCall);
       window.removeEventListener('android-answer-call', onAndroidAnswerCall);
       window.removeEventListener('android-decline-call', onAndroidDeclineCall);
     };
@@ -3686,6 +4105,10 @@ export default function App() {
     stopAllCallRingtones,
     clearAndroidIncomingCallNotice,
     forceShowIncomingCallModal,
+    presentPendingCallModal,
+    isIncomingCallStillActive,
+    setPersistentIncomingCall,
+    finalizeCall,
     wakeAndSyncPeer,
   ]);
 
@@ -4372,12 +4795,24 @@ export default function App() {
     }, 30000);
   };
 
-  // Accept Incoming Call (termasuk pendingCall / incomingCallRef yang stabil terhadap re-render React)
+  // Accept Incoming Call (termasuk pendingCall / incomingCallRef / persisted storage yang stabil terhadap re-render React)
   const handleAcceptCall = async (isAutoAccept = false) => {
-    // BARIS PERTAMA: matikan total seluruh suara dering secara sinkron seketika tombol Jawab ditekan
+    // BARIS PERTAMA: matikan total seluruh suara dering secara sinkron seketika tombol Angkat ditekan
     stopAllCallRingtones();
     clearAndroidIncomingCallNotice();
     try {
+      const persistedOnClick = readPersistedIncomingCallState();
+      if (persistedOnClick && !pendingCallRef.current && !incomingCallRef.current) {
+        pendingCallRef.current = {
+          callId: persistedOnClick.callId,
+          peerId: persistedOnClick.callerId,
+          peerName: persistedOnClick.callerName,
+          peerAvatar: persistedOnClick.callerAvatar,
+          callType: persistedOnClick.callType,
+          receivedAt: persistedOnClick.timestamp,
+        };
+      }
+
       const initialRt = callRuntimeRef.current;
       const initialIncoming = incomingCallRef.current;
       const initialPending = pendingCallRef.current;
@@ -4396,7 +4831,7 @@ export default function App() {
       } catch (mediaErr) {
         console.error('[WattappsAU Call] Gagal mengakses mikrofon/kamera saat Angkat:', mediaErr);
         if (isAutoAccept) {
-          showToast('Ketuk tombol hijau Jawab untuk menghubungkan audio/video.');
+          showToast('Ketuk tombol hijau Angkat untuk menghubungkan audio/video.');
         } else {
           showToast('Gagal mengakses mikrofon. Periksa izin aplikasi.');
           handleRejectCall();
@@ -4515,7 +4950,10 @@ export default function App() {
           }
         }
 
+        pendingCallRef.current = null;
         setPersistentIncomingCall(null);
+        clearPersistedIncomingCallState();
+        setIsIncomingCallOpen(false);
         setActiveCallUI({
           callId: resolvedCallId,
           peerId: resolvedPeerId,
@@ -4544,10 +4982,13 @@ export default function App() {
         return;
       }
 
-      // Kasus 2: Pengguna mengetuk Jawab pada pop-up pendingCall/notifikasi sebelum MediaConnection baru tiba dari penelepon
+      // Kasus 2: Pengguna mengetuk Angkat pada pop-up pendingCall/notifikasi sebelum MediaConnection baru tiba dari penelepon
       const fallbackPeerId = latestPending?.peerId || latestIncoming?.callerId;
       const fallbackCallId = latestPending?.callId || latestIncoming?.callId;
-      const fallbackPeerName = fallbackPeerId
+      const isPlaceholderCaller = fallbackPeerId === 'android-fcm-call';
+      const fallbackPeerName = isPlaceholderCaller
+        ? latestPending?.peerName || latestIncoming?.callerName || 'Panggilan Masuk'
+        : fallbackPeerId
         ? getTrustedPeerName(fallbackPeerId, latestPending?.peerName || latestIncoming?.callerName)
         : LOADING_IDENTITY_LABEL;
       const fallbackPeerAvatar = latestPending?.peerAvatar || latestIncoming?.callerAvatar || '';
@@ -4580,22 +5021,26 @@ export default function App() {
           timeoutId,
         };
 
-        // Kirim sinyal accept segera agar penelepon mengirim MediaConnection segar
-        peerManagerRef.current?.ensureConnection(fallbackPeerId, true);
-        peerManagerRef.current?.sendPacket(fallbackPeerId, {
-          kind: 'CALL_SIGNAL',
-          action: 'accept',
-          callId: fallbackCallId,
-          callType: resolvedCallType,
-          fromId: me.id,
-          fromName: me.name,
-          fromAvatar: me.avatar,
-        });
+        // Kirim sinyal accept segera agar penelepon mengirim MediaConnection segar (atau bangunkan koneksi PeerJS untuk placeholder FCM)
+        if (!isPlaceholderCaller) {
+          peerManagerRef.current?.ensureConnection(fallbackPeerId, true);
+          peerManagerRef.current?.sendPacket(fallbackPeerId, {
+            kind: 'CALL_SIGNAL',
+            action: 'accept',
+            callId: fallbackCallId,
+            callType: resolvedCallType,
+            fromId: me.id,
+            fromName: me.name,
+            fromAvatar: me.avatar,
+          });
+        } else {
+          void wakeAndSyncPeer(true);
+        }
 
         try {
           stopAllCallRingtones();
           pauseKeepAliveForCall();
-          dismissIncomingCallNotification(fallbackPeerId);
+          dismissIncomingCallNotification(isPlaceholderCaller ? undefined : fallbackPeerId);
           isSpeakerOnRef.current = true;
           unlockRemoteAudioElement();
           setAndroidBridgeCallAudioMode(true);
@@ -4605,18 +5050,27 @@ export default function App() {
           // ignore
         }
 
-        setActiveCallUI((prev) =>
-          prev
-            ? {
-                ...prev,
-                callType: resolvedCallType,
-                isCameraOff: resolvedCallType !== 'video',
-                phase: 'outgoing',
-                iceState: 'checking',
-                localStream,
-              }
-            : null
-        );
+        // Hapus status panggilan masuk sementara setelah diangkat
+        pendingCallRef.current = null;
+        setPersistentIncomingCall(null);
+        clearPersistedIncomingCallState();
+        setIsIncomingCallOpen(false);
+
+        setActiveCallUI({
+          callId: fallbackCallId,
+          peerId: fallbackPeerId,
+          peerName: fallbackPeerName,
+          peerAvatar: fallbackPeerAvatar,
+          callType: resolvedCallType,
+          isMuted: false,
+          isCameraOff: resolvedCallType !== 'video',
+          isSpeakerOn: true,
+          phase: 'outgoing',
+          duration: 0,
+          iceState: 'checking',
+          localStream,
+          remoteStream: null,
+        });
       }
     } catch (err) {
       console.error('[WattappsAU Call] Error tidak terduga pada handleAcceptCall:', err);
@@ -4634,20 +5088,28 @@ export default function App() {
     stopAllCallRingtones();
     clearAndroidIncomingCallNotice();
     dismissIncomingCallNotification();
+    const persisted = readPersistedIncomingCallState();
     const rt = callRuntimeRef.current;
     const pending = pendingCallRef.current;
     const activeIncoming = incomingCallRef.current;
     const me = profileRef.current;
     const cleanFallbackId = fallback?.callerId ? fromFullPeerId(fallback.callerId) : undefined;
 
-    const targetPeerId = rt?.peerId || pending?.peerId || activeIncoming?.callerId || cleanFallbackId;
+    const targetPeerId =
+      rt?.peerId || pending?.peerId || activeIncoming?.callerId || cleanFallbackId || persisted?.callerId;
     const targetCallId =
-      rt?.callId || pending?.callId || activeIncoming?.callId || fallback?.callId || generateUid('call');
+      rt?.callId ||
+      pending?.callId ||
+      activeIncoming?.callId ||
+      fallback?.callId ||
+      persisted?.callId ||
+      generateUid('call');
     const targetCallType: CallType =
       rt?.callType ||
       pending?.callType ||
       (activeIncoming ? (activeIncoming.isVideo ? 'video' : 'audio') : undefined) ||
       fallback?.callType ||
+      persisted?.callType ||
       'audio';
 
     if (activeIncoming?.call) {
@@ -4658,7 +5120,7 @@ export default function App() {
       }
     }
 
-    if (targetPeerId && targetCallId && me) {
+    if (targetPeerId && targetPeerId !== 'android-fcm-call' && targetCallId && me) {
       peerManagerRef.current?.sendPacket(targetPeerId, {
         kind: 'CALL_SIGNAL',
         action: 'reject',
@@ -4682,17 +5144,19 @@ export default function App() {
     setAndroidBridgeCallAudioMode(false);
     resumeKeepAliveAfterCall();
     setPersistentIncomingCall(null);
+    clearPersistedIncomingCallState();
+    setIsIncomingCallOpen(false);
     setActiveCallUI(null);
-    if (targetPeerId) {
+    if (targetPeerId && targetPeerId !== 'android-fcm-call') {
       const existingContact = contactsRef.current.find((c) => c.id === targetPeerId);
       const record: CallRecord = {
         id: targetCallId,
         peerId: targetPeerId,
         peerName: getTrustedPeerName(
           targetPeerId,
-          activeIncoming?.callerName || fallback?.callerName
+          activeIncoming?.callerName || fallback?.callerName || persisted?.callerName
         ),
-        peerAvatar: existingContact?.avatar || activeIncoming?.callerAvatar || '',
+        peerAvatar: existingContact?.avatar || activeIncoming?.callerAvatar || persisted?.callerAvatar || '',
         callType: targetCallType,
         direction: 'incoming',
         status: 'rejected',
@@ -5594,7 +6058,7 @@ export default function App() {
         />
       )}
 
-      {(activeCallUI || incomingCall) && (
+      {(activeCallUI || incomingCall || isIncomingCallOpen) && (activeCallUI || incomingCall) && (
         <CallOverlay
           call={
             activeCallUI || {
