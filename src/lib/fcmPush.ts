@@ -12,7 +12,8 @@ import { LOCKED_USER_ID_KEY, LOCKED_USER_NAME_KEY } from './db';
 
 export interface AndroidBridgeInterface {
   getFcmToken?: () => string | null | undefined;
-  showIncomingCall?: (sender: string, body?: string) => void;
+  showIncomingCall?: (callerName: string, callType?: string) => void;
+  dismissIncomingCall?: () => void;
   showIncomingMessage?: (sender: string, body: string) => void;
   setCallAudioMode?: (inCall: boolean) => void;
   enterBatteryStandby?: () => void;
@@ -502,20 +503,35 @@ export async function sendFcmPushToUser(params: FcmPushRequest): Promise<FcmPush
 }
 
 /**
- * Memicu notifikasi panggilan masuk melalui AndroidBridge saat aplikasi aktif di latar depan.
+ * Memicu notifikasi panggilan masuk melalui AndroidBridge (gunakan "voice" atau "video").
  */
 export function triggerAndroidBridgeIncomingCall(
-  sender: string,
-  body = 'Panggilan Masuk WattappsAU'
+  callerName: string,
+  callType: 'voice' | 'video' = 'voice'
 ): void {
   if (typeof window === 'undefined') return;
   try {
     const fn = window.AndroidBridge?.showIncomingCall;
     if (typeof fn === 'function') {
-      fn(
-        (sender || 'WattappsAU').trim().slice(0, MAX_SENDER_LENGTH),
-        (body || 'Panggilan Masuk WattappsAU').trim().slice(0, MAX_BODY_LENGTH)
-      );
+      const safeName =
+        (callerName || 'WattappsAU').trim().slice(0, MAX_SENDER_LENGTH) || 'WattappsAU';
+      const safeType: 'voice' | 'video' = callType === 'video' ? 'video' : 'voice';
+      fn(safeName, safeType);
+    }
+  } catch {
+    // ignore bridge error
+  }
+}
+
+/**
+ * Menutup notifikasi / dering panggilan masuk native di Android WebView saat panggilan dijawab, ditutup, atau tidak terjawab.
+ */
+export function dismissAndroidBridgeIncomingCall(): void {
+  if (typeof window === 'undefined') return;
+  try {
+    const fn = window.AndroidBridge?.dismissIncomingCall;
+    if (typeof fn === 'function') {
+      fn();
     }
   } catch {
     // ignore bridge error

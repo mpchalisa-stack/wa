@@ -1,4 +1,5 @@
 import React, { useEffect, useRef, useState } from 'react';
+import { createPortal } from 'react-dom';
 import {
   ChevronDown,
   Lock,
@@ -264,9 +265,12 @@ export const CallOverlay: React.FC<CallOverlayProps> = ({
   };
 
   // Banner Notifikasi Mengambang ala WhatsApp (saat panggilan masuk diperkecil)
-  if (call.phase === 'incoming' && minimizedBanner) {
-    return (
-      <div className="fixed top-3 left-3 right-3 sm:left-1/2 sm:-translate-x-1/2 sm:max-w-md z-[130] select-none">
+  const overlayContent =
+    call.phase === 'incoming' && minimizedBanner ? (
+      <div
+        className="fixed left-3 right-3 sm:left-1/2 sm:-translate-x-1/2 sm:max-w-md z-[9990] select-none"
+        style={{ top: 'max(16px, env(safe-area-inset-top, 0px))' }}
+      >
         <div
           onClick={() => setMinimizedBanner(false)}
           className="rounded-2xl bg-[#111b21]/95 backdrop-blur-md border border-emerald-500/35 shadow-2xl px-3.5 py-3 flex items-center gap-3 text-white cursor-pointer"
@@ -361,11 +365,8 @@ export const CallOverlay: React.FC<CallOverlayProps> = ({
           </div>
         </div>
       </div>
-    );
-  }
-
-  return (
-    <div className="fixed inset-0 z-[150] bg-[#0b141a] text-white flex flex-col justify-between overflow-hidden select-none">
+    ) : (
+    <div className="fixed inset-0 z-[9999] bg-[#0b141a] text-white flex flex-col justify-between overflow-hidden select-none">
       {/* Background / Remote Full-Screen Video */}
       {showRemoteVideo ? (
         <video
@@ -405,7 +406,8 @@ export const CallOverlay: React.FC<CallOverlayProps> = ({
         <button
           type="button"
           onClick={() => setMinimizedBanner(true)}
-          className="absolute top-4 right-4 pt-safe z-30 w-10 h-10 rounded-full bg-white/10 hover:bg-white/20 text-slate-200 flex items-center justify-center transition-colors cursor-pointer"
+          style={{ top: 'max(36px, env(safe-area-inset-top, 0px))' }}
+          className="absolute right-4 z-30 w-10 h-10 rounded-full bg-white/10 hover:bg-white/20 text-slate-200 flex items-center justify-center transition-colors cursor-pointer"
           title="Perkecil ke banner mengambang"
           aria-label="Perkecil ke banner mengambang"
         >
@@ -415,7 +417,7 @@ export const CallOverlay: React.FC<CallOverlayProps> = ({
 
       {call.phase === 'incoming' ? (
         /* Layar Panggilan Masuk Full-Screen Ala WhatsApp Dark Mode */
-        <div className="relative z-10 flex-1 flex flex-col items-center justify-between px-6 pt-8 pt-safe pb-4 text-center">
+        <div className="relative z-10 flex-1 flex flex-col items-center justify-between px-6 pt-safe-header pb-4 text-center">
           {/* Header Atas: Enkripsi End-to-End */}
           <div className="inline-flex items-center gap-1.5 text-xs text-slate-400 mt-1">
             <Lock className="w-3.5 h-3.5 text-slate-400 shrink-0" />
@@ -423,7 +425,15 @@ export const CallOverlay: React.FC<CallOverlayProps> = ({
           </div>
 
           {/* Identitas Penelepon di Tengah Atas */}
-          <div className="mt-6 flex flex-col items-center max-w-full">
+          <div className="mt-5 flex flex-col items-center max-w-full">
+            <div className="mb-3 inline-flex items-center gap-2 rounded-full bg-emerald-500/15 border border-emerald-400/35 px-3.5 py-1 text-xs font-semibold text-emerald-300">
+              {isVideo ? (
+                <Video className="w-3.5 h-3.5 animate-pulse" />
+              ) : (
+                <Phone className="w-3.5 h-3.5 animate-pulse" />
+              )}
+              <span>{isVideo ? 'Panggilan Video Masuk' : 'Panggilan Suara Masuk'}</span>
+            </div>
             <h2 className="text-3xl font-semibold text-white tracking-tight max-w-full truncate px-2">
               {call.peerName}
             </h2>
@@ -615,7 +625,10 @@ export const CallOverlay: React.FC<CallOverlayProps> = ({
       )}
 
       {/* Bottom Controls */}
-      <div className="relative z-20 px-8 pb-12 pb-safe">
+      <div
+        className="relative z-20 px-8"
+        style={{ paddingBottom: 'max(40px, calc(env(safe-area-inset-bottom, 0px) + 20px))' }}
+      >
         {call.phase === 'incoming' ? (
           <div className="max-w-xs mx-auto flex items-center justify-between">
             <div className="flex flex-col items-center gap-2.5">
@@ -750,4 +763,9 @@ export const CallOverlay: React.FC<CallOverlayProps> = ({
       </div>
     </div>
   );
+
+  if (typeof document !== 'undefined' && document.body) {
+    return createPortal(overlayContent, document.body);
+  }
+  return overlayContent;
 };

@@ -714,6 +714,13 @@ export function showIncomingWebNotification(options: {
 }
 
 export function dismissIncomingCallNotification(peerId?: string): void {
+  try {
+    if (typeof window !== 'undefined') {
+      window.AndroidBridge?.dismissIncomingCall?.();
+    }
+  } catch {
+    // ignore bridge error
+  }
   if (typeof navigator === 'undefined' || !('serviceWorker' in navigator)) return;
   navigator.serviceWorker
     .getRegistration()
