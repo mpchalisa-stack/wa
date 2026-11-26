@@ -117,6 +117,26 @@ export const StatusTab: React.FC<StatusTabProps> = ({
     }
   }, [currentStory, profile.id, onMarkStatusViewed]);
 
+  // Tutup penampil status atau editor status teks terlebih dahulu saat tombol Back ditekan
+  useEffect(() => {
+    const handleBackPress = (event: Event) => {
+      if (event.defaultPrevented) return;
+      if (viewerGroupUserId) {
+        event.preventDefault();
+        setViewerGroupUserId(null);
+        return;
+      }
+      if (showTextComposer) {
+        event.preventDefault();
+        setShowTextComposer(false);
+      }
+    };
+    window.addEventListener('wattapps-back-press', handleBackPress);
+    return () => {
+      window.removeEventListener('wattapps-back-press', handleBackPress);
+    };
+  }, [viewerGroupUserId, showTextComposer]);
+
   // Auto-advance timer for story viewer
   useEffect(() => {
     if (!viewerGroupUserId || !currentStory || isPaused) return;

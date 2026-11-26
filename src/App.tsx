@@ -289,8 +289,6 @@ function readPersistedIncomingCallState(): PersistedIncomingCall | null {
   return resolved;
 }
 
-let isHistoryTrapped = false;
-
 export default function App() {
   const [profile, setProfile] = useState<UserProfile | null>(() => getSavedProfile());
   const [theme, setTheme] = useState<ThemeMode>(() => getSavedTheme());
@@ -795,10 +793,13 @@ export default function App() {
   );
 
   const isExitedRef = useRef<boolean>(isExited);
+  const internalHistoryDepthRef = useRef<number>(0);
+  const ignoreNextPopStateRef = useRef<boolean>(false);
   const backGuardStateRef = useRef({
     activeTab,
     activeChatId,
     searchOpen,
+    searchQuery,
     showMainMenu,
     showProfileDrawer,
     showNewChatModal,
@@ -836,6 +837,7 @@ export default function App() {
       activeTab,
       activeChatId,
       searchOpen,
+      searchQuery,
       showMainMenu,
       showProfileDrawer,
       showNewChatModal,
@@ -850,6 +852,7 @@ export default function App() {
     activeTab,
     activeChatId,
     searchOpen,
+    searchQuery,
     showMainMenu,
     showProfileDrawer,
     showNewChatModal,
@@ -3456,7 +3459,7 @@ export default function App() {
           priorityIds.add(p.recipientId);
         }
       });
-      if (pendingCallRef.current?.peerId) {
+      if (pendingCallRef.current?.peerId && pendingCallRef.current.peerId !== 'android-fcm-call') {
         priorityIds.add(pendingCallRef.current.peerId);
       }
       contactsRef.current
@@ -3480,17 +3483,21 @@ export default function App() {
       if (pendingCall && !callRuntimeRef.current) {
         if (Date.now() - pendingCall.receivedAt <= PENDING_CALL_TTL_MS) {
           presentPendingCallModal(pendingCall);
-          peerManagerRef.current?.sendPacket(pendingCall.peerId, {
-            kind: 'CALL_SIGNAL',
-            action: 'ringing',
-            callId: pendingCall.callId,
-            callType: pendingCall.callType,
-            fromId: me.id,
-            fromName: me.name,
-            fromAvatar: me.avatar,
-          });
+          if (pendingCall.peerId !== 'android-fcm-call') {
+            peerManagerRef.current?.sendPacket(pendingCall.peerId, {
+              kind: 'CALL_SIGNAL',
+              action: 'ringing',
+              callId: pendingCall.callId,
+              callType: pendingCall.callType,
+              fromId: me.id,
+              fromName: me.name,
+              fromAvatar: me.avatar,
+            });
+          }
         } else {
           pendingCallRef.current = null;
+          clearPersistedIncomingCallState();
+          setIsIncomingCallOpen(false);
         }
       }
     },
@@ -3575,6 +3582,9 @@ export default function App() {
 
     // Periksa seketika saat APK/halaman pertama kali dimuat dari layar mati
     checkIncomingCallOnResume();
+    if (incomingCallRef.current || pendingCallRef.current || readPersistedIncomingCallState()) {
+      void wakeAndSyncPeer(true);
+    }
 
     const handleVisibilityChange = () => {
       if (document.visibilityState === 'visible') {
@@ -3590,7 +3600,10 @@ export default function App() {
 
     const handleWindowFocus = () => {
       checkIncomingCallOnResume();
-      void wakeAndSyncPeer(false);
+      const hasRingingCall = Boolean(
+        incomingCallRef.current || pendingCallRef.current || readPersistedIncomingCallState()
+      );
+      void wakeAndSyncPeer(hasRingingCall);
     };
 
     const handlePageShow = (event: PageTransitionEvent) => {
@@ -3620,49 +3633,62 @@ export default function App() {
     setPersistentIncomingCall,
   ]);
 
-  // Cegah tombol Back sistem Android (tombol segitiga) menutup aplikasi & mematikan Mode Siaga
-  // Suntikkan 2x history.pushState setelah sentuhan pengguna pertama (User Activation) agar tidak diabaikan Chrome Android
+  // Dorong satu entri riwayat internal yang aman saat membuka modal, pencarian, ruang chat, atau tab sekunder
+  const hasInternalSubView = Boolean(
+    activeCallUI ||
+      incomingCall ||
+      isIncomingCallOpen ||
+      lightboxMedia ||
+      cameraPurpose ||
+      showResetConfirm ||
+      showMainMenu ||
+      showProfileDrawer ||
+      showShareAppModal ||
+      showNewChatModal ||
+      showNewGroupModal ||
+      searchOpen ||
+      activeChatId ||
+      activeTab !== 'chats'
+  );
+
+  useEffect(() => {
+    if (isExited || typeof window === 'undefined') return;
+    if (hasInternalSubView && internalHistoryDepthRef.current === 0) {
+      try {
+        window.history.pushState({ wattappsInternal: true }, '', window.location.href);
+        internalHistoryDepthRef.current = 1;
+      } catch {
+        // ignore history errors in restricted frames
+      }
+    }
+  }, [hasInternalSubView, isExited]);
+
+  // Kelola tombol Back Android (event `android-back-button`) & tombol kembali browser (`popstate`)
   useEffect(() => {
     if (isExited || typeof window === 'undefined') return;
 
-    const trapBackButton = () => {
-      if (isExitedRef.current) return;
-      if (!isHistoryTrapped) {
-        try {
-          window.history.pushState({ wattappsGuard: true }, '', window.location.href);
-          window.history.pushState({ wattappsGuard: true }, '', window.location.href);
-          isHistoryTrapped = true;
-        } catch {
-          // ignore history errors in restricted frames
-        }
-      }
-    };
-
-    const handlePopState = () => {
-      if (isExitedRef.current || !isHistoryTrapped) return;
-
-      // (a) Segera dorong kembali state baru agar jebakan riwayat tidak pernah habis
-      try {
-        window.history.pushState({ wattappsGuard: true }, '', window.location.href);
-      } catch {
-        // ignore
-      }
-
+    const closeTopmostSubView = (): boolean => {
       const ui = backGuardStateRef.current;
 
-      // (b) Jika sedang membuka modal panggilan, lightbox, kamera, menu dropdown, modal profil, pencarian, atau ruang chat aktif, tutup tampilan tersebut
-      if (ui.hasCallModal || callRuntimeRef.current || incomingCallRef.current || pendingCallRef.current) {
+      if (
+        ui.hasCallModal ||
+        callRuntimeRef.current ||
+        incomingCallRef.current ||
+        pendingCallRef.current
+      ) {
         const rt = callRuntimeRef.current;
         const pending = pendingCallRef.current;
         const ic = incomingCallRef.current;
         const me = profileRef.current;
-        const isIncomingPhase = Boolean((rt && !rt.connectedAt && rt.direction === 'incoming') || pending || ic);
+        const isIncomingPhase = Boolean(
+          (rt && !rt.connectedAt && rt.direction === 'incoming') || pending || ic
+        );
         const targetPeerId = rt?.peerId || pending?.peerId || ic?.callerId;
         const targetCallId = rt?.callId || pending?.callId || ic?.callId;
         const targetCallType: CallType =
           rt?.callType || pending?.callType || (ic?.isVideo ? 'video' : 'audio');
 
-        if (targetPeerId && targetCallId && me) {
+        if (targetPeerId && targetPeerId !== 'android-fcm-call' && targetCallId && me) {
           peerManagerRef.current?.sendPacket(targetPeerId, {
             kind: 'CALL_SIGNAL',
             action: isIncomingPhase ? 'reject' : 'end',
@@ -3674,49 +3700,143 @@ export default function App() {
           });
         }
         finalizeCall(isIncomingPhase ? 'rejected' : undefined);
-      } else if (ui.lightboxMedia) {
+        return true;
+      }
+
+      if (ui.lightboxMedia) {
         setLightboxMedia(null);
-      } else if (ui.cameraPurpose) {
+        return true;
+      }
+      if (ui.cameraPurpose) {
         setCameraPurpose(null);
-      } else if (ui.showResetConfirm) {
+        return true;
+      }
+      if (ui.showResetConfirm) {
         setShowResetConfirm(false);
-      } else if (ui.showMainMenu) {
+        return true;
+      }
+      if (ui.showMainMenu) {
         setShowMainMenu(false);
-      } else if (ui.showProfileDrawer) {
+        return true;
+      }
+      if (ui.showProfileDrawer) {
         setShowProfileDrawer(false);
-      } else if (ui.showShareAppModal) {
+        return true;
+      }
+      if (ui.showShareAppModal) {
         setShowShareAppModal(false);
-      } else if (ui.showNewChatModal) {
+        return true;
+      }
+      if (ui.showNewChatModal) {
         setShowNewChatModal(false);
-      } else if (ui.showNewGroupModal) {
+        return true;
+      }
+      if (ui.showNewGroupModal) {
         setShowNewGroupModal(false);
-      } else if (ui.searchOpen) {
+        return true;
+      }
+
+      // Beri kesempatan sub-tampilan internal (Status viewer / composer, ChatRoom menu/info/lokasi) menutup diri
+      const subViewEvent = new CustomEvent('wattapps-back-press', { cancelable: true });
+      window.dispatchEvent(subViewEvent);
+      if (subViewEvent.defaultPrevented) {
+        return true;
+      }
+
+      if (ui.searchOpen || ui.searchQuery.trim()) {
         setSearchOpen(false);
         setSearchQuery('');
-      } else if (ui.activeChatId) {
-        setActiveChatId(null);
-      } else if (ui.activeTab !== 'chats') {
-        setActiveTab('chats');
-      } else {
-        // (c) Sudah di halaman utama daftar chat: JANGAN keluar & JANGAN hentikan audio latar belakang Mode Siaga
-        showToast(
-          'Tombol Back dikunci agar Mode Siaga tetap aktif. Tekan tombol Home (bulat) untuk ke layar utama HP, atau pilih menu ⋮ > Exit untuk keluar.',
-          4500,
-          'warning'
-        );
+        return true;
       }
+      if (ui.activeChatId) {
+        setActiveChatId(null);
+        return true;
+      }
+      if (ui.activeTab !== 'chats') {
+        setActiveTab('chats');
+        return true;
+      }
+      return false;
     };
 
-    window.addEventListener('pointerdown', trapBackButton, { passive: true });
-    window.addEventListener('touchstart', trapBackButton, { passive: true });
+    const hasRemainingLayersAfterClose = (): boolean => {
+      const ui = backGuardStateRef.current;
+      let count = 0;
+      if (ui.hasCallModal || callRuntimeRef.current || incomingCallRef.current || pendingCallRef.current)
+        count += 1;
+      if (ui.lightboxMedia) count += 1;
+      if (ui.cameraPurpose) count += 1;
+      if (ui.showResetConfirm) count += 1;
+      if (ui.showMainMenu) count += 1;
+      if (ui.showProfileDrawer) count += 1;
+      if (ui.showShareAppModal) count += 1;
+      if (ui.showNewChatModal) count += 1;
+      if (ui.showNewGroupModal) count += 1;
+      if (ui.searchOpen || ui.searchQuery.trim()) count += 1;
+      if (ui.activeChatId) count += 1;
+      if (ui.activeTab !== 'chats') count += 1;
+      return count > 1;
+    };
+
+    const handleAndroidBackButton = (event: Event) => {
+      if (isExitedRef.current) return;
+      const handled = closeTopmostSubView();
+      if (handled) {
+        if (typeof event.preventDefault === 'function') {
+          event.preventDefault();
+        }
+        return;
+      }
+
+      // Sudah berada di tampilan utama Chat dan tidak ada modal/pencarian terbuka:
+      const hasSafeInternalHistory =
+        internalHistoryDepthRef.current > 0 &&
+        (window.history.state as { wattappsInternal?: boolean } | null)?.wattappsInternal === true &&
+        window.history.length > 1;
+
+      if (typeof window.AndroidBridge?.enterBatteryStandby === 'function') {
+        enterAndroidBridgeBatteryStandby();
+        return;
+      }
+
+      if (hasSafeInternalHistory) {
+        internalHistoryDepthRef.current = Math.max(0, internalHistoryDepthRef.current - 1);
+        ignoreNextPopStateRef.current = true;
+        window.history.back();
+      }
+      // Jika tidak ada riwayat internal, biarkan sistem kembali/berpindah ke latar belakang tanpa memacetkan layar
+    };
+
+    const handlePopState = () => {
+      if (isExitedRef.current) return;
+      if (ignoreNextPopStateRef.current) {
+        ignoreNextPopStateRef.current = false;
+        return;
+      }
+
+      internalHistoryDepthRef.current = Math.max(0, internalHistoryDepthRef.current - 1);
+      const stillHasOtherLayer = hasRemainingLayersAfterClose();
+      const handled = closeTopmostSubView();
+
+      if (handled && stillHasOtherLayer && internalHistoryDepthRef.current === 0) {
+        try {
+          window.history.pushState({ wattappsInternal: true }, '', window.location.href);
+          internalHistoryDepthRef.current = 1;
+        } catch {
+          // ignore
+        }
+      }
+      // Jika tidak ada modal/sub-view yang ditutup (sudah di tampilan utama), jangan menjebak riwayat lagi
+    };
+
+    window.addEventListener('android-back-button', handleAndroidBackButton);
     window.addEventListener('popstate', handlePopState);
 
     return () => {
-      window.removeEventListener('pointerdown', trapBackButton);
-      window.removeEventListener('touchstart', trapBackButton);
+      window.removeEventListener('android-back-button', handleAndroidBackButton);
       window.removeEventListener('popstate', handlePopState);
     };
-  }, [isExited, showToast, finalizeCall]);
+  }, [isExited, finalizeCall]);
 
   // Buka ruang chat targetId & tampilkan modal Panggilan Masuk (Angkat/Tolak) dari URL parameter atau postMessage SW
   const applyNotificationTarget = useCallback(
@@ -5397,7 +5517,7 @@ export default function App() {
     clearPeerMediaSession();
     releaseAudioContextNow();
 
-    isHistoryTrapped = false;
+    internalHistoryDepthRef.current = 0;
     isExitedRef.current = true;
     peerManagerRef.current?.destroy();
     peerManagerRef.current = null;
@@ -5416,7 +5536,7 @@ export default function App() {
 
   // Buka kembali aplikasi dari layar istirahat/offline
   const handleReopenApp = useCallback(async () => {
-    isHistoryTrapped = false;
+    internalHistoryDepthRef.current = 0;
     isExitedRef.current = false;
     standbyModeRef.current = true;
     setStandbyMode(true);
@@ -5540,62 +5660,67 @@ export default function App() {
             </div>
           ) : (
             <div className="flex flex-col">
-            <div className="min-h-[60px] py-1.5 px-3 flex items-center justify-between gap-1.5">
+            <div className="min-h-[60px] py-1.5 px-3 flex items-center justify-between gap-2">
               {/* Brand & PeerJS Live Status Indicator */}
               <div className="flex items-center gap-2 min-w-0 flex-1">
                 <button
                   type="button"
                   onClick={() => setShowProfileDrawer(true)}
-                  className="inline-flex items-center gap-2 text-lg font-bold tracking-tight hover:opacity-90 cursor-pointer min-w-0"
+                  className="shrink-0 hover:opacity-90 cursor-pointer flex items-center justify-center"
+                  aria-label="Profil & ID Saya"
                 >
                   <AppLogo size={32} className="shadow-xs ring-1 ring-white/25 shrink-0" />
-                  <span className="flex flex-col items-start text-left min-w-0 leading-none">
-                    <span className="text-[16px] font-bold tracking-tight leading-tight">
-                      WattappsAU
-                    </span>
-                  </span>
                 </button>
-                <button
-                  type="button"
-                  onClick={() => {
-                    if (peerState !== 'online') {
-                      peerManagerRef.current?.connect();
-                      showToast('Menghubungkan ulang ke server PeerJS...');
-                    } else {
-                      setShowProfileDrawer(true);
-                    }
-                  }}
-                  title={peerError || `ID Anda: ${profile.id}`}
-                  className="inline-flex items-center gap-1 text-[11px] font-medium text-white/90 hover:text-white transition-colors whitespace-nowrap cursor-pointer shrink-0"
-                >
-                  <span
-                    className={`w-2 h-2 rounded-full shrink-0 ${
-                      peerState === 'online'
-                        ? 'bg-[#25D366]'
+                <div className="flex flex-col sm:flex-row sm:items-center sm:gap-2 min-w-0 flex-1">
+                  <button
+                    type="button"
+                    onClick={() => setShowProfileDrawer(true)}
+                    className="text-left text-[15px] sm:text-[16px] font-bold tracking-tight leading-tight truncate hover:opacity-90 cursor-pointer min-w-0"
+                  >
+                    WattappsAU
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => {
+                      if (peerState !== 'online') {
+                        peerManagerRef.current?.connect();
+                        showToast('Menghubungkan ulang ke server PeerJS...');
+                      } else {
+                        setShowProfileDrawer(true);
+                      }
+                    }}
+                    title={peerError || `ID Anda: ${profile.id}`}
+                    className="inline-flex items-center gap-1 text-[11px] font-medium text-white/90 hover:text-white transition-colors whitespace-nowrap cursor-pointer shrink-0 w-fit"
+                  >
+                    <span
+                      className={`w-2 h-2 rounded-full shrink-0 ${
+                        peerState === 'online'
+                          ? 'bg-[#25D366]'
+                          : peerState === 'connecting'
+                          ? 'bg-amber-300 animate-pulse'
+                          : 'bg-rose-400'
+                      }`}
+                    />
+                    <span className="truncate">
+                      {peerState === 'online'
+                        ? 'Online'
                         : peerState === 'connecting'
-                        ? 'bg-amber-300 animate-pulse'
-                        : 'bg-rose-400'
-                    }`}
-                  />
-                  <span>
-                    {peerState === 'online'
-                      ? 'Online'
-                      : peerState === 'connecting'
-                      ? 'Menghubungkan...'
-                      : 'Terputus'}
-                  </span>
-                  {peerState === 'disconnected' || peerState === 'error' ? (
-                    <RefreshCw className="w-3 h-3" />
-                  ) : null}
-                </button>
+                        ? 'Menghubungkan...'
+                        : 'Terputus'}
+                    </span>
+                    {peerState === 'disconnected' || peerState === 'error' ? (
+                      <RefreshCw className="w-3 h-3 shrink-0" />
+                    ) : null}
+                  </button>
+                </div>
               </div>
 
               {/* Right Icons: Mode Siaga / Anti-Sleep, Camera, Global Search, 3-Dot Menu */}
-              <div className="flex items-center gap-0.5 shrink-0">
+              <div className="flex items-center gap-1 sm:gap-1.5 shrink-0">
                 <button
                   type="button"
                   onClick={() => void handleToggleStandby()}
-                  className={`h-8 px-2 mr-0.5 rounded-full inline-flex items-center gap-1 text-[11px] font-semibold transition-all cursor-pointer border ${
+                  className={`h-8 px-2.5 rounded-full inline-flex items-center gap-1 text-[11px] font-semibold transition-all cursor-pointer border shrink-0 whitespace-nowrap ${
                     standbyMode
                       ? 'bg-cyan-500/15 border-cyan-400/65 text-cyan-200 shadow-[0_0_12px_rgba(34,211,238,0.28)]'
                       : 'bg-white/10 border-white/15 text-white/90 hover:bg-white/20'
@@ -5619,32 +5744,32 @@ export default function App() {
                 <button
                   type="button"
                   onClick={() => setCameraPurpose(activeContact ? 'chat' : 'status')}
-                  className="w-9 h-9 rounded-full flex items-center justify-center hover:bg-white/10 transition-colors cursor-pointer"
+                  className="w-8 h-8 sm:w-9 sm:h-9 rounded-full flex items-center justify-center shrink-0 hover:bg-white/10 transition-colors cursor-pointer"
                   title="Kamera"
                   aria-label="Buka Kamera"
                 >
-                  <Camera className="w-5 h-5" />
+                  <Camera className="w-[18px] h-[18px] sm:w-5 sm:h-5" />
                 </button>
 
                 <button
                   type="button"
                   onClick={() => setSearchOpen(true)}
-                  className="w-9 h-9 rounded-full flex items-center justify-center hover:bg-white/10 transition-colors cursor-pointer"
+                  className="w-8 h-8 sm:w-9 sm:h-9 rounded-full flex items-center justify-center shrink-0 hover:bg-white/10 transition-colors cursor-pointer"
                   title="Pencarian"
                   aria-label="Pencarian global"
                 >
-                  <Search className="w-5 h-5" />
+                  <Search className="w-[18px] h-[18px] sm:w-5 sm:h-5" />
                 </button>
 
-                <div className="relative">
+                <div className="relative shrink-0">
                   <button
                     type="button"
                     onClick={() => setShowMainMenu((prev) => !prev)}
-                    className="w-9 h-9 rounded-full flex items-center justify-center hover:bg-white/10 transition-colors cursor-pointer"
+                    className="w-8 h-8 sm:w-9 sm:h-9 rounded-full flex items-center justify-center shrink-0 hover:bg-white/10 transition-colors cursor-pointer"
                     title="Menu lainnya"
                     aria-label="Menu titik tiga"
                   >
-                    <MoreVertical className="w-5 h-5" />
+                    <MoreVertical className="w-[18px] h-[18px] sm:w-5 sm:h-5" />
                   </button>
 
                   {showMainMenu && (

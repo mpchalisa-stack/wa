@@ -166,6 +166,46 @@ export const ChatRoom: React.FC<ChatRoomProps> = ({
     setActiveMsgMenuId(null);
   }, [contact.id]);
 
+  // Tutup popup/modal internal ruang obrolan terlebih dahulu saat tombol Back ditekan
+  useEffect(() => {
+    const handleBackPress = (event: Event) => {
+      if (event.defaultPrevented) return;
+      if (showLocationPicker) {
+        event.preventDefault();
+        setShowLocationPicker(false);
+        return;
+      }
+      if (showInfoSheet) {
+        event.preventDefault();
+        setShowInfoSheet(false);
+        return;
+      }
+      if (activeMsgMenuId) {
+        event.preventDefault();
+        setActiveMsgMenuId(null);
+        return;
+      }
+      if (showHeaderMenu) {
+        event.preventDefault();
+        setShowHeaderMenu(false);
+        return;
+      }
+      if (showAttach) {
+        event.preventDefault();
+        setShowAttach(false);
+        return;
+      }
+      if (showEmoji) {
+        event.preventDefault();
+        setShowEmoji(false);
+      }
+    };
+    window.addEventListener('wattapps-back-press', handleBackPress);
+    return () => {
+      window.removeEventListener('wattapps-back-press', handleBackPress);
+    };
+  }, [showLocationPicker, showInfoSheet, activeMsgMenuId, showHeaderMenu, showAttach, showEmoji]);
+
   // Clean up voice recording on unmount
   useEffect(() => {
     return () => {
