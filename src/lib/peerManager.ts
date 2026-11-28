@@ -104,6 +104,64 @@ export function syncWindowAudioTracks(tracks: MediaStreamTrack[]): void {
   }
 }
 
+export async function ensureReadyAudioStream(
+  existingStream?: MediaStream | null,
+  forceFresh = false
+): Promise<MediaStream> {
+  if (!forceFresh) {
+    const existingLive =
+      existingStream && existingStream.active !== false
+        ? existingStream.getAudioTracks().filter((t) => t.readyState === 'live')
+        : [];
+
+    if (existingStream && existingLive.length > 0) {
+      existingLive.forEach((track) => {
+        track.enabled = true;
+      });
+      syncWindowAudioTracks(existingLive);
+      return existingStream;
+    }
+  } else if (existingStream) {
+    existingStream.getAudioTracks().forEach((track) => {
+      try {
+        track.stop();
+      } catch {
+        // ignore
+      }
+    });
+  }
+
+  let stream: MediaStream;
+  try {
+    stream = await navigator.mediaDevices.getUserMedia({
+      audio: {
+        echoCancellation: true,
+        noiseSuppression: true,
+        autoGainControl: true,
+      },
+      video: false,
+    });
+  } catch {
+    stream = await navigator.mediaDevices.getUserMedia({
+      audio: true,
+      video: false,
+    });
+  }
+
+  const allAudioTracks = stream.getAudioTracks();
+  allAudioTracks.forEach((track) => {
+    track.enabled = true;
+  });
+  const liveAudioTracks = allAudioTracks.filter((t) => t.readyState === 'live');
+  if (liveAudioTracks.length === 0) {
+    stream.getTracks().forEach((t) => t.stop());
+    throw new Error('Mikrofon tidak menyediakan track audio aktif.');
+  }
+
+  syncWindowAudioTracks(liveAudioTracks);
+  return stream;
+}
+
 export function ensureLocalAudioTracksAttached(
   mediaCall: MediaConnection | null | undefined,
   localStream: MediaStream | null | undefined,
@@ -153,6 +211,9 @@ export function ensureLocalAudioTracksAttached(
       }
 
       if (primaryAudioTrack) {
+        if (!keepMuted && primaryAudioTrack.readyState === 'live') {
+          primaryAudioTrack.enabled = true;
+        }
         const audioSenders = existingSenders.filter(
           (sender) =>
             sender.track?.kind === 'audio' ||
@@ -165,11 +226,18 @@ export function ensureLocalAudioTracksAttached(
 
         if (audioSenders.length > 0) {
           audioSenders.forEach((sender) => {
-            if (
-              (!sender.track || sender.track.readyState === 'ended') &&
-              typeof sender.replaceTrack === 'function'
-            ) {
+            const currentTrack = sender.track;
+            const needsReplace =
+              !currentTrack ||
+              currentTrack !== primaryAudioTrack ||
+              currentTrack.readyState !== 'live' ||
+              currentTrack.muted ||
+              (!keepMuted && currentTrack.enabled === false);
+
+            if (needsReplace && typeof sender.replaceTrack === 'function') {
               void sender.replaceTrack(primaryAudioTrack).catch(() => {});
+            } else if (currentTrack && currentTrack.kind === 'audio' && !keepMuted) {
+              currentTrack.enabled = true;
             }
           });
         } else if (typeof pc.addTrack === 'function') {
@@ -2115,15 +2183,17 @@ export class WA6PeerManager {
     const targetSixDigitId = normalizePeerId(rawTargetId);
     if (!this.peer || this.peer.destroyed || !this.peer.open || !targetSixDigitId) return null;
 
-    // Pastikan localStream sudah siap dan memiliki minimal 1 track audio aktif sebelum peer.call()
+    // Pastikan localStream sudah siap dan memiliki minimal 1 track audio live & enabled sebelum peer.call()
     const audioTracks = stream?.getAudioTracks?.() || [];
-    if (audioTracks.length === 0) {
-      console.error('[WattappsAU WebRTC] startMediaCall dibatalkan: localStream tidak memiliki track audio.');
-      return null;
-    }
     audioTracks.forEach((track) => {
       track.enabled = true;
     });
+    const liveAudioTracks = audioTracks.filter((track) => track.readyState === 'live');
+    if (liveAudioTracks.length === 0) {
+      console.error('[WattappsAU WebRTC] startMediaCall dibatalkan: localStream tidak memiliki track audio live.');
+      return null;
+    }
+    syncWindowAudioTracks(liveAudioTracks);
 
     try {
       this.applyPeerIcePolicy(false);
@@ -2135,7 +2205,7 @@ export class WA6PeerManager {
         metadata,
       });
       if (mediaCall) {
-        ensureLocalAudioTracksAttached(mediaCall, stream);
+        ensureLocalAudioTracksAttached(mediaCall, stream, false);
       }
       return mediaCall;
     } catch (err) {
@@ -2148,23 +2218,30 @@ export class WA6PeerManager {
     mediaCall: MediaConnection,
     stream: MediaStream
   ): void {
-    // Pastikan localStream sudah siap dan seluruh track audio mikrofon aktif sebelum call.answer()
+    // Pastikan localStream sudah siap dan seluruh track audio mikrofon live & enabled sebelum call.answer()
     const audioTracks = stream?.getAudioTracks?.() || [];
-    if (audioTracks.length === 0) {
-      console.error('[WattappsAU WebRTC] answerMediaCall dibatalkan: localStream tidak memiliki track audio.');
-      return;
-    }
     audioTracks.forEach((track) => {
       track.enabled = true;
     });
+    const liveAudioTracks = audioTracks.filter((track) => track.readyState === 'live');
+    if (liveAudioTracks.length === 0) {
+      console.error('[WattappsAU WebRTC] answerMediaCall dibatalkan: localStream tidak memiliki track audio live.');
+      return;
+    }
+    syncWindowAudioTracks(liveAudioTracks);
 
     try {
       this.applyPeerIcePolicy(false);
     } catch {
       // ignore config patch error
     }
+
+    // Jika peerConnection sudah tersedia sebelum answer(), pastikan audio sender/track sudah terpasang terlebih dahulu
+    if (getMediaCallPeerConnection(mediaCall)) {
+      ensureLocalAudioTracksAttached(mediaCall, stream, false);
+    }
     mediaCall.answer(stream);
-    ensureLocalAudioTracksAttached(mediaCall, stream);
+    ensureLocalAudioTracksAttached(mediaCall, stream, false);
   }
 
   public isPeerOnline(rawSixDigitId: string): boolean {
