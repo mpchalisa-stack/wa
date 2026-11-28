@@ -371,6 +371,7 @@ jobs:
           import android.webkit.WebSettings;
           import android.webkit.WebView;
           import android.widget.Toast;
+          import androidx.activity.OnBackPressedCallback;
           import androidx.annotation.NonNull;
           import androidx.core.app.ActivityCompat;
           import androidx.core.app.NotificationCompat;
@@ -411,6 +412,7 @@ jobs:
                   enableLockScreenDisplay();
                   createNotificationChannels();
                   setupWebViewPermissionsAndBridge();
+                  setupBackButtonHandler();
                   checkAndRequestPermissions();
                   handleCallActionIntent(getIntent());
               }
@@ -430,23 +432,38 @@ jobs:
                   }
               }
 
-              @Override
-              public void onBackPressed() {
+              private void setupBackButtonHandler() {
+                  getOnBackPressedDispatcher().addCallback(this, new OnBackPressedCallback(true) {
+                      @Override
+                      public void handleOnBackPressed() {
+                          handleSystemBackAction();
+                      }
+                  });
+              }
+
+              private void handleSystemBackAction() {
                   if (bridge != null && bridge.getWebView() != null) {
                       WebView wv = bridge.getWebView();
-                      wv.evaluateJavascript(
-                          "(function(){ try { window.dispatchEvent(new CustomEvent('android-back-button')); return true; } catch(e) { return false; } })()",
-                          val -> runOnUiThread(() -> {
-                              if (wv.canGoBack()) {
-                                  wv.goBack();
-                              } else {
-                                  moveTaskToBack(true);
-                              }
-                          })
-                      );
-                      return;
+                      runOnUiThread(() -> {
+                          wv.evaluateJavascript(
+                              "(function(){ try { window.dispatchEvent(new CustomEvent('android-back-button')); } catch(e) {} })()",
+                              null
+                          );
+                          if (wv.canGoBack()) {
+                              wv.goBack();
+                          } else {
+                              moveTaskToBack(true);
+                          }
+                      });
+                  } else {
+                      moveTaskToBack(true);
                   }
-                  super.onBackPressed();
+              }
+
+              @Override
+              @SuppressWarnings("deprecation")
+              public void onBackPressed() {
+                  handleSystemBackAction();
               }
 
               @Override
