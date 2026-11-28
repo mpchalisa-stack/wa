@@ -82,27 +82,107 @@ export function getMediaCallPeerConnection(mediaCall: MediaConnection | null | u
   return internal.peerConnection || internal._pc || null;
 }
 
-export function ensureLocalAudioTracksAttached(
-  mediaCall: MediaConnection,
-  localStream: MediaStream
-): void {
-  localStream.getAudioTracks().forEach((track) => {
-    track.enabled = true;
-  });
-
-  const pc = getMediaCallPeerConnection(mediaCall);
-  if (!pc || typeof pc.getSenders !== 'function' || typeof pc.addTrack !== 'function') return;
-
+export function syncWindowAudioTracks(tracks: MediaStreamTrack[]): void {
+  if (typeof window === 'undefined') return;
   try {
-    const existingSenders = pc.getSenders();
-    localStream.getAudioTracks().forEach((audioTrack) => {
-      const alreadyAdded = existingSenders.some(
-        (sender) => sender.track && (sender.track.id === audioTrack.id || sender.track.kind === 'audio')
-      );
-      if (!alreadyAdded) {
-        pc.addTrack(audioTrack, localStream);
+    const win = window as Window & { __wattappsAudioTracks?: MediaStreamTrack[] };
+    const existing = Array.isArray(win.__wattappsAudioTracks) ? win.__wattappsAudioTracks : [];
+    const mergedMap = new Map<string, MediaStreamTrack>();
+    for (const t of existing) {
+      if (t && t.kind === 'audio' && t.readyState === 'live') {
+        mergedMap.set(t.id, t);
+      }
+    }
+    for (const t of tracks) {
+      if (t && t.kind === 'audio' && t.readyState === 'live') {
+        mergedMap.set(t.id, t);
+      }
+    }
+    win.__wattappsAudioTracks = Array.from(mergedMap.values());
+  } catch {
+    // ignore
+  }
+}
+
+export function ensureLocalAudioTracksAttached(
+  mediaCall: MediaConnection | null | undefined,
+  localStream: MediaStream | null | undefined,
+  keepMuted = false
+): void {
+  if (!localStream) return;
+  const audioTracks = localStream.getAudioTracks();
+  if (!keepMuted) {
+    audioTracks.forEach((track) => {
+      if (track.readyState === 'live') {
+        track.enabled = true;
       }
     });
+  }
+  syncWindowAudioTracks(audioTracks);
+
+  const pc = getMediaCallPeerConnection(mediaCall);
+  if (!pc) return;
+
+  try {
+    if (typeof pc.getTransceivers === 'function') {
+      pc.getTransceivers().forEach((transceiver) => {
+        const isAudio =
+          transceiver.sender?.track?.kind === 'audio' ||
+          transceiver.receiver?.track?.kind === 'audio';
+        if (isAudio && (transceiver.direction === 'recvonly' || transceiver.direction === 'inactive')) {
+          try {
+            transceiver.direction = 'sendrecv';
+          } catch {
+            // ignore if browser locks transceiver direction
+          }
+        }
+      });
+    }
+
+    if (typeof pc.getSenders === 'function') {
+      const existingSenders = pc.getSenders();
+      const liveAudioTracks = audioTracks.filter((t) => t.readyState === 'live');
+      const primaryAudioTrack = liveAudioTracks[0] || audioTracks[0];
+
+      if (!keepMuted) {
+        existingSenders.forEach((sender) => {
+          if (sender.track && sender.track.kind === 'audio' && sender.track.readyState === 'live') {
+            sender.track.enabled = true;
+          }
+        });
+      }
+
+      if (primaryAudioTrack) {
+        const audioSenders = existingSenders.filter(
+          (sender) =>
+            sender.track?.kind === 'audio' ||
+            (!sender.track &&
+              typeof pc.getTransceivers === 'function' &&
+              pc
+                .getTransceivers()
+                .some((tr) => tr.sender === sender && tr.receiver?.track?.kind === 'audio'))
+        );
+
+        if (audioSenders.length > 0) {
+          audioSenders.forEach((sender) => {
+            if (
+              (!sender.track || sender.track.readyState === 'ended') &&
+              typeof sender.replaceTrack === 'function'
+            ) {
+              void sender.replaceTrack(primaryAudioTrack).catch(() => {});
+            }
+          });
+        } else if (typeof pc.addTrack === 'function') {
+          liveAudioTracks.forEach((audioTrack) => {
+            try {
+              pc.addTrack(audioTrack, localStream);
+            } catch {
+              // ignore duplicate track errors
+            }
+          });
+        }
+      }
+    }
   } catch {
     // PeerJS may have already added transceivers/tracks during offer/answer creation
   }

@@ -66,6 +66,7 @@ import {
   getMediaCallPeerConnection,
   inspectMediaCallTransport,
   normalizePeerId,
+  syncWindowAudioTracks,
 } from './lib/peerManager';
 import {
   initGlobalAudioUnlock,
@@ -104,6 +105,8 @@ import {
   enterAndroidBridgeBatteryStandby,
   fetchPeerIdentityFromFirestore,
   getCachedPeerIdentity,
+  notifyAndroidBridgeAnswerCallAudioReady,
+  notifyAndroidBridgeAppReadyForCall,
   sendFcmPushToUser,
   setAndroidBridgeCallAudioMode,
   startFcmTokenSyncLoop,
@@ -426,6 +429,9 @@ export default function App() {
   const boundStreamCallsRef = useRef<WeakSet<MediaConnection>>(new WeakSet());
   const boundPcRef = useRef<WeakSet<RTCPeerConnection>>(new WeakSet());
   const isSpeakerOnRef = useRef<boolean>(true);
+  const isCallMutedRef = useRef<boolean>(false);
+  const peerStateRef = useRef<PeerConnectionState>(peerState);
+  peerStateRef.current = peerState;
   const lastBridgeIncomingCallIdRef = useRef<string | null>(null);
   const pendingAndroidCallActionRef = useRef<{
     action: 'answer' | 'decline';
@@ -440,6 +446,7 @@ export default function App() {
   );
   const handleIncomingMediaCallRef = useRef<(mediaCall: MediaConnection) => void>(() => {});
   const flushPendingForPeerRef = useRef<(recipientId: string) => Promise<void>>(async () => {});
+  const wakeAndSyncPeerRef = useRef<(force?: boolean) => Promise<void>>(async () => {});
 
   const LOADING_IDENTITY_LABEL = 'Memuat identitas...';
 
@@ -603,10 +610,15 @@ export default function App() {
   );
 
   const getCallLocalStream = useCallback(async (callType: CallType): Promise<MediaStream> => {
+    const audioConstraints: MediaTrackConstraints = {
+      echoCancellation: true,
+      noiseSuppression: true,
+      autoGainControl: true,
+    };
     let stream: MediaStream;
     try {
       stream = await navigator.mediaDevices.getUserMedia({
-        audio: true,
+        audio: audioConstraints,
         video: callType === 'video' ? { facingMode: 'user' } : false,
       });
     } catch (err) {
@@ -615,12 +627,26 @@ export default function App() {
           '[WattappsAU Call] Gagal mengakses kamera untuk panggilan video, fallback ke audio saja:',
           err
         );
+        try {
+          stream = await navigator.mediaDevices.getUserMedia({
+            audio: audioConstraints,
+            video: false,
+          });
+        } catch {
+          stream = await navigator.mediaDevices.getUserMedia({
+            audio: true,
+            video: false,
+          });
+        }
+      } else {
+        console.warn(
+          '[WattappsAU Call] Fallback constraint audio standar untuk getUserMedia:',
+          err
+        );
         stream = await navigator.mediaDevices.getUserMedia({
           audio: true,
           video: false,
         });
-      } else {
-        throw err;
       }
     }
     const audioTracks = stream.getAudioTracks();
@@ -631,8 +657,73 @@ export default function App() {
     audioTracks.forEach((track) => {
       track.enabled = true;
     });
+    isCallMutedRef.current = false;
+    syncWindowAudioTracks(audioTracks);
     return stream;
   }, []);
+
+  const ensureActiveCallMicTracksReady = useCallback(async () => {
+    const rt = callRuntimeRef.current;
+    if (!rt?.localStream) return;
+    const shouldStayMuted = Boolean(isCallMutedRef.current);
+    const existingTracks = rt.localStream.getAudioTracks();
+    const liveTracks = existingTracks.filter((t) => t.readyState === 'live');
+    if (liveTracks.length > 0) {
+      liveTracks.forEach((t) => {
+        t.enabled = !shouldStayMuted;
+      });
+      syncWindowAudioTracks(liveTracks);
+      ensureLocalAudioTracksAttached(rt.mediaCall, rt.localStream, shouldStayMuted);
+      return;
+    }
+
+    // Jika track mikrofon berhenti ('ended') saat layar sempat terkunci, re-acquire & replaceTrack otomatis
+    try {
+      const freshStream = await getCallLocalStream('audio');
+      const freshTracks = freshStream.getAudioTracks();
+      if (freshTracks.length === 0) return;
+
+      const currentRt = callRuntimeRef.current;
+      if (!currentRt || currentRt.callId !== rt.callId) {
+        freshStream.getTracks().forEach((t) => t.stop());
+        return;
+      }
+
+      const mutedNow = Boolean(isCallMutedRef.current);
+      freshTracks.forEach((t) => {
+        t.enabled = !mutedNow;
+      });
+
+      existingTracks.forEach((oldTrack) => {
+        try {
+          oldTrack.stop();
+          currentRt.localStream?.removeTrack(oldTrack);
+        } catch {
+          // ignore
+        }
+      });
+      freshTracks.forEach((newTrack) => {
+        try {
+          currentRt.localStream?.addTrack(newTrack);
+        } catch {
+          // ignore
+        }
+      });
+
+      syncWindowAudioTracks(freshTracks);
+      if (currentRt.localStream) {
+        ensureLocalAudioTracksAttached(currentRt.mediaCall, currentRt.localStream, mutedNow);
+        const updatedLocalStream = new MediaStream(currentRt.localStream.getTracks());
+        setActiveCallUI((prev) =>
+          prev && prev.callId === currentRt.callId
+            ? { ...prev, localStream: updatedLocalStream }
+            : prev
+        );
+      }
+    } catch (err) {
+      console.warn('[WattappsAU Call] Gagal memulihkan track mikrofon aktif:', err);
+    }
+  }, [getCallLocalStream]);
 
   // Buka kunci autoplay elemen <audio id="remoteAudio"> tepat di dalam klik tombol Panggil/Jawab (User Gesture Android WebView)
   const unlockRemoteAudioElement = useCallback(() => {
@@ -1339,6 +1430,10 @@ export default function App() {
       callRuntimeRef.current = null;
       remoteStreamRef.current = null;
       isSpeakerOnRef.current = true;
+      isCallMutedRef.current = false;
+      if (typeof window !== 'undefined') {
+        window.__wattappsAudioTracks = [];
+      }
       attachRemoteCallAudioStream(null);
       setAndroidBridgeCallAudioMode(false);
       setActiveCallUI(null);
@@ -1702,6 +1797,10 @@ export default function App() {
               setActiveCallUI((prev) => (prev ? { ...prev, duration: secs } : null));
             }, 1000);
           }
+
+          if (rt.localStream && !isCallMutedRef.current) {
+            ensureLocalAudioTracksAttached(mediaCall, rt.localStream, false);
+          }
         }
 
         const pc = getMediaCallPeerConnection(mediaCall);
@@ -1754,6 +1853,9 @@ export default function App() {
             const state = pc.iceConnectionState || 'checking';
             setActiveCallUI((prev) => (prev ? { ...prev, iceState: state } : null));
             if (state === 'connected' || state === 'completed') {
+              if (rt.localStream && !isCallMutedRef.current) {
+                ensureLocalAudioTracksAttached(mediaCall, rt.localStream, false);
+              }
               void inspectMediaCallTransport(mediaCall, false).then((mode) => {
                 if (
                   mode &&
@@ -2158,6 +2260,19 @@ export default function App() {
             presentPendingCallModal(pending);
             void resolvePeerIdentity(cleanId, packet.fromName, true);
             notifyAndroidIncomingCallOnce(packet.callId, callerName, isVideo);
+            if (!peerManagerRef.current || peerStateRef.current !== 'online') {
+              void wakeAndSyncPeerRef.current(true).finally(() => {
+                if (!callRuntimeRef.current?.connectedAt && pendingCallRef.current?.callId === packet.callId) {
+                  notifyAndroidBridgeAppReadyForCall();
+                }
+              });
+            } else {
+              window.requestAnimationFrame(() => {
+                if (!callRuntimeRef.current?.connectedAt && pendingCallRef.current?.callId === packet.callId) {
+                  notifyAndroidBridgeAppReadyForCall();
+                }
+              });
+            }
             showIncomingWebNotification({
               title: callerName,
               body: isVideo ? 'Panggilan video WattappsAU' : 'Panggilan suara WattappsAU',
@@ -2340,16 +2455,19 @@ export default function App() {
         (awaitingAnswer.peerId === cleanId || awaitingAnswer.peerId === 'android-fcm-call')
       ) {
         stopAllCallRingtones();
+        notifyAndroidBridgeAnswerCallAudioReady();
         clearAndroidIncomingCallNotice();
         dismissIncomingCallNotification(cleanId);
         window.clearTimeout(awaitingAnswer.timeoutId);
         awaitingMediaCallAnswerRef.current = null;
         setPersistentIncomingCall(null);
         isSpeakerOnRef.current = true;
+        isCallMutedRef.current = false;
 
         awaitingAnswer.localStream.getAudioTracks().forEach((track) => {
           track.enabled = true;
         });
+        syncWindowAudioTracks(awaitingAnswer.localStream.getAudioTracks());
 
         callRuntimeRef.current = {
           callId,
@@ -2546,8 +2664,21 @@ export default function App() {
         pendingAndroidAction.action === 'answer'
       ) {
         pendingAndroidCallActionRef.current = null;
+        notifyAndroidBridgeAnswerCallAudioReady();
         clearAndroidIncomingCallNotice();
         void handleAcceptCallRef.current(false);
+      } else if (!peerManagerRef.current || peerStateRef.current !== 'online') {
+        void wakeAndSyncPeerRef.current(true).finally(() => {
+          if (callRuntimeRef.current?.callId === callId && !callRuntimeRef.current.connectedAt) {
+            notifyAndroidBridgeAppReadyForCall();
+          }
+        });
+      } else {
+        window.requestAnimationFrame(() => {
+          if (callRuntimeRef.current?.callId === callId && !callRuntimeRef.current.connectedAt) {
+            notifyAndroidBridgeAppReadyForCall();
+          }
+        });
       }
       showIncomingWebNotification({
         title: callerName,
@@ -3378,8 +3509,21 @@ export default function App() {
 
           if (pendingAction && Date.now() - pendingAction.timestamp <= 12000 && pendingAction.action === 'answer') {
             pendingAndroidCallActionRef.current = null;
+            notifyAndroidBridgeAnswerCallAudioReady();
             clearAndroidIncomingCallNotice();
             void handleAcceptCallRef.current(false);
+          } else if (!peerManagerRef.current || peerStateRef.current !== 'online') {
+            void wakeAndSyncPeerRef.current(true).finally(() => {
+              if (!callRuntimeRef.current?.connectedAt && pendingCallRef.current?.callId === callId) {
+                notifyAndroidBridgeAppReadyForCall();
+              }
+            });
+          } else {
+            window.requestAnimationFrame(() => {
+              if (!callRuntimeRef.current?.connectedAt && pendingCallRef.current?.callId === callId) {
+                notifyAndroidBridgeAppReadyForCall();
+              }
+            });
           }
         }
         if (signal.fromId) {
@@ -3503,6 +3647,7 @@ export default function App() {
     },
     [flushPendingForPeer, presentPendingCallModal]
   );
+  wakeAndSyncPeerRef.current = wakeAndSyncPeer;
 
   // Dengarkan visibilitychange, online, pageshow & window.focus untuk auto-reconnect PeerJS/WebRTC
   // dan paksa munculkan layar panggilan masuk bila masih berdering saat layar HP dinyalakan
@@ -3580,36 +3725,72 @@ export default function App() {
       }
     };
 
+    const notifyIfRingingOnWake = () => {
+      const hasRinging = Boolean(
+        !callRuntimeRef.current?.connectedAt &&
+          (incomingCallRef.current || pendingCallRef.current || readPersistedIncomingCallState())
+      );
+      if (!hasRinging) return;
+      window.requestAnimationFrame(() => {
+        if (
+          !callRuntimeRef.current?.connectedAt &&
+          (incomingCallRef.current || pendingCallRef.current || readPersistedIncomingCallState())
+        ) {
+          notifyAndroidBridgeAppReadyForCall();
+        }
+      });
+    };
+
+    const recoverActiveCallAudioOnWake = () => {
+      const rt = callRuntimeRef.current;
+      if (!rt) return;
+      if (rt.connectedAt || rt.direction === 'outgoing') {
+        void ensureActiveCallMicTracksReady();
+        resumeWebAudioContext();
+        unlockRemoteAudioElement();
+        setAndroidBridgeCallAudioMode(true);
+        if (remoteStreamRef.current) {
+          attachRemoteCallAudioStream(remoteStreamRef.current, false);
+        }
+      }
+    };
+
     // Periksa seketika saat APK/halaman pertama kali dimuat dari layar mati
     checkIncomingCallOnResume();
     if (incomingCallRef.current || pendingCallRef.current || readPersistedIncomingCallState()) {
-      void wakeAndSyncPeer(true);
+      void wakeAndSyncPeer(true).finally(notifyIfRingingOnWake);
     }
 
     const handleVisibilityChange = () => {
       if (document.visibilityState === 'visible') {
         checkIncomingCallOnResume();
-        void wakeAndSyncPeer(true);
+        recoverActiveCallAudioOnWake();
+        void wakeAndSyncPeer(true).finally(notifyIfRingingOnWake);
       }
     };
 
     const handleNetworkOnline = () => {
       checkIncomingCallOnResume();
-      void wakeAndSyncPeer(true);
+      recoverActiveCallAudioOnWake();
+      void wakeAndSyncPeer(true).finally(notifyIfRingingOnWake);
     };
 
     const handleWindowFocus = () => {
       checkIncomingCallOnResume();
+      recoverActiveCallAudioOnWake();
       const hasRingingCall = Boolean(
         incomingCallRef.current || pendingCallRef.current || readPersistedIncomingCallState()
       );
-      void wakeAndSyncPeer(hasRingingCall);
+      void wakeAndSyncPeer(hasRingingCall).finally(() => {
+        if (hasRingingCall) notifyIfRingingOnWake();
+      });
     };
 
     const handlePageShow = (event: PageTransitionEvent) => {
       if (event.persisted || document.visibilityState === 'visible') {
         checkIncomingCallOnResume();
-        void wakeAndSyncPeer(true);
+        recoverActiveCallAudioOnWake();
+        void wakeAndSyncPeer(true).finally(notifyIfRingingOnWake);
       }
     };
 
@@ -4083,6 +4264,17 @@ export default function App() {
           : null;
       const savedPersisted = readPersistedIncomingCallState();
 
+      const signalAppReadyForIncoming = () => {
+        window.requestAnimationFrame(() => {
+          if (
+            !callRuntimeRef.current?.connectedAt &&
+            (incomingCallRef.current || pendingCallRef.current || readPersistedIncomingCallState())
+          ) {
+            notifyAndroidBridgeAppReadyForCall();
+          }
+        });
+      };
+
       if (existingIncoming || existingPending || savedPersisted) {
         if (existingIncoming && existingIncoming.callerId === 'android-fcm-call' && rawCaller) {
           setPersistentIncomingCall({
@@ -4094,7 +4286,12 @@ export default function App() {
         setIsIncomingCallOpen(true);
         forceShowIncomingCallModal();
         setIncomingCallModalForceTick((n) => n + 1);
-        void wakeAndSyncPeer(true);
+        if (!peerManagerRef.current || peerStateRef.current !== 'online') {
+          void wakeAndSyncPeer(true).finally(signalAppReadyForIncoming);
+        } else {
+          void wakeAndSyncPeer(true);
+          signalAppReadyForIncoming();
+        }
         return;
       }
 
@@ -4137,11 +4334,17 @@ export default function App() {
         }
       }, 30000);
 
-      void wakeAndSyncPeer(true);
+      if (!peerManagerRef.current || peerStateRef.current !== 'online') {
+        void wakeAndSyncPeer(true).finally(signalAppReadyForIncoming);
+      } else {
+        void wakeAndSyncPeer(true);
+        signalAppReadyForIncoming();
+      }
     };
 
     const onAndroidAnswerCall = () => {
       stopAllCallRingtones();
+      notifyAndroidBridgeAnswerCallAudioReady();
       clearAndroidIncomingCallNotice();
       dismissIncomingCallNotification();
 
@@ -4764,6 +4967,7 @@ export default function App() {
     ensureCallAudioContext(true);
     setAndroidBridgeCallAudioMode(true);
     isSpeakerOnRef.current = true;
+    isCallMutedRef.current = false;
     unlockRemoteAudioElement();
 
     let localStream: MediaStream;
@@ -4917,9 +5121,11 @@ export default function App() {
 
   // Accept Incoming Call (termasuk pendingCall / incomingCallRef / persisted storage yang stabil terhadap re-render React)
   const handleAcceptCall = async (isAutoAccept = false) => {
-    // BARIS PERTAMA: matikan total seluruh suara dering secara sinkron seketika tombol Angkat ditekan
+    // BARIS PERTAMA: matikan total seluruh suara dering & getar native secara sinkron seketika tombol Angkat ditekan
     stopAllCallRingtones();
+    notifyAndroidBridgeAnswerCallAudioReady();
     clearAndroidIncomingCallNotice();
+    isCallMutedRef.current = false;
     try {
       const persistedOnClick = readPersistedIncomingCallState();
       if (persistedOnClick && !pendingCallRef.current && !incomingCallRef.current) {
@@ -4958,6 +5164,11 @@ export default function App() {
         }
         return;
       }
+
+      localStream.getAudioTracks().forEach((track) => {
+        track.enabled = true;
+      });
+      syncWindowAudioTracks(localStream.getAudioTracks());
 
       // Baca ulang seluruh ref terbaru SETELAH await getUserMedia agar tidak basi bila mediaCall baru saja tiba
       const latestRt = callRuntimeRef.current;
@@ -5026,14 +5237,16 @@ export default function App() {
             track.enabled = true;
           });
           targetMediaCall.answer(localStream);
-          ensureLocalAudioTracksAttached(targetMediaCall, localStream);
+          ensureLocalAudioTracksAttached(targetMediaCall, localStream, false);
         }
 
         // Pasang listener RTCPeerConnection (pc.ontrack & iceconnectionstatechange) segera setelah answer() membuat peerConnection
         bindMediaCallDiagnostics(resolvedCallId, targetMediaCall);
 
-        // 2. Setelah handshake answer berhasil dipicu, pastikan semua dering mati & jalankan pengaturan audio/UI secara terisolasi
+        // 2. Setelah handshake answer berhasil dipicu, pastikan semua dering & getar mati total & jalankan pengaturan audio/UI secara terisolasi
         stopAllCallRingtones();
+        notifyAndroidBridgeAnswerCallAudioReady();
+        clearAndroidIncomingCallNotice();
         if (unansweredCallTimerRef.current !== null) {
           window.clearTimeout(unansweredCallTimerRef.current);
           unansweredCallTimerRef.current = null;
@@ -5159,6 +5372,8 @@ export default function App() {
 
         try {
           stopAllCallRingtones();
+          notifyAndroidBridgeAnswerCallAudioReady();
+          clearAndroidIncomingCallNotice();
           pauseKeepAliveForCall();
           dismissIncomingCallNotification(isPlaceholderCaller ? undefined : fallbackPeerId);
           isSpeakerOnRef.current = true;
@@ -5323,9 +5538,11 @@ export default function App() {
     const rt = callRuntimeRef.current;
     if (!rt?.localStream) return;
     const nextMuted = !activeCallUI?.isMuted;
+    isCallMutedRef.current = nextMuted;
     rt.localStream.getAudioTracks().forEach((t) => {
       t.enabled = !nextMuted;
     });
+    syncWindowAudioTracks(rt.localStream.getAudioTracks());
     setActiveCallUI((prev) => (prev ? { ...prev, isMuted: nextMuted } : null));
   };
 
@@ -5417,11 +5634,13 @@ export default function App() {
     isSpeakerOnRef.current = true;
     setActiveCallUI((prev) => (prev ? { ...prev, isSpeakerOn: true } : null));
 
-    if (rt?.localStream && !activeCallUI?.isMuted) {
+    if (rt?.localStream && !isCallMutedRef.current) {
       rt.localStream.getAudioTracks().forEach((track) => {
-        track.enabled = true;
+        if (track.readyState === 'live') track.enabled = true;
       });
-      ensureLocalAudioTracksAttached(rt.mediaCall, rt.localStream);
+      syncWindowAudioTracks(rt.localStream.getAudioTracks());
+      ensureLocalAudioTracksAttached(rt.mediaCall, rt.localStream, false);
+      void ensureActiveCallMicTracksReady();
     }
 
     const remoteStream =

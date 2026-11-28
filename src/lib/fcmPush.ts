@@ -13,6 +13,8 @@ import { LOCKED_USER_ID_KEY, LOCKED_USER_NAME_KEY } from './db';
 export interface AndroidBridgeInterface {
   getFcmToken?: () => string | null | undefined;
   showIncomingCall?: (callerName: string, callType?: string) => void;
+  notifyAppReadyForCall?: () => void;
+  answerCallAudioReady?: () => void;
   dismissIncomingCall?: () => void;
   showIncomingMessage?: (sender: string, body: string) => void;
   setCallAudioMode?: (inCall: boolean) => void;
@@ -24,6 +26,7 @@ export interface AndroidBridgeInterface {
 declare global {
   interface Window {
     AndroidBridge?: AndroidBridgeInterface;
+    __wattappsAudioTracks?: MediaStreamTrack[];
   }
 }
 
@@ -517,6 +520,37 @@ export function triggerAndroidBridgeIncomingCall(
         (callerName || 'WattappsAU').trim().slice(0, MAX_SENDER_LENGTH) || 'WattappsAU';
       const safeType: 'voice' | 'video' = callType === 'video' ? 'video' : 'voice';
       fn(safeName, safeType);
+    }
+  } catch {
+    // ignore bridge error
+  }
+}
+
+/**
+ * Memberi tahu Android WebView bahwa layar panggilan masuk sudah tampil & aplikasi siap menerima panggilan
+ * agar nada dering dan getar berbunyi sinkron.
+ */
+export function notifyAndroidBridgeAppReadyForCall(): void {
+  if (typeof window === 'undefined') return;
+  try {
+    const fn = window.AndroidBridge?.notifyAppReadyForCall;
+    if (typeof fn === 'function') {
+      fn();
+    }
+  } catch {
+    // ignore bridge error
+  }
+}
+
+/**
+ * Memberi tahu Android WebView bahwa panggilan baru saja diangkat & audio siap agar dering/getar langsung berhenti total.
+ */
+export function notifyAndroidBridgeAnswerCallAudioReady(): void {
+  if (typeof window === 'undefined') return;
+  try {
+    const fn = window.AndroidBridge?.answerCallAudioReady;
+    if (typeof fn === 'function') {
+      fn();
     }
   } catch {
     // ignore bridge error

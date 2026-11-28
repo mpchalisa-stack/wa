@@ -16,7 +16,11 @@ import {
 import { CallType } from '../types';
 import { formatDuration, formatSixDigitId } from '../lib/media';
 import { stopAllRingtones } from '../lib/audio';
-import { dismissAndroidBridgeIncomingCall } from '../lib/fcmPush';
+import {
+  dismissAndroidBridgeIncomingCall,
+  notifyAndroidBridgeAnswerCallAudioReady,
+  notifyAndroidBridgeAppReadyForCall,
+} from '../lib/fcmPush';
 import { activateActiveMediaSession, releaseActiveMediaSession } from '../lib/standby';
 import { Avatar } from './Avatar';
 import { AppLogo } from './AppLogo';
@@ -74,14 +78,28 @@ export const CallOverlay: React.FC<CallOverlayProps> = ({
   const [micLevel, setMicLevel] = useState(0);
   const [micTrackCount, setMicTrackCount] = useState(0);
   const [remoteTrackCount, setRemoteTrackCount] = useState(0);
+  const lastReadyNotifiedKeyRef = useRef<string>('');
 
   // Reset animasi getar & paksa layar penuh setiap kali panggilan masuk baru / dipicu notifikasi
+  // lalu beri tahu AndroidBridge bahwa layar panggilan masuk sudah tampil & siap menerima panggilan
   useEffect(() => {
     setShakeStopped(false);
     setMinimizedBanner(false);
     setAvatarImgFailed(false);
     if (call.phase === 'connected') {
       stopAllRingtones();
+      lastReadyNotifiedKeyRef.current = '';
+      return;
+    }
+    if (call.phase === 'incoming') {
+      const readyKey = `${call.callId}:${forceFullscreenTick}`;
+      if (lastReadyNotifiedKeyRef.current !== readyKey) {
+        lastReadyNotifiedKeyRef.current = readyKey;
+        const rafId = window.requestAnimationFrame(() => {
+          notifyAndroidBridgeAppReadyForCall();
+        });
+        return () => window.cancelAnimationFrame(rafId);
+      }
     }
   }, [call.callId, call.phase, call.peerAvatar, forceFullscreenTick]);
 
@@ -248,6 +266,7 @@ export const CallOverlay: React.FC<CallOverlayProps> = ({
   // Hentikan total seluruh suara dering, tutup notifikasi native Android & hentikan animasi getar SEKETIKA saat tombol Angkat/Tolak/Akhiri ditekan
   const handleAcceptClick = () => {
     stopAllRingtones();
+    notifyAndroidBridgeAnswerCallAudioReady();
     dismissAndroidBridgeIncomingCall();
     setShakeStopped(true);
     setMinimizedBanner(false);
