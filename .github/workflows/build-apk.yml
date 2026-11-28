@@ -222,6 +222,11 @@ jobs:
 
                   Intent intent = new Intent(this, MainActivity.class);
                   intent.setFlags(Intent.FLAG_ACTIVITY_NEW_TASK | Intent.FLAG_ACTIVITY_SINGLE_TOP);
+                  if (isCall) {
+                      intent.setAction("ACTION_INCOMING_CALL");
+                      intent.putExtra("caller_name", title);
+                      intent.putExtra("call_type", "voice");
+                  }
                   PendingIntent pi = PendingIntent.getActivity(
                       this, (int) System.currentTimeMillis(), intent, PendingIntent.FLAG_IMMUTABLE | PendingIntent.FLAG_UPDATE_CURRENT
                   );
@@ -426,6 +431,25 @@ jobs:
               }
 
               @Override
+              public void onBackPressed() {
+                  if (bridge != null && bridge.getWebView() != null) {
+                      WebView wv = bridge.getWebView();
+                      wv.evaluateJavascript(
+                          "(function(){ try { window.dispatchEvent(new CustomEvent('android-back-button')); return true; } catch(e) { return false; } })()",
+                          val -> runOnUiThread(() -> {
+                              if (wv.canGoBack()) {
+                                  wv.goBack();
+                              } else {
+                                  moveTaskToBack(true);
+                              }
+                          })
+                      );
+                      return;
+                  }
+                  super.onBackPressed();
+              }
+
+              @Override
               public void onPause() {
                   super.onPause();
                   if (bridge != null && bridge.getWebView() != null) {
@@ -468,8 +492,26 @@ jobs:
               }
 
               private void handleCallActionIntent(Intent intent) {
-                  if (intent == null || intent.getAction() == null) return;
+                  if (intent == null) return;
                   String action = intent.getAction();
+                  if ("ACTION_INCOMING_CALL".equals(action)) {
+                      enableLockScreenDisplay();
+                      wakeScreenBriefly(20000);
+                      String caller = intent.getStringExtra("caller_name");
+                      String type = intent.getStringExtra("call_type");
+                      if (bridge != null && bridge.getWebView() != null) {
+                          String safeCaller = caller != null ? caller.replace("\\", "\\\\").replace("'", "\\'") : "Panggilan Masuk";
+                          String safeType = type != null ? type.replace("\\", "\\\\").replace("'", "\\'") : "voice";
+                          bridge.getWebView().post(() ->
+                              bridge.getWebView().evaluateJavascript(
+                                  "window.dispatchEvent(new CustomEvent('android-incoming-call', { detail: { caller: '" + safeCaller + "', type: '" + safeType + "' } }));",
+                                  null
+                              )
+                          );
+                      }
+                      return;
+                  }
+                  if (action == null) return;
                   stopRingtoneAndVibration();
                   NotificationManager nm = (NotificationManager) getSystemService(Context.NOTIFICATION_SERVICE);
                   if (nm != null) nm.cancel(CALL_NOTIF_ID);
@@ -659,6 +701,9 @@ jobs:
                   }
 
                   Intent fullScreenIntent = new Intent(this, MainActivity.class);
+                  fullScreenIntent.setAction("ACTION_INCOMING_CALL");
+                  fullScreenIntent.putExtra("caller_name", callerName);
+                  fullScreenIntent.putExtra("call_type", callType);
                   fullScreenIntent.setFlags(Intent.FLAG_ACTIVITY_NEW_TASK | Intent.FLAG_ACTIVITY_SINGLE_TOP);
                   PendingIntent fullScreenPending = PendingIntent.getActivity(
                       this, 0, fullScreenIntent, PendingIntent.FLAG_IMMUTABLE | PendingIntent.FLAG_UPDATE_CURRENT
@@ -867,11 +912,12 @@ jobs:
         run: |
           sudo apt-get update && sudo apt-get install -y imagemagick
           if [ -f "logo.png" ]; then
+            convert logo.png -background "#28a745" -alpha remove -alpha off -gravity center -resize 512x512^ -extent 512x512 /tmp/wattapps_icon.png
             for dir in android/app/src/main/res/mipmap-*; do
               if [ -d "$dir" ]; then
-                convert logo.png -resize 512x512 "$dir/ic_launcher.png"
-                convert logo.png -resize 512x512 "$dir/ic_launcher_round.png"
-                convert logo.png -resize 512x512 "$dir/ic_launcher_foreground.png"
+                cp /tmp/wattapps_icon.png "$dir/ic_launcher.png"
+                cp /tmp/wattapps_icon.png "$dir/ic_launcher_round.png"
+                cp /tmp/wattapps_icon.png "$dir/ic_launcher_foreground.png"
               fi
             done
             rm -rf android/app/src/main/res/mipmap-anydpi-v26
