@@ -1,4 +1,4 @@
-import React, { useCallback, useEffect, useState } from 'react';
+import React, { useCallback, useEffect, useRef, useState } from 'react';
 import {
   Crosshair,
   ExternalLink,
@@ -9,11 +9,19 @@ import {
   X,
 } from 'lucide-react';
 import { LocationMeta } from '../types';
+import { requestAndroidBridgeGpsLocation } from '../lib/fcmPush';
 
 interface LocationPickerModalProps {
   open: boolean;
   onClose: () => void;
   onSendLocation: (location: LocationMeta) => void;
+}
+
+interface AndroidLocationUpdateDetail {
+  lat?: number | string;
+  lng?: number | string;
+  accuracy?: number | string;
+  error?: string;
 }
 
 export function buildOpenStreetMapEmbedUrl(lat: number, lng: number, delta = 0.0045): string {
@@ -25,7 +33,7 @@ export function buildOpenStreetMapEmbedUrl(lat: number, lng: number, delta = 0.0
 }
 
 export function buildExternalMapUrl(lat: number, lng: number): string {
-  return `https://maps.google.com/?q=${lat.toFixed(6)},${lng.toFixed(6)}`;
+  return `https://www.google.com/maps?q=${lat.toFixed(6)},${lng.toFixed(6)}`;
 }
 
 export const LocationPickerModal: React.FC<LocationPickerModalProps> = ({
@@ -37,9 +45,26 @@ export const LocationPickerModal: React.FC<LocationPickerModalProps> = ({
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
   const [coords, setCoords] = useState<{ lat: number; lng: number; accuracy?: number } | null>(null);
   const [label, setLabel] = useState('');
+  const requestSessionRef = useRef(0);
+  const bridgeTimerRef = useRef<number | null>(null);
+  const coordsResolvedRef = useRef(false);
+
+  const clearBridgeTimer = useCallback(() => {
+    if (bridgeTimerRef.current !== null) {
+      window.clearTimeout(bridgeTimerRef.current);
+      bridgeTimerRef.current = null;
+    }
+  }, []);
 
   const fetchGpsLocation = useCallback(() => {
-    if (typeof navigator === 'undefined' || !navigator.geolocation) {
+    const sessionId = ++requestSessionRef.current;
+    coordsResolvedRef.current = false;
+    clearBridgeTimer();
+
+    const bridgeTriggered = requestAndroidBridgeGpsLocation();
+    const hasWebGeolocation = typeof navigator !== 'undefined' && Boolean(navigator.geolocation);
+
+    if (!bridgeTriggered && !hasWebGeolocation) {
       setErrorMsg('Perangkat atau browser ini tidak mendukung GPS Geolocation.');
       setLoading(false);
       return;
@@ -48,27 +73,69 @@ export const LocationPickerModal: React.FC<LocationPickerModalProps> = ({
     setLoading(true);
     setErrorMsg(null);
 
-    const onSuccess = (pos: GeolocationPosition) => {
+    const applyResolvedCoords = (lat: number, lng: number, accuracy?: number) => {
+      if (requestSessionRef.current !== sessionId) return;
+      coordsResolvedRef.current = true;
+      clearBridgeTimer();
       setCoords({
-        lat: pos.coords.latitude,
-        lng: pos.coords.longitude,
-        accuracy: Number.isFinite(pos.coords.accuracy) ? Math.round(pos.coords.accuracy) : undefined,
+        lat,
+        lng,
+        accuracy:
+          typeof accuracy === 'number' && Number.isFinite(accuracy)
+            ? Math.round(accuracy)
+            : undefined,
       });
       setLoading(false);
       setErrorMsg(null);
     };
 
-    const onFallbackError = (err: GeolocationPositionError) => {
+    const failWithGpsError = (message: string) => {
+      if (requestSessionRef.current !== sessionId || coordsResolvedRef.current) return;
+      clearBridgeTimer();
       setLoading(false);
+      setErrorMsg(message);
+    };
+
+    if (bridgeTriggered) {
+      bridgeTimerRef.current = window.setTimeout(() => {
+        if (requestSessionRef.current === sessionId && !coordsResolvedRef.current) {
+          failWithGpsError(
+            'GPS HP tampak sedang mati atau tidak merespons. Aktifkan layanan Lokasi (GPS) di pengaturan HP Anda lalu ketuk Coba Lagi.'
+          );
+        }
+      }, 15000);
+    }
+
+    if (!hasWebGeolocation) {
+      return;
+    }
+
+    const onSuccess = (pos: GeolocationPosition) => {
+      applyResolvedCoords(pos.coords.latitude, pos.coords.longitude, pos.coords.accuracy);
+    };
+
+    const onFallbackError = (err: GeolocationPositionError) => {
+      if (requestSessionRef.current !== sessionId || coordsResolvedRef.current) return;
+      let friendlyMsg =
+        'Waktu pencarian GPS habis. Pastikan GPS HP dalam keadaan aktif lalu coba lagi.';
       if (err.code === err.PERMISSION_DENIED) {
-        setErrorMsg(
-          'Izin lokasi GPS ditolak. Aktifkan izin Lokasi pada pengaturan aplikasi/browser Anda lalu coba lagi.'
-        );
+        friendlyMsg =
+          'Izin lokasi GPS ditolak atau GPS HP belum diaktifkan. Aktifkan Lokasi (GPS) serta izin lokasi aplikasi lalu coba lagi.';
       } else if (err.code === err.POSITION_UNAVAILABLE) {
-        setErrorMsg('Sinyal GPS tidak tersedia. Pastikan GPS perangkat dalam keadaan aktif.');
-      } else {
-        setErrorMsg('Waktu pencarian GPS habis. Coba lagi di area dengan sinyal lebih baik.');
+        friendlyMsg =
+          'GPS perangkat sedang mati atau sinyal satelit tidak tersedia. Aktifkan GPS di bilah status HP Anda lalu coba lagi.';
       }
+
+      // Jika AndroidBridge.requestGpsLocation dipanggil, beri kesempatan event android-location-update menyelesaikan terlebih dahulu
+      if (bridgeTriggered) {
+        clearBridgeTimer();
+        bridgeTimerRef.current = window.setTimeout(() => {
+          failWithGpsError(friendlyMsg);
+        }, 4500);
+        return;
+      }
+
+      failWithGpsError(friendlyMsg);
     };
 
     navigator.geolocation.getCurrentPosition(
@@ -87,18 +154,69 @@ export const LocationPickerModal: React.FC<LocationPickerModalProps> = ({
         maximumAge: 5000,
       }
     );
-  }, []);
+  }, [clearBridgeTimer]);
 
   useEffect(() => {
     if (!open) {
+      requestSessionRef.current += 1;
+      coordsResolvedRef.current = false;
+      clearBridgeTimer();
       setCoords(null);
       setLabel('');
       setErrorMsg(null);
       setLoading(false);
       return;
     }
+
+    const handleAndroidLocationUpdate = (event: Event) => {
+      const detail = (event as CustomEvent<AndroidLocationUpdateDetail>)?.detail;
+      if (!detail) return;
+
+      const lat = typeof detail.lat === 'string' ? Number(detail.lat) : detail.lat;
+      const lng = typeof detail.lng === 'string' ? Number(detail.lng) : detail.lng;
+      const accuracy =
+        typeof detail.accuracy === 'string' ? Number(detail.accuracy) : detail.accuracy;
+
+      if (
+        typeof lat === 'number' &&
+        Number.isFinite(lat) &&
+        typeof lng === 'number' &&
+        Number.isFinite(lng)
+      ) {
+        coordsResolvedRef.current = true;
+        clearBridgeTimer();
+        setCoords({
+          lat,
+          lng,
+          accuracy:
+            typeof accuracy === 'number' && Number.isFinite(accuracy)
+              ? Math.round(accuracy)
+              : undefined,
+        });
+        setLoading(false);
+        setErrorMsg(null);
+        return;
+      }
+
+      if (detail.error && !coordsResolvedRef.current) {
+        clearBridgeTimer();
+        setLoading(false);
+        setErrorMsg(
+          typeof detail.error === 'string' && detail.error.trim()
+            ? detail.error.trim()
+            : 'GPS HP sedang mati atau izin lokasi belum aktif. Aktifkan GPS lalu coba lagi.'
+        );
+      }
+    };
+
+    window.addEventListener('android-location-update', handleAndroidLocationUpdate);
     fetchGpsLocation();
-  }, [open, fetchGpsLocation]);
+
+    return () => {
+      window.removeEventListener('android-location-update', handleAndroidLocationUpdate);
+      clearBridgeTimer();
+    };
+  }, [open, fetchGpsLocation, clearBridgeTimer]);
 
   if (!open) return null;
 

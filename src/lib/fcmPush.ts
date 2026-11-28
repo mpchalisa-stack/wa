@@ -21,6 +21,7 @@ export interface AndroidBridgeInterface {
   enterBatteryStandby?: () => void;
   saveBase64File?: (fileName: string, base64Data: string) => boolean | void;
   downloadFile?: (urlOrData: string, fileName: string, mimeType?: string) => boolean | void;
+  requestGpsLocation?: () => void;
 }
 
 declare global {
@@ -615,3 +616,22 @@ export function enterAndroidBridgeBatteryStandby(): void {
     // ignore bridge error
   }
 }
+
+/**
+ * Meminta koordinat GPS native dari Android WebView (`window.AndroidBridge?.requestGpsLocation()`).
+ * Mengembalikan `true` jika metode bridge tersedia dan berhasil dipanggil.
+ */
+export function requestAndroidBridgeGpsLocation(): boolean {
+  if (typeof window === 'undefined') return false;
+  try {
+    const fn = window.AndroidBridge?.requestGpsLocation;
+    if (typeof fn === 'function') {
+      fn();
+      return true;
+    }
+  } catch {
+    // ignore bridge error
+  }
+  return false;
+}
+

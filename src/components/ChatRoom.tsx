@@ -1072,6 +1072,14 @@ export const ChatRoom: React.FC<ChatRoomProps> = ({
                           ? ` · ±${msg.location.accuracy} m`
                           : ''}
                       </div>
+                      <a
+                        href={buildExternalMapUrl(msg.location.lat, msg.location.lng)}
+                        target="_blank"
+                        rel="noopener noreferrer"
+                        className="block text-[11px] text-sky-600 dark:text-sky-400 underline truncate"
+                      >
+                        {buildExternalMapUrl(msg.location.lat, msg.location.lng)}
+                      </a>
                       <div className="pt-1 flex items-center gap-2">
                         <a
                           href={buildExternalMapUrl(msg.location.lat, msg.location.lng)}
@@ -1319,6 +1327,11 @@ export const ChatRoom: React.FC<ChatRoomProps> = ({
           <button
             type="button"
             onClick={() => {
+              try {
+                window.AndroidBridge?.requestGpsLocation?.();
+              } catch {
+                // ignore bridge error
+              }
               setShowAttach(false);
               setShowLocationPicker(true);
             }}
