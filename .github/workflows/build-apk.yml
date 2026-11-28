@@ -350,12 +350,15 @@ jobs:
           import android.content.Intent;
           import android.content.pm.PackageManager;
           import android.media.AudioAttributes;
+          import android.media.AudioManager;
           import android.media.Ringtone;
           import android.media.RingtoneManager;
           import android.net.Uri;
           import android.os.Build;
           import android.os.Bundle;
           import android.os.Environment;
+          import android.os.Handler;
+          import android.os.Looper;
           import android.os.PowerManager;
           import android.os.VibrationEffect;
           import android.os.Vibrator;
@@ -392,6 +395,9 @@ jobs:
               private static final int CALL_NOTIF_ID = 202;
               private static int msgNotifCounter = 300;
               private Ringtone currentRingtone;
+              private boolean isCallRinging = false;
+              private final Handler ringHandler = new Handler(Looper.getMainLooper());
+              private Runnable ringRunnable;
 
               @Override
               public void onCreate(Bundle savedInstanceState) {
@@ -467,6 +473,15 @@ jobs:
               }
 
               @Override
+              public void onResume() {
+                  super.onResume();
+                  if (bridge != null && bridge.getWebView() != null) {
+                      bridge.getWebView().onResume();
+                      bridge.getWebView().resumeTimers();
+                  }
+              }
+
+              @Override
               public void onPause() {
                   super.onPause();
                   if (bridge != null && bridge.getWebView() != null) {
@@ -498,13 +513,66 @@ jobs:
                   }
               }
 
-              private void stopRingtoneAndVibration() {
+              private void startRingtoneAndVibration() {
+                  isCallRinging = true;
                   try {
-                      if (currentRingtone != null && currentRingtone.isPlaying()) currentRingtone.stop();
+                      Uri ringtoneUri = RingtoneManager.getDefaultUri(RingtoneManager.TYPE_RINGTONE);
+                      currentRingtone = RingtoneManager.getRingtone(getApplicationContext(), ringtoneUri);
+                      if (currentRingtone != null && !currentRingtone.isPlaying()) {
+                          currentRingtone.play();
+                      }
+
+                      Vibrator v = (Vibrator) getSystemService(Context.VIBRATOR_SERVICE);
+                      if (v != null) {
+                          long[] pattern = {0, 800, 600, 800, 600};
+                          if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                              v.vibrate(VibrationEffect.createWaveform(pattern, 0));
+                          } else {
+                              v.vibrate(pattern, 0);
+                          }
+                      }
+                  } catch (Exception e) {
+                      e.printStackTrace();
+                  }
+              }
+
+              private void stopRingtoneAndVibration() {
+                  isCallRinging = false;
+                  if (ringRunnable != null) {
+                      ringHandler.removeCallbacks(ringRunnable);
+                      ringRunnable = null;
+                  }
+                  try {
+                      if (currentRingtone != null) {
+                          if (currentRingtone.isPlaying()) currentRingtone.stop();
+                          currentRingtone = null;
+                      }
                       Vibrator v = (Vibrator) getSystemService(Context.VIBRATOR_SERVICE);
                       if (v != null) v.cancel();
                   } catch (Exception e) {
                       e.printStackTrace();
+                  }
+              }
+
+              private void switchToCommunicationAudio() {
+                  stopRingtoneAndVibration();
+                  getWindow().clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
+                  try {
+                      AudioManager am = (AudioManager) getSystemService(Context.AUDIO_SERVICE);
+                      if (am != null) {
+                          am.setMode(AudioManager.MODE_IN_COMMUNICATION);
+                          am.setMicrophoneMute(false);
+                      }
+                  } catch (Exception e) {
+                      e.printStackTrace();
+                  }
+                  if (bridge != null && bridge.getWebView() != null) {
+                      bridge.getWebView().post(() ->
+                          bridge.getWebView().evaluateJavascript(
+                              "(function(){ try { if (window.__wattappsAudioTracks) { window.__wattappsAudioTracks.forEach(function(t){ t.enabled = true; }); } } catch(e) {} })()",
+                              null
+                          )
+                      );
                   }
               }
 
@@ -529,17 +597,18 @@ jobs:
                       return;
                   }
                   if (action == null) return;
-                  stopRingtoneAndVibration();
                   NotificationManager nm = (NotificationManager) getSystemService(Context.NOTIFICATION_SERVICE);
                   if (nm != null) nm.cancel(CALL_NOTIF_ID);
 
                   if ("ACTION_ANSWER_CALL".equals(action)) {
+                      switchToCommunicationAudio();
                       if (bridge != null && bridge.getWebView() != null) {
                           bridge.getWebView().post(() ->
                               bridge.getWebView().evaluateJavascript("window.dispatchEvent(new CustomEvent('android-answer-call'));", null)
                           );
                       }
                   } else if ("ACTION_DECLINE_CALL".equals(action)) {
+                      stopRingtoneAndVibration();
                       if (bridge != null && bridge.getWebView() != null) {
                           bridge.getWebView().post(() ->
                               bridge.getWebView().evaluateJavascript("window.dispatchEvent(new CustomEvent('android-decline-call'));", null)
@@ -669,9 +738,28 @@ jobs:
                   }
 
                   @JavascriptInterface
+                  public void notifyAppReadyForCall() {
+                      runOnUiThread(() -> {
+                          if (isCallRinging && (currentRingtone == null || !currentRingtone.isPlaying())) {
+                              startRingtoneAndVibration();
+                          }
+                      });
+                  }
+
+                  @JavascriptInterface
+                  public void answerCallAudioReady() {
+                      runOnUiThread(() -> {
+                          switchToCommunicationAudio();
+                          NotificationManager nm = (NotificationManager) getSystemService(Context.NOTIFICATION_SERVICE);
+                          if (nm != null) nm.cancel(CALL_NOTIF_ID);
+                      });
+                  }
+
+                  @JavascriptInterface
                   public void dismissIncomingCall() {
                       runOnUiThread(() -> {
                           stopRingtoneAndVibration();
+                          getWindow().clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
                           NotificationManager nm = (NotificationManager) getSystemService(Context.NOTIFICATION_SERVICE);
                           if (nm != null) nm.cancel(CALL_NOTIF_ID);
                       });
@@ -687,8 +775,11 @@ jobs:
                   wakeScreenBriefly(20000);
                   enableLockScreenDisplay();
                   getWindow().addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
+                  isCallRinging = true;
 
                   if (bridge != null && bridge.getWebView() != null) {
+                      bridge.getWebView().onResume();
+                      bridge.getWebView().resumeTimers();
                       String safeCaller = callerName != null ? callerName.replace("\\", "\\\\").replace("'", "\\'") : "Panggilan Masuk";
                       String safeType = callType != null ? callType.replace("\\", "\\\\").replace("'", "\\'") : "voice";
                       bridge.getWebView().post(() ->
@@ -697,24 +788,6 @@ jobs:
                               null
                           )
                       );
-                  }
-
-                  try {
-                      Uri ringtoneUri = RingtoneManager.getDefaultUri(RingtoneManager.TYPE_RINGTONE);
-                      currentRingtone = RingtoneManager.getRingtone(getApplicationContext(), ringtoneUri);
-                      if (currentRingtone != null) currentRingtone.play();
-
-                      Vibrator v = (Vibrator) getSystemService(Context.VIBRATOR_SERVICE);
-                      if (v != null) {
-                          long[] pattern = {0, 800, 600, 800, 600};
-                          if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-                              v.vibrate(VibrationEffect.createWaveform(pattern, 0));
-                          } else {
-                              v.vibrate(pattern, 0);
-                          }
-                      }
-                  } catch (Exception e) {
-                      e.printStackTrace();
                   }
 
                   Intent fullScreenIntent = new Intent(this, MainActivity.class);
@@ -763,6 +836,14 @@ jobs:
                   try {
                       startActivity(fullScreenIntent);
                   } catch (Exception ignored) {}
+
+                  if (ringRunnable != null) ringHandler.removeCallbacks(ringRunnable);
+                  ringRunnable = () -> {
+                      if (isCallRinging) {
+                          startRingtoneAndVibration();
+                      }
+                  };
+                  ringHandler.postDelayed(ringRunnable, 1200);
               }
 
               private void displayIncomingMessageNotification(String senderName, String messageText) {
